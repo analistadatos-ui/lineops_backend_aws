@@ -3544,6 +3544,7 @@ console.log(`[DEBUG] Summary for ${date}: totalSewed = ${totalSewed}`);
     );
     const totalOperators = parseInt(operatorsResult.rows[0].total_operators) || 0;
 
+
 // 4) Efficiency – using packing output (finished garments) to count total SAM produced
 const efficiencyResult = await client.query(
   `
