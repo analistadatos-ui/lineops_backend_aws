@@ -1,0 +1,23 @@
+# Secrets — NEVER commit these
+.env
+_env
+*.env
+
+# Dependencies (rebuilt from package.json, no need to commit)
+node_modules/
+
+# Logs
+logs/
+*.log
+
+# Database dumps
+*.dump
+app.dump
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Certs downloaded at build time
+global-bundle.pem

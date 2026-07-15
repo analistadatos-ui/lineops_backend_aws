@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log
+logs
+.env
+_env
+*.env
+.git
+.gitignore
+*.dump
+app.dump
+global-bundle.pem
+README.md
+Dockerfile
+.dockerignore
