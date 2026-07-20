@@ -222,4 +222,59 @@ function generatePresignedGetUrl(key, expiresInSeconds = 3600) {
   return `https://${HOST}${canonicalPath(key)}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
 }
 
-module.exports = { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl };
+/**
+ * Generates a temporary signed PUT URL so the browser can upload an object
+ * directly to S3. Only `host` is signed, so the client may send any
+ * Content-Type. No request is made here — this just builds the URL.
+ */
+function generatePresignedPutUrl(key, expiresInSeconds = 300) {
+  if (!key) return null;
+
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const dateStamp = amzDate.slice(0, 8);
+  const credentialScope = `${dateStamp}/${REGION}/s3/aws4_request`;
+
+  const queryParams = {
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Credential": `${ACCESS_KEY}/${credentialScope}`,
+    "X-Amz-Date": amzDate,
+    "X-Amz-Expires": String(expiresInSeconds),
+    "X-Amz-SignedHeaders": "host",
+  };
+
+  const canonicalQueryString = Object.keys(queryParams)
+    .sort()
+    .map((k) => `${awsUriEncode(k, true)}=${awsUriEncode(queryParams[k], true)}`)
+    .join("&");
+
+  const canonicalHeaders = `host:${HOST}\n`;
+  const signedHeaders = "host";
+  const payloadHash = "UNSIGNED-PAYLOAD";
+
+  const canonicalRequest = [
+    "PUT",                       // <-- only difference from the GET version
+    canonicalPath(key),
+    canonicalQueryString,
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join("\n");
+
+  const stringToSign = [
+    "AWS4-HMAC-SHA256",
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest),
+  ].join("\n");
+
+  const kDate = hmac(`AWS4${SECRET_KEY}`, dateStamp);
+  const kRegion = hmac(kDate, REGION);
+  const kService = hmac(kRegion, "s3");
+  const kSigning = hmac(kService, "aws4_request");
+  const signature = crypto.createHmac("sha256", kSigning).update(stringToSign, "utf8").digest("hex");
+
+  return `https://${HOST}${canonicalPath(key)}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
+}
+
+module.exports = { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl,generatePresignedPutUrl };

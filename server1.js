@@ -5862,6 +5862,21 @@ app.get("/api/master-codes/:id", authenticateToken, requireMerchantAccess, async
   }
 });
 
+app.post("/api/master-codes/photo-upload-url", authenticateToken, requireMerchantAccess, async (req, res) => {
+  try {
+    const { filename, contentType } = req.body;
+    if (!contentType || !/^image\//.test(contentType)) {
+      return res.status(400).json({ success: false, error: "Valid image contentType required" });
+    }
+    const photoKey = makeStylePhotoKey(filename || "");
+    const uploadUrl = generatePresignedPutUrl(photoKey, 300);   // no contentType arg
+    res.json({ success: true, uploadUrl, photoKey });
+  } catch (err) {
+    console.error("❌ presign error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 /**
  * POST /api/master-codes
  * Create a new master code
