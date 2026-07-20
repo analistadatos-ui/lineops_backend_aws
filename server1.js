@@ -5902,6 +5902,7 @@ app.post("/api/master-codes", authenticateToken, requireMerchantAccess, async (r
       sam,
       photoBase64,    // e.g. "data:image/png;base64,iVBORw0KG..."
       photoFilename,  // original filename, used only to infer extension
+       photoKey: incomingPhotoKey,   // 
     } = req.body;
     
     // Validate required fields
@@ -5926,27 +5927,11 @@ app.post("/api/master-codes", authenticateToken, requireMerchantAccess, async (r
     }
 
     // Upload the photo to S3, if one was sent
-    if (photoBase64) {
-      try {
-        const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(photoBase64);
-        if (!match) {
-          throw new Error("Photo must be a base64 image data URL");
-        }
-        const [, mimeType, base64Data] = match;
-        const buffer = Buffer.from(base64Data, "base64");
-
-        if (buffer.length > 8 * 1024 * 1024) {
-          throw new Error("Photo exceeds 8MB limit");
-        }
-
-        photoKey = makeStylePhotoKey(photoFilename || "");
-        const uploadResult = await uploadBufferToS3(buffer, photoKey, mimeType);
-        photoUrl = uploadResult.url;
-      } catch (uploadErr) {
-        await client.query("ROLLBACK");
-        console.error("❌ Error uploading photo to S3:", uploadErr.message);
-        return res.status(400).json({ success: false, error: `Photo upload failed: ${uploadErr.message}` });
-      }
+    // The browser already uploaded the file straight to S3 via a presigned URL,
+    // so we just persist the key it returned. A fresh GET URL is signed on read.
+    if (incomingPhotoKey) {
+      photoKey = incomingPhotoKey;
+      photoUrl = generatePresignedGetUrl(photoKey, 3600);
     }
     
     const result = await client.query(
