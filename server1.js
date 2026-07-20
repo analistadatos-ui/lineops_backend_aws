@@ -11,7 +11,7 @@ const morgan = require("morgan");
 const { body, validationResult, param, query } = require("express-validator");
 const winston = require("winston");
 const fs = require("fs");
-const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl } = require("./s3-raw");
+const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl, generatePresignedPutUrl } = require("./s3-raw");
 
 // ----------------------------------------------------------------------
 // 1. LOGGER (Winston)
