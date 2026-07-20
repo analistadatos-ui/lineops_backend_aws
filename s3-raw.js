@@ -13,10 +13,19 @@ for (const key of REQUIRED_ENV) {
 }
 
 const REGION = process.env.AWS_REGION;
-const ACCESS_KEY = process.env.AWS_ACCESS_KEY_ID;
-const SECRET_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const BUCKET = process.env.S3_BUCKET_NAME;
 const HOST = `${BUCKET}.s3.${REGION}.amazonaws.com`;
+
+// Read credentials fresh on every call. Under a Lambda execution role these are
+// TEMPORARY and rotate over the life of the container; caching them at module
+// load causes intermittent 403s after a rotation. REGION/BUCKET never change.
+function getCredentials() {
+  return {
+    accessKey: process.env.AWS_ACCESS_KEY_ID,
+    secretKey: process.env.AWS_SECRET_ACCESS_KEY,
+    sessionToken: process.env.AWS_SESSION_TOKEN, // undefined with static keys
+  };
+}
 
 // --- AWS SigV4 helpers -----------------------------------------------------
 
@@ -53,6 +62,7 @@ function canonicalPath(key) {
 }
 
 function signRequest({ method, key, headers, payloadHash }) {
+  const { accessKey, secretKey, sessionToken } = getCredentials();
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ""); // e.g. 20260706T201530Z
   const dateStamp = amzDate.slice(0, 8);
@@ -61,11 +71,8 @@ function signRequest({ method, key, headers, payloadHash }) {
     host: HOST,
     "x-amz-content-sha256": payloadHash,
     "x-amz-date": amzDate,
-    // When running under a Lambda execution role, credentials are temporary and
-    // require the session token to be signed in. Harmless with static keys.
-    ...(process.env.AWS_SESSION_TOKEN
-      ? { "x-amz-security-token": process.env.AWS_SESSION_TOKEN }
-      : {}),
+    // Temporary (role) credentials require the session token to be signed in.
+    ...(sessionToken ? { "x-amz-security-token": sessionToken } : {}),
     ...headers,
   };
 
@@ -90,14 +97,14 @@ function signRequest({ method, key, headers, payloadHash }) {
     sha256Hex(canonicalRequest),
   ].join("\n");
 
-  const kDate = hmac(`AWS4${SECRET_KEY}`, dateStamp);
+  const kDate = hmac(`AWS4${secretKey}`, dateStamp);
   const kRegion = hmac(kDate, REGION);
   const kService = hmac(kRegion, "s3");
   const kSigning = hmac(kService, "aws4_request");
   const signature = crypto.createHmac("sha256", kSigning).update(stringToSign, "utf8").digest("hex");
 
   const authorization =
-    `AWS4-HMAC-SHA256 Credential=${ACCESS_KEY}/${credentialScope}, ` +
+    `AWS4-HMAC-SHA256 Credential=${accessKey}/${credentialScope}, ` +
     `SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
   return { ...allHeaders, Authorization: authorization };
@@ -171,6 +178,7 @@ function makeStylePhotoKey(originalName = "") {
 function generatePresignedGetUrl(key, expiresInSeconds = 3600) {
   if (!key) return null;
 
+  const { accessKey, secretKey, sessionToken } = getCredentials();
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
   const dateStamp = amzDate.slice(0, 8);
@@ -178,13 +186,11 @@ function generatePresignedGetUrl(key, expiresInSeconds = 3600) {
 
   const queryParams = {
     "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
-    "X-Amz-Credential": `${ACCESS_KEY}/${credentialScope}`,
+    "X-Amz-Credential": `${accessKey}/${credentialScope}`,
     "X-Amz-Date": amzDate,
     "X-Amz-Expires": String(expiresInSeconds),
     "X-Amz-SignedHeaders": "host",
-    ...(process.env.AWS_SESSION_TOKEN
-      ? { "X-Amz-Security-Token": process.env.AWS_SESSION_TOKEN }
-      : {}),
+    ...(sessionToken ? { "X-Amz-Security-Token": sessionToken } : {}),
   };
 
   // Build canonical query string: sorted by key, both key and value percent-encoded
@@ -213,7 +219,7 @@ function generatePresignedGetUrl(key, expiresInSeconds = 3600) {
     sha256Hex(canonicalRequest),
   ].join("\n");
 
-  const kDate = hmac(`AWS4${SECRET_KEY}`, dateStamp);
+  const kDate = hmac(`AWS4${secretKey}`, dateStamp);
   const kRegion = hmac(kDate, REGION);
   const kService = hmac(kRegion, "s3");
   const kSigning = hmac(kService, "aws4_request");
@@ -230,6 +236,7 @@ function generatePresignedGetUrl(key, expiresInSeconds = 3600) {
 function generatePresignedPutUrl(key, expiresInSeconds = 300) {
   if (!key) return null;
 
+  const { accessKey, secretKey, sessionToken } = getCredentials();
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
   const dateStamp = amzDate.slice(0, 8);
@@ -237,10 +244,13 @@ function generatePresignedPutUrl(key, expiresInSeconds = 300) {
 
   const queryParams = {
     "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
-    "X-Amz-Credential": `${ACCESS_KEY}/${credentialScope}`,
+    "X-Amz-Credential": `${accessKey}/${credentialScope}`,
     "X-Amz-Date": amzDate,
     "X-Amz-Expires": String(expiresInSeconds),
     "X-Amz-SignedHeaders": "host",
+    // THIS was missing — temporary (role) credentials need the session token,
+    // signed as a query param, or S3 returns 403 on the PUT.
+    ...(sessionToken ? { "X-Amz-Security-Token": sessionToken } : {}),
   };
 
   const canonicalQueryString = Object.keys(queryParams)
@@ -268,7 +278,7 @@ function generatePresignedPutUrl(key, expiresInSeconds = 300) {
     sha256Hex(canonicalRequest),
   ].join("\n");
 
-  const kDate = hmac(`AWS4${SECRET_KEY}`, dateStamp);
+  const kDate = hmac(`AWS4${secretKey}`, dateStamp);
   const kRegion = hmac(kDate, REGION);
   const kService = hmac(kRegion, "s3");
   const kSigning = hmac(kService, "aws4_request");
