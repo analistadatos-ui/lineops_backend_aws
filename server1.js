@@ -765,6 +765,7 @@ app.post(
     body("slots").isArray({ min: 1 }).withMessage("At least one shift slot required"),
     body("slots.*.label").notEmpty().withMessage("Slot label required"),
     body("slots.*.hours").isFloat({ min: 0 }).withMessage("Planned hours must be non‑negative"),
+     body("workOrderId").optional({ nullable: true }).isInt({ min: 1 }).withMessage("workOrderId must be a positive integer"),
   ]),
   async (req, res, next) => {
     const client = await pool.connect();
@@ -772,11 +773,11 @@ app.post(
       await setSchema(client);
       await client.query("BEGIN");
 
-      const { line, date, style, operators, workingHours, sam, efficiency, target, targetPerHour, slots } = req.body;
+      const { line, date, style, operators, workingHours, sam, efficiency, target, targetPerHour, slots , workOrderId } = req.body;
 
       const lineRunResult = await client.query(
-        `INSERT INTO line_runs (line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+        `INSERT INTO line_runs (line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour, work_order_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
          RETURNING id`,
         [
           line,
@@ -788,6 +789,7 @@ app.post(
           parseFloat(efficiency) || 0.7,
           parseFloat(target) || 0,
           parseFloat(targetPerHour) || 0,
+          workOrderId || null,
         ]
       );
 
@@ -1097,7 +1099,13 @@ app.get("/api/get-run-data/:runId", authenticateToken, async (req, res, next) =>
     await setSchema(client);
     const { runId } = req.params;
 
-    const runResult = await client.query("SELECT * FROM line_runs WHERE id = $1", [runId]);
+     const runResult = await client.query(
+  `SELECT lr.*, wo.work_order_no
+   FROM line_runs lr
+   LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
+   WHERE lr.id = $1`,
+  [runId]
+);
     if (runResult.rows.length === 0) return res.status(404).json({ success: false, error: "Run not found" });
 
     const slotsResult = await client.query(
@@ -1524,7 +1532,7 @@ app.get("/api/run/:runId", async (req, res) => {
     const { runId } = req.params;
 
     // Get line run data
-    const runResult = await client.query("SELECT * FROM line_runs WHERE id = $1", [runId]);
+    const runResult = await client.query("SELECT lr.*, wo.work_order_no FROM line_runs lr LEFT JOIN work_orders wo ON wo.id = lr.work_order_id WHERE lr.id = $1", [runId]);
 
     if (runResult.rows.length === 0) {
       return res.status(404).json({
@@ -3940,6 +3948,7 @@ async function getLineCapacityForDate(client, date) {
   return { lines: fallback.rows, capacitySource: "fallback", capacityDate: dateStr };
 }
 
+
 /**
  * GET /api/planning/available-lines?date=YYYY-MM-DD
  * Per-line capacity for a date, minus whatever is already assigned that date.
@@ -3965,6 +3974,27 @@ app.get("/api/planning/available-lines", authenticateToken, async (req, res) => 
     const assignedByLine = {};
     assignedResult.rows.forEach((r) => { assignedByLine[r.line_no] = parseFloat(r.assigned) || 0; });
 
+    // Which work orders make up each line's load that day (for the dashboard bar)
+    const workOrdersResult = await client.query(
+      `SELECT la.line_no,
+              wo.work_order_no,
+              SUM(la.assigned_quantity) as assigned_quantity
+       FROM line_assignments la
+       JOIN work_orders wo ON wo.id = la.work_order_id
+       WHERE la.assigned_date = $1 AND la.status NOT IN ('cancelled', 'rejected')
+       GROUP BY la.line_no, wo.work_order_no
+       ORDER BY assigned_quantity DESC`,
+      [date]
+    );
+    const workOrdersByLine = {};
+    workOrdersResult.rows.forEach((r) => {
+      if (!workOrdersByLine[r.line_no]) workOrdersByLine[r.line_no] = [];
+      workOrdersByLine[r.line_no].push({
+        work_order_no: r.work_order_no,
+        assigned_quantity: Math.round((parseFloat(r.assigned_quantity) || 0) * 100) / 100,
+      });
+    });
+
     const linesWithAvailability = lines.map((line) => {
       const targetPcs = parseFloat(line.target_pcs) || 0;
       const assigned = assignedByLine[line.line_no] || 0;
@@ -3975,12 +4005,65 @@ app.get("/api/planning/available-lines", authenticateToken, async (req, res) => 
         assigned_quantity: Math.round(assigned * 100) / 100,
         available_capacity: Math.round(available * 100) / 100,
         utilization_percentage: Math.round(utilizationPercentage * 10) / 10,
+        work_orders: workOrdersByLine[line.line_no] || [],
       };
     });
 
     res.json({ success: true, lines: linesWithAvailability, capacitySource, capacityDate });
   } catch (err) {
     console.error("❌ Error fetching available lines:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/planning/line-work-orders", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { line, date } = req.query;
+    if (line == null || String(line).trim() === "") {
+      return res.status(400).json({ success: false, error: "line parameter is required" });
+    }
+
+    const params = [String(line)]; // line_assignments.line_no is TEXT
+    let query = `
+      SELECT
+        la.id              AS assignment_id,
+        la.work_order_id,
+        la.line_no,
+        la.assigned_date,
+        la.assigned_quantity,
+        la.planned_start_date,
+        la.planned_end_date,
+        la.priority,
+        la.status          AS assignment_status,
+        wo.work_order_no,
+        wo.customer_name,
+        wo.style_description,
+        wo.style_code,
+        wo.estilo,
+        wo.color,
+        wo.total_to_produce,
+        wo.commitment_date,
+        wo.sam_minutes     AS sam,
+        wo.status          AS work_order_status
+      FROM line_assignments la
+      JOIN work_orders wo ON wo.id = la.work_order_id
+      WHERE la.line_no = $1
+        AND la.status <> 'cancelled'
+    `;
+    if (date) {
+      params.push(date);
+      query += ` AND la.assigned_date = $${params.length}`;
+    }
+    query += ` ORDER BY la.priority DESC, la.assigned_date ASC, la.created_at DESC;`;
+
+    const result = await client.query(query, params);
+    res.json({ success: true, workOrders: result.rows });
+  } catch (err) {
+    console.error("❌ Error fetching planning line work orders:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
