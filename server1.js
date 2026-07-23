@@ -737,6 +737,15 @@ app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
+const registerWorkOrders = require("./work-orders");
+registerWorkOrders(app, {
+  authenticateToken,
+  pool,
+  setSchema,
+  getCachedPresignedUrl,
+   uploadBufferToS3,      // add
+  makeStylePhotoKey,     // add
+});
 const registerMechanicsSummary = require("./mecanics-summary");
 registerMechanicsSummary(app, authenticateToken);
 
@@ -6412,307 +6421,19 @@ app.post("/api/fabrics", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/api/work-orders", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await setSchema(client);
-    
-    const { status, lineNo, startDate, endDate } = req.query;
-    
-    let query = `
-      SELECT 
-        wo.id,
-        wo.work_order_no,
-        wo.quantity,
-        wo.customer_id,
-        wo.customer_name,
-        wo.style_description,
-        wo.color,
-        wo.fabric_supplier,
-        wo.fabrics,
-        wo.style_code,
-        wo.estilo,
-        wo.line_no,
-        wo.run_date,
-        wo.warehouse_stock,
-        wo.extra_quantity,
-        wo.total_to_produce,
-        wo.commitment_date,
-        wo.master_code_id,
-        wo.sam_minutes,
-        wo.created_at,
-        wo.updated_at,
-        wo.status,
-        MAX(mc.photo_filename) as master_code_photo_filename,
-        COALESCE(SUM(la.assigned_quantity) FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) as assigned_quantity
-      FROM work_orders wo
-      LEFT JOIN line_assignments la ON la.work_order_id = wo.id
-      LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
-      WHERE 1=1
-    `;
-    
-    const params = [];
-    let paramIndex = 1;
-    
-    if (status) {
-      query += ` AND wo.status = $${paramIndex++}`;
-      params.push(status);
-    }
-    
-    if (lineNo) {
-      query += ` AND wo.line_no = $${paramIndex++}`;
-      params.push(lineNo);
-    }
-    
-    if (startDate) {
-      query += ` AND wo.run_date >= $${paramIndex++}`;
-      params.push(startDate);
-    }
-    
-    if (endDate) {
-      query += ` AND wo.run_date <= $${paramIndex++}`;
-      params.push(endDate);
-    }
-    
-    query += ` GROUP BY wo.id ORDER BY wo.created_at DESC`;
-    
-    const result = await client.query(query, params);
 
-    const workOrders = result.rows.map((row) => {
-      const masterCodePhotoUrl = row.master_code_photo_filename
-        ? generatePresignedGetUrl(row.master_code_photo_filename, 3600)
-        : null;
-      delete row.master_code_photo_filename;
-      return { ...row, master_code_photo_url: masterCodePhotoUrl };
-    });
-    
-    res.json({
-      success: true,
-      workOrders,
-    });
-  } catch (err) {
-    logger.error("❌ Error fetching work orders:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    client.release();
-  }
-});
 
 /**
  * GET /api/work-orders/:id
  * Get a specific work order by ID
  */
-app.get("/api/work-orders/:id", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await setSchema(client);
-    
-    const { id } = req.params;
-    
-    const result = await client.query(
-      `
-      SELECT 
-        wo.*,
-        mc.code as master_code,
-        mc.photo_filename as master_code_photo_filename,
-        json_agg(
-          json_build_object(
-            'id', la.id,
-            'line_no', la.line_no,
-            'assigned_date', la.assigned_date,
-            'assigned_quantity', la.assigned_quantity,
-            'status', la.status,
-            'planned_start_date', la.planned_start_date,
-            'planned_end_date', la.planned_end_date
-          )
-        ) FILTER (WHERE la.id IS NOT NULL) as assignments
-      FROM work_orders wo
-      LEFT JOIN line_assignments la ON wo.id = la.work_order_id
-      LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
-      WHERE wo.id = $1
-      GROUP BY wo.id, mc.code, mc.photo_filename
-      `,
-      [id]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: "Work order not found",
-      });
-    }
 
-    const workOrder = result.rows[0];
-    workOrder.master_code_photo_url = workOrder.master_code_photo_filename
-      ? generatePresignedGetUrl(workOrder.master_code_photo_filename, 3600)
-      : null;
-    delete workOrder.master_code_photo_filename;
-    
-    res.json({
-      success: true,
-      workOrder,
-    });
-  } catch (err) {
-    logger.error("❌ Error fetching work order:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    client.release();
-  }
-});
 
 /**
  * POST /api/work-orders
  * Create a new work order
  */
-app.post("/api/work-orders", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await setSchema(client);
-    
-    const {
-      workOrderNo,
-      totalQuantity,
-      warehouseStock,
-      extraQuantity,
-      totalToProduce,
-      commitmentDate,
-      customerId,
-      styleDescription,
-      styleCode,
-      estilo,
-      color,
-      fabricSupplier,
-      fabrics,
-      lineNo,
-      runDate,
-      masterCodeId,
-      samMinutes,
-    } = req.body;
-    
-    // Validate required fields
-    if (!workOrderNo || !totalToProduce || !customerId || !styleDescription) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing required fields: workOrderNo, totalToProduce, customerId, styleDescription",
-      });
-    }
-    
-    // Check if work order number already exists
-    const existingCheck = await client.query(
-      "SELECT id FROM work_orders WHERE work_order_no = $1",
-      [workOrderNo]
-    );
-    
-    if (existingCheck.rows.length > 0) {
-      return res.status(400).json({
-        success: false,
-        error: "Work order number already exists",
-      });
-    }
 
-    // Look up the customer name for backward-compat display columns
-    const customerResult = await client.query(
-      "SELECT name FROM customers WHERE id = $1",
-      [parseInt(customerId)]
-    );
-    if (customerResult.rows.length === 0) {
-      return res.status(400).json({ success: false, error: "Customer not found" });
-    }
-    const customerName = customerResult.rows[0].name;
-
-    // If a master code was selected, use its own SAM unless the caller explicitly overrode it
-    let resolvedSamMinutes = samMinutes ? parseFloat(samMinutes) : null;
-    if (masterCodeId && resolvedSamMinutes === null) {
-      const mc = await client.query(
-        "SELECT sam_minutes FROM master_codes WHERE id = $1",
-        [parseInt(masterCodeId)]
-      );
-      if (mc.rows.length > 0) {
-        resolvedSamMinutes = parseFloat(mc.rows[0].sam_minutes);
-      }
-    }
-    
-    const result = await client.query(
-      `
-      INSERT INTO work_orders (
-        work_order_no,
-        quantity,
-        customer_id,
-        customer_name,
-        style_description,
-        color,
-        fabric_supplier,
-        style_code,
-        estilo,
-        fabrics,
-        line_no,
-        run_date,
-        warehouse_stock,
-        extra_quantity,
-        total_to_produce,
-        commitment_date,
-        master_code_id,
-        sam_minutes,
-        created_at,
-        updated_at,
-        status
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW(), NOW(), 'pending')
-      RETURNING *
-      `,
-      [
-        workOrderNo,
-        parseFloat(totalQuantity) || parseFloat(totalToProduce),
-        parseInt(customerId),
-        customerName,
-        styleDescription,
-        color || null,
-        fabricSupplier || null,
-        styleCode || null,
-        estilo || null,
-        Array.isArray(fabrics) ? fabrics : [],
-        lineNo || null,
-        runDate || null,
-        parseFloat(warehouseStock) || 0,
-        parseFloat(extraQuantity) || 0,
-        parseFloat(totalToProduce),
-        commitmentDate || null,
-        masterCodeId ? parseInt(masterCodeId) : null,
-        resolvedSamMinutes,
-      ]
-    );
-    
-    const workOrder = result.rows[0];
-    if (workOrder.master_code_id) {
-      const mcResult = await client.query(
-        "SELECT photo_filename FROM master_codes WHERE id = $1",
-        [workOrder.master_code_id]
-      );
-      workOrder.master_code_photo_url = mcResult.rows[0]?.photo_filename
-        ? generatePresignedGetUrl(mcResult.rows[0].photo_filename, 3600)
-        : null;
-    }
-    
-    res.json({
-      success: true,
-      message: "Work order created successfully",
-      workOrder,
-    });
-  } catch (err) {
-    logger.error("❌ Error creating work order:", err.message);
-    
-    if (err.code === "23505") {
-      return res.status(400).json({
-        success: false,
-        error: "Work order number already exists",
-      });
-    }
-    
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    client.release();
-  }
-});
 
 /**
  * PUT /api/work-orders/:id
