@@ -390,7 +390,7 @@ function registerWorkOrders(
         photoKey: incomingPhotoKey,   // browser already uploaded to S3 via presigned PUT
         lines,
         workOrderNo,
-        commitmentDate, fabrics, warehouseStock, extraQuantity,
+        commitmentDate, season, fabrics, warehouseStock, extraQuantity,
       } = req.body;
 
       const T = up(tipo, 3), M = up(modelo, 3), C = up(correlativo, 2);
@@ -424,8 +424,7 @@ function registerWorkOrders(
       }
       const customerName = cust.rows[0].name;
 
-      // The browser already uploaded the file straight to S3 via a presigned
-      // PUT (POST /api/master-codes/photo-upload-url), so we only receive the key.
+      // Photo already uploaded to S3 by the browser (presigned PUT); store its key.
       if (incomingPhotoKey) {
         photoKey = incomingPhotoKey;
         photoUrl = generatePresignedGetUrl(photoKey, 3600);
@@ -462,15 +461,15 @@ function registerWorkOrders(
             work_order_no, quantity, customer_id, customer_name, style_description,
             color, fabric_supplier, style_code, estilo, fabrics, warehouse_stock,
             extra_quantity, total_to_produce, commitment_date, master_code_id,
-            sam_minutes, created_at, updated_at, status
+            sam_minutes, season, created_at, updated_at, status
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW(),NOW(),'pending')
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW(),NOW(),'pending')
          RETURNING *`,
         [
           workOrderNo, orderedQty, parseInt(customerId), customerName, description,
           colorSummary, (Array.isArray(fabrics) ? fabrics[0] : null) || null, styleCode, EST,
           Array.isArray(fabrics) ? fabrics : [], wStock, xtra, totalToProduce,
-          commitmentDate || null, primaryMasterCodeId, samNum,
+          commitmentDate || null, primaryMasterCodeId, samNum, season || null,
         ]
       );
       const workOrder = woResult.rows[0];
