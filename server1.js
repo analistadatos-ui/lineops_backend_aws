@@ -4158,23 +4158,30 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
     await setSchema(client);
     const { workOrderId, lineNo, date } = req.query;
 
-    let query = "SELECT * FROM line_assignments WHERE 1=1";
+    let query = `
+      SELECT la.*,
+             wo.work_order_no,
+             wo.style_description,
+             wo.customer_name
+        FROM line_assignments la
+        JOIN work_orders wo ON wo.id = la.work_order_id
+       WHERE 1=1`;
     const params = [];
     let paramIndex = 1;
-
+ 
     if (workOrderId) {
-      query += ` AND work_order_id = $${paramIndex++}`;
+      query += ` AND la.work_order_id = $${paramIndex++}`;
       params.push(parseInt(workOrderId));
     }
     if (lineNo) {
-      query += ` AND line_no = $${paramIndex++}`;
+      query += ` AND la.line_no = $${paramIndex++}`;
       params.push(lineNo);
     }
     if (date) {
-      query += ` AND assigned_date = $${paramIndex++}`;
+      query += ` AND la.assigned_date = $${paramIndex++}`;
       params.push(date);
     }
-    query += " ORDER BY created_at DESC";
+    query += " ORDER BY la.created_at DESC";
 
     const result = await client.query(query, params);
     res.json({ success: true, assignments: result.rows });
@@ -4185,6 +4192,9 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
     client.release();
   }
 });
+
+
+
 
 /**
  * POST /api/line-assignments
@@ -4290,6 +4300,53 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error creating line assignment:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { id } = req.params;
+
+    const existing = await client.query(
+      "SELECT work_order_id FROM line_assignments WHERE id = $1",
+      [parseInt(id)]
+    );
+    if (existing.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Assignment not found" });
+    }
+    const workOrderId = existing.rows[0].work_order_id;
+
+    await client.query("DELETE FROM line_assignments WHERE id = $1", [parseInt(id)]);
+
+    // If no active assignments remain, return the work order to 'pending'
+    // (mirror of the POST, which moves 'pending' -> 'assigned').
+    const remainingActive = await client.query(
+      `SELECT COALESCE(SUM(assigned_quantity), 0) AS total
+         FROM line_assignments
+        WHERE work_order_id = $1 AND status NOT IN ('cancelled')`,
+      [workOrderId]
+    );
+    const stillAssigned = parseFloat(remainingActive.rows[0].total) || 0;
+    if (stillAssigned <= 0) {
+      await client.query(
+        "UPDATE work_orders SET status = CASE WHEN status = 'assigned' THEN 'pending' ELSE status END, updated_at = NOW() WHERE id = $1",
+        [workOrderId]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, message: "Line assignment removed", workOrderId });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error deleting line assignment:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
