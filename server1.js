@@ -742,6 +742,7 @@ registerWorkOrders(app, {
   authenticateToken,
   pool,
   setSchema,
+  generatePresignedGetUrl,
    uploadBufferToS3,      // add
   makeStylePhotoKey,     // add
 });

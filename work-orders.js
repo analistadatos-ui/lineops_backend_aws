@@ -31,7 +31,7 @@
 //          authenticateToken,
 //          pool,
 //          setSchema,
-//          getCachedPresignedUrl,   // presignCache (already required at top)
+//          generatePresignedGetUrl,   // presignCache (already required at top)
 //          uploadBufferToS3,        // s3-raw (already required at top)
 //          makeStylePhotoKey,       // s3-raw (already required at top)
 //        });
@@ -101,13 +101,13 @@ const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, 
  * @param {import('express').RequestHandler} deps.authenticateToken
  * @param {import('pg').Pool} deps.pool
  * @param {(client: any) => Promise<void>} deps.setSchema
- * @param {(filename: string) => string} deps.getCachedPresignedUrl
+ * @param {(filename: string) => string} deps.generatePresignedGetUrl
  * @param {(buffer: Buffer, key: string, mime: string) => Promise<{url:string}>} [deps.uploadBufferToS3]
  * @param {(filename: string) => string} [deps.makeStylePhotoKey]
  */
 function registerWorkOrders(
   app,
-  { authenticateToken, pool, setSchema, getCachedPresignedUrl, uploadBufferToS3, makeStylePhotoKey }
+  { authenticateToken, pool, setSchema, generatePresignedGetUrl, uploadBufferToS3, makeStylePhotoKey }
 ) {
   // =====================================================================
   //  WORK-ORDER ROUTES (per-color breakdown)
@@ -148,7 +148,7 @@ function registerWorkOrders(
       const result = await client.query(query, params);
       const workOrders = result.rows.map((row) => {
         const url = row.master_code_photo_filename
-          ? getCachedPresignedUrl(row.master_code_photo_filename)
+          ? generatePresignedGetUrl(row.master_code_photo_filename, 3600)
           : null;
         delete row.master_code_photo_filename;
         return { ...row, master_code_photo_url: url };
@@ -227,7 +227,7 @@ function registerWorkOrders(
 
       const workOrder = result.rows[0];
       workOrder.master_code_photo_url = workOrder.master_code_photo_filename
-        ? getCachedPresignedUrl(workOrder.master_code_photo_filename)
+        ? generatePresignedGetUrl(workOrder.master_code_photo_filename, 3600)
         : null;
       delete workOrder.master_code_photo_filename;
 
@@ -335,7 +335,7 @@ function registerWorkOrders(
       if (workOrder.master_code_id) {
         const mcResult = await client.query("SELECT photo_filename FROM master_codes WHERE id = $1", [workOrder.master_code_id]);
         workOrder.master_code_photo_url = mcResult.rows[0]?.photo_filename
-          ? getCachedPresignedUrl(mcResult.rows[0].photo_filename)
+          ? generatePresignedGetUrl(mcResult.rows[0].photo_filename, 3600)
           : null;
       }
 
@@ -387,7 +387,7 @@ function registerWorkOrders(
         tipo, modelo, correlativo,
         clienteCode, customerId, estilo,
         description, sam,
-        photoBase64, photoFilename,
+        photoKey: incomingPhotoKey,   // browser already uploaded to S3 via presigned PUT
         lines,
         workOrderNo,
         commitmentDate, fabrics, warehouseStock, extraQuantity,
@@ -424,21 +424,11 @@ function registerWorkOrders(
       }
       const customerName = cust.rows[0].name;
 
-      if (photoBase64) {
-        const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(photoBase64);
-        if (!match) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({ success: false, error: "Photo must be a base64 image data URL" });
-        }
-        const [, mimeType, base64Data] = match;
-        const buffer = Buffer.from(base64Data, "base64");
-        if (buffer.length > 8 * 1024 * 1024) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({ success: false, error: "Photo exceeds 8MB limit" });
-        }
-        photoKey = makeStylePhotoKey(photoFilename || "");
-        const uploadResult = await uploadBufferToS3(buffer, photoKey, mimeType);
-        photoUrl = uploadResult.url;
+      // The browser already uploaded the file straight to S3 via a presigned
+      // PUT (POST /api/master-codes/photo-upload-url), so we only receive the key.
+      if (incomingPhotoKey) {
+        photoKey = incomingPhotoKey;
+        photoUrl = generatePresignedGetUrl(photoKey, 3600);
       }
 
       const samNum = parseFloat(sam) || 0;
@@ -496,7 +486,7 @@ function registerWorkOrders(
       await client.query("COMMIT");
 
       workOrder.lines = cells;
-      if (photoKey) workOrder.master_code_photo_url = getCachedPresignedUrl(photoKey);
+      if (photoKey) workOrder.master_code_photo_url = generatePresignedGetUrl(photoKey, 3600);
 
       res.json({
         success: true,
