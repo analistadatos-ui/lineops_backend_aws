@@ -4159,7 +4159,20 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
     const { workOrderId, lineNo, date } = req.query;
 
     let query = `
-      SELECT la.*,
+      SELECT la.id,
+             la.work_order_id,
+             la.line_run_id,
+             la.line_no,
+             to_char(la.assigned_date, 'YYYY-MM-DD')       AS assigned_date,
+             la.assigned_quantity,
+             la.available_minutes,
+             la.required_production_rate,
+             to_char(la.planned_start_date, 'YYYY-MM-DD')  AS planned_start_date,
+             to_char(la.planned_end_date, 'YYYY-MM-DD')    AS planned_end_date,
+             la.priority,
+             la.status,
+             la.created_at,
+             la.updated_at,
              wo.work_order_no,
              wo.style_description,
              wo.customer_name
