@@ -506,6 +506,7 @@ await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_line ON line
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_work_order ON line_assignments(work_order_id);");
 
 
+await registerCutOrders.initSchema({ pool, setSchema });
 
     // Create index for faster queries
     await client.query("CREATE INDEX IF NOT EXISTS idx_capacity_history_operation ON operator_capacity_history(operation_id);");
@@ -736,6 +737,9 @@ app.post(
 app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
+
+const registerCutOrders = require("./cut-orders");
+registerCutOrders(app, { authenticateToken, pool, setSchema });
 
 const registerWorkOrders = require("./work-orders");
 registerWorkOrders(app, {
