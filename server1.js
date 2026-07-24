@@ -6231,7 +6231,150 @@ app.delete("/api/master-codes/:id", authenticateToken, requireMerchantAccess, as
   }
 });
 
-
+/**
+ * PUT /api/master-codes/:id
+ * Update an existing master code (fix a mistake). Accepts a numeric id or the
+ * code string, mirroring GET/DELETE. Any subset of fields may be sent.
+ *
+ * Photo:
+ *   - send  photoKey   (from /api/master-codes/photo-upload-url) to replace it
+ *   - send  removePhoto: true   to clear it
+ *   - send neither to leave the current photo untouched
+ */
+app.put("/api/master-codes/:id", authenticateToken, requireMerchantAccess, async (req, res) => {
+  const client = await pool.connect();
+  let newPhotoKey = null; // set if the caller uploaded a replacement photo
+  let oldPhotoKey = null; // deleted from S3 only after a successful swap/remove
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+ 
+    const { id } = req.params;
+    const isNumeric = /^\d+$/.test(id);
+ 
+    // Load the current row first (we need its id + old photo key).
+    const currentRes = await client.query(
+      isNumeric
+        ? "SELECT id, code, photo_filename FROM master_codes WHERE id = $1"
+        : "SELECT id, code, photo_filename FROM master_codes WHERE code = $1",
+      [isNumeric ? parseInt(id, 10) : id]
+    );
+ 
+    if (currentRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Master code not found" });
+    }
+ 
+    const current = currentRes.rows[0];
+    const rowId = current.id;
+ 
+    const {
+      code,
+      type,
+      modelo,
+      correlativo,
+      talla,
+      cliente,
+      color,
+      estilo,
+      description,
+      sam,
+      photoKey,     // replacement image key (optional)
+      removePhoto,  // boolean, clear the image (optional)
+    } = req.body;
+ 
+    // If the code itself is being changed, make sure no OTHER row already uses it.
+    if (code && code !== current.code) {
+      const dup = await client.query(
+        "SELECT id FROM master_codes WHERE code = $1 AND id <> $2",
+        [code, rowId]
+      );
+      if (dup.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, error: "Master code already exists" });
+      }
+    }
+ 
+    // Build the UPDATE dynamically so partial edits work too.
+    const updates = [];
+    const values = [];
+    let i = 1;
+    const setField = (col, val) => {
+      updates.push(`${col} = $${i++}`);
+      values.push(val);
+    };
+ 
+    if (code !== undefined) setField("code", code);
+    if (type !== undefined) setField("type", type);
+    if (modelo !== undefined) setField("modelo", modelo);
+    if (correlativo !== undefined) setField("correlativo", correlativo);
+    if (talla !== undefined) setField("talla", talla);
+    if (cliente !== undefined) setField("cliente", cliente);
+    if (color !== undefined) setField("color", color);
+    if (estilo !== undefined) setField("estilo", estilo);
+    if (description !== undefined) setField("description", description);
+    if (sam !== undefined) setField("sam_minutes", parseFloat(sam) || 0);
+ 
+    if (photoKey) {
+      newPhotoKey = photoKey;
+      oldPhotoKey = current.photo_filename || null;
+      setField("photo_filename", photoKey);
+      setField("photo_url", generatePresignedGetUrl(photoKey, 3600));
+    } else if (removePhoto) {
+      oldPhotoKey = current.photo_filename || null;
+      setField("photo_filename", null);
+      setField("photo_url", null);
+    }
+ 
+    if (updates.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: "No fields to update" });
+    }
+ 
+    updates.push(`updated_at = NOW()`);
+    values.push(rowId);
+ 
+    const result = await client.query(
+      `
+      UPDATE master_codes
+      SET ${updates.join(", ")}
+      WHERE id = $${i}
+      RETURNING
+        id, code, type, modelo, correlativo, talla, cliente, color, estilo,
+        description, sam_minutes AS sam, photo_filename,
+        created_at AS "createdAt"
+      `,
+      values
+    );
+ 
+    await client.query("COMMIT");
+ 
+    // The previous image is now unreferenced — clean it up (best effort).
+    if (oldPhotoKey && oldPhotoKey !== newPhotoKey) {
+      await deleteFromS3(oldPhotoKey);
+    }
+ 
+    const row = result.rows[0];
+    row.photoUrl = row.photo_filename ? generatePresignedGetUrl(row.photo_filename, 3600) : null;
+ 
+    res.json({
+      success: true,
+      message: "Master code updated successfully",
+      masterCode: row,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error updating master code:", err.message);
+    // Don't leak the object we just uploaded if the DB write failed.
+    if (newPhotoKey) await deleteFromS3(newPhotoKey);
+    if (err.code === "23505") {
+      return res.status(400).json({ success: false, error: "Master code already exists" });
+    }
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
 
 // ----------------------------------------------------------------------
 // 18. USER MANAGEMENT
