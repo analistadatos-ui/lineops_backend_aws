@@ -41,6 +41,10 @@ async function initSchema({ pool, setSchema }) {
     // yield (fabric per piece) and the resulting total fabric length
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS yield_per_piece NUMERIC(10,4);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS total_length NUMERIC(14,2);`);
+    // cutting progress (filled by the cutter)
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS panels INT;`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS amount_cut NUMERIC(12,2);`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS remaining_to_cut NUMERIC(12,2);`);
     console.log("✅ cut_orders table ready in prod_db_schema");
   } finally {
     client.release();
@@ -69,6 +73,9 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                co.quantity,
                co.yield_per_piece,
                co.total_length,
+               co.panels,
+               co.amount_cut,
+               co.remaining_to_cut,
                co.notes,
                co.status,
                co.created_at,
@@ -127,6 +134,54 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       res.json({ success: true, cutOrder: result.rows[0] });
     } catch (err) {
       console.error("❌ Error creating cut order:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Record cutting progress: panels, amount cut, and remaining to cut.
+  // Sets status to 'completed' when nothing remains, else 'in_progress'.
+  app.patch("/api/cut-orders/:id/cutting", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { panels, amountCut, remainingToCut } = req.body;
+
+      const p = panels === undefined || panels === null || panels === "" ? null : parseInt(panels);
+      const cut = amountCut === undefined || amountCut === null || amountCut === "" ? null : parseFloat(amountCut);
+      const rem = remainingToCut === undefined || remainingToCut === null || remainingToCut === "" ? null : parseFloat(remainingToCut);
+
+      if (cut !== null && (isNaN(cut) || cut < 0)) {
+        return res.status(400).json({ success: false, error: "Cantidad cortada inválida" });
+      }
+      if (rem !== null && (isNaN(rem) || rem < 0)) {
+        return res.status(400).json({ success: false, error: "Restante por cortar inválido" });
+      }
+      if (p !== null && (isNaN(p) || p < 0)) {
+        return res.status(400).json({ success: false, error: "N° de paneles inválido" });
+      }
+
+      // Status: completed if remaining is 0 (and some cutting recorded), else in_progress.
+      const newStatus = rem !== null && rem <= 0 ? "completed" : "in_progress";
+
+      const result = await client.query(
+        `UPDATE cut_orders
+            SET panels = COALESCE($1, panels),
+                amount_cut = COALESCE($2, amount_cut),
+                remaining_to_cut = COALESCE($3, remaining_to_cut),
+                status = $4,
+                updated_at = now()
+          WHERE id = $5
+          RETURNING *`,
+        [p, cut, rem, newStatus, parseInt(req.params.id)]
+      );
+      if (result.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "Cut order not found" });
+      }
+      res.json({ success: true, cutOrder: result.rows[0] });
+    } catch (err) {
+      console.error("❌ Error saving cutting progress:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
       client.release();
