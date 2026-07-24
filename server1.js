@@ -1190,6 +1190,74 @@ app.get("/api/line-runs", authenticateToken, async (req, res, next) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// PATCH /api/line-runs/operators  —  add to server.js (near the other
+// /api/line-runs routes). Changing the number of sewers (operators) on a line
+// recomputes its daily capacity:
+//
+//   available minutes/day = operators × working_hours × 60 × efficiency
+//   target_pcs (per day)  = available minutes/day ÷ SAM
+//   target_per_hour       = target_pcs ÷ working_hours
+//
+// By default it applies to ALL runs of the line (each recomputed with its own
+// working_hours / efficiency / SAM). Pass an optional `date` to scope it to a
+// single run_date.
+// ---------------------------------------------------------------------------
+app.patch("/api/line-runs/operators", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { lineNo, operators, date } = req.body;
+    const ops = parseInt(operators);
+ 
+    if (lineNo === undefined || lineNo === null || String(lineNo).trim() === "" || isNaN(ops) || ops < 0) {
+      return res.status(400).json({ success: false, error: "lineNo y operators (>= 0) son obligatorios" });
+    }
+ 
+    const params = [String(lineNo)];
+    let where = "WHERE line_no = $1";
+    if (date) {
+      params.push(date);
+      where += " AND run_date = $2";
+    }
+ 
+    const runs = await client.query(
+      `SELECT id, working_hours, efficiency, sam_minutes FROM line_runs ${where}`,
+      params
+    );
+    if (runs.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "No hay corridas para esa línea" });
+    }
+ 
+    await client.query("BEGIN");
+    let updated = 0;
+    for (const r of runs.rows) {
+      const wh = parseFloat(r.working_hours) || 0;
+      const eff = parseFloat(r.efficiency) || 0;
+      const sam = parseFloat(r.sam_minutes) || 0;
+      const availableMin = ops * wh * 60 * eff;
+      const targetPcs = sam > 0 ? availableMin / sam : 0;
+      const targetPerHour = wh > 0 ? targetPcs / wh : 0;
+      await client.query(
+        `UPDATE line_runs
+            SET operators_count = $1, target_pcs = $2, target_per_hour = $3, updated_at = now()
+          WHERE id = $4`,
+        [ops, targetPcs, targetPerHour, r.id]
+      );
+      updated++;
+    }
+    await client.query("COMMIT");
+ 
+    res.json({ success: true, updated, operators: ops });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ Error updating line operators:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/line-runs/:lineNo", authenticateToken, async (req, res, next) => {
   const client = await pool.connect();
   try {
