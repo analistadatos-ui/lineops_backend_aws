@@ -1279,6 +1279,89 @@ app.get("/api/line-runs/:lineNo", authenticateToken, async (req, res, next) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// PATCH /api/line-assignments/:id/move  —  add to server.js near the other
+// line-assignments routes.
+//
+// Moves an existing assignment to another line and/or day. Revalidates the
+// target's daily capacity (target_pcs of the line's run for that date, minus
+// what's already assigned there — excluding this assignment itself).
+// ---------------------------------------------------------------------------
+app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const id = parseInt(req.params.id);
+    const { lineNo, assignedDate } = req.body;
+
+    if (!lineNo || !assignedDate) {
+      return res.status(400).json({ success: false, error: "lineNo y assignedDate son obligatorios" });
+    }
+
+    const cur = await client.query(
+      "SELECT id, assigned_quantity FROM line_assignments WHERE id = $1",
+      [id]
+    );
+    if (cur.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Assignment not found" });
+    }
+    const qty = parseFloat(cur.rows[0].assigned_quantity) || 0;
+
+    // Target capacity: exact run for that line+date, else the line's latest run.
+    let capRes = await client.query(
+      "SELECT id, target_pcs FROM line_runs WHERE line_no = $1 AND run_date = $2 ORDER BY updated_at DESC LIMIT 1",
+      [String(lineNo), assignedDate]
+    );
+    if (capRes.rows.length === 0) {
+      capRes = await client.query(
+        "SELECT id, target_pcs FROM line_runs WHERE line_no = $1 ORDER BY run_date DESC LIMIT 1",
+        [String(lineNo)]
+      );
+    }
+    if (capRes.rows.length === 0) {
+      return res.status(400).json({ success: false, error: `Línea ${lineNo} sin capacidad configurada` });
+    }
+    const capacity = parseFloat(capRes.rows[0].target_pcs) || 0;
+    const runId = capRes.rows[0].id;
+
+    // Already assigned on the target line/day, excluding this assignment.
+    const usedRes = await client.query(
+      `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
+         FROM line_assignments
+        WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled') AND id <> $3`,
+      [String(lineNo), assignedDate, id]
+    );
+    const used = parseFloat(usedRes.rows[0].used) || 0;
+    const available = capacity - used;
+
+    if (qty > available) {
+      return res.status(400).json({
+        success: false,
+        error: `La línea ${lineNo} solo tiene ${Math.max(0, Math.round(available))} pzas disponibles el ${assignedDate}`,
+      });
+    }
+
+    const upd = await client.query(
+      `UPDATE line_assignments
+          SET line_no = $1,
+              line_run_id = $2,
+              assigned_date = $3,
+              planned_start_date = $3,
+              planned_end_date = $3,
+              updated_at = now()
+        WHERE id = $4
+        RETURNING *`,
+      [String(lineNo), runId, assignedDate, id]
+    );
+    res.json({ success: true, assignment: upd.rows[0] });
+  } catch (err) {
+    console.error("❌ Error moving line assignment:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/lineleader/latest-run", authenticateToken, allowRoles("line_leader", "engineer", "supervisor"), async (req, res, next) => {
   const client = await pool.connect();
   try {
