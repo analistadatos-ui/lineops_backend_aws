@@ -71,11 +71,14 @@ async function initSchema({ pool, setSchema }) {
         master_code_id BIGINT REFERENCES master_codes(id) ON DELETE SET NULL,
         talla VARCHAR(3) NOT NULL,
         color VARCHAR(3) NOT NULL,
+        estilo VARCHAR(6),
         quantity NUMERIC(12,2) NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         CONSTRAINT chk_wo_line_qty_positive CHECK (quantity > 0)
       );
     `);
+    // Additive migration for databases created before per-color estilo existed.
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS estilo VARCHAR(6);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_work_order_lines_wo ON work_order_lines(work_order_id);");
     await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_order_lines_unique ON work_order_lines(work_order_id, talla, color);");
     console.log("✅ work_order_lines table ready in prod_db_schema");
@@ -107,7 +110,10 @@ const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, 
  */
 function registerWorkOrders(
   app,
-  { authenticateToken, pool, setSchema, generatePresignedGetUrl, uploadBufferToS3, makeStylePhotoKey }
+  // server.js passes `getCachedPresignedUrl` (the cached presigner). Bind it to the
+  // local name this module calls. Its calls pass an expiry arg (…, 3600) which the
+  // cache function simply ignores — harmless.
+  { authenticateToken, pool, setSchema, getCachedPresignedUrl: generatePresignedGetUrl, uploadBufferToS3, makeStylePhotoKey }
 ) {
   // =====================================================================
   //  WORK-ORDER ROUTES (per-color breakdown)
@@ -387,27 +393,55 @@ function registerWorkOrders(
         tipo, modelo, correlativo,
         clienteCode, customerId, estilo,
         description, sam,
-        photoKey: incomingPhotoKey,   // browser already uploaded to S3 via presigned PUT
+        photoBase64, photoFilename,   // wizard sends the image inline as a base64 data URL
         lines,
         workOrderNo,
         commitmentDate, season, fabrics, warehouseStock, extraQuantity,
       } = req.body;
 
       const T = up(tipo, 3), M = up(modelo, 3), C = up(correlativo, 2);
-      const CLI = up(clienteCode, 3), EST = up(estilo, 6);
+      const CLI = up(clienteCode, 3), EST = up(estilo, 6); // EST is now only a fallback default
 
+      // Each line carries its OWN estilo (client style ref). If a line omits it,
+      // fall back to the order-level EST so older callers keep working.
       const cells = Array.isArray(lines)
         ? lines
-            .map((l) => ({ talla: up(l.talla, 3), color: up(l.color, 3), quantity: parseFloat(l.quantity) }))
+            .map((l) => ({
+              talla: up(l.talla, 3),
+              color: up(l.color, 3),
+              estilo: up(l.estilo, 6) || EST,
+              quantity: parseFloat(l.quantity),
+            }))
             .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0)
         : [];
 
-      if (!T || !M || !C || !CLI || !EST || !description || !sam) {
-        return res.status(400).json({ success: false, error: "Missing style fields: tipo, modelo, correlativo, clienteCode, estilo, description, sam" });
+      if (!T || !M || !C || !CLI || !description || !sam) {
+        return res.status(400).json({ success: false, error: "Missing style fields: tipo, modelo, correlativo, clienteCode, description, sam" });
       }
       if (!customerId) return res.status(400).json({ success: false, error: "customerId is required" });
       if (cells.length === 0) return res.status(400).json({ success: false, error: "Enter at least one size/color quantity" });
       if (!workOrderNo) return res.status(400).json({ success: false, error: "workOrderNo is required" });
+
+      // Every color/size cell needs a 6-char estilo (per-color estilo cliente).
+      const badEstilo = cells.find((c) => !c.estilo || c.estilo.length !== 6);
+      if (badEstilo) {
+        return res.status(400).json({
+          success: false,
+          error: `Falta el estilo cliente (6 caracteres) para el color ${badEstilo.color || "?"}`,
+        });
+      }
+
+      // A given color must map to exactly one estilo (colors identify the colorway).
+      const colorEstilo = {};
+      for (const c of cells) {
+        if (colorEstilo[c.color] && colorEstilo[c.color] !== c.estilo) {
+          return res.status(400).json({
+            success: false,
+            error: `El color ${c.color} tiene más de un estilo (${colorEstilo[c.color]} y ${c.estilo}). Usa un color distinto por estilo.`,
+          });
+        }
+        colorEstilo[c.color] = c.estilo;
+      }
 
       await client.query("BEGIN");
 
@@ -424,9 +458,22 @@ function registerWorkOrders(
       }
       const customerName = cust.rows[0].name;
 
-      // Photo already uploaded to S3 by the browser (presigned PUT); store its key.
-      if (incomingPhotoKey) {
-        photoKey = incomingPhotoKey;
+      // The wizard sends the image inline as a base64 data URL. Decode it, upload
+      // to S3, and keep the object key — same flow as server.js's master-codes route.
+      if (photoBase64) {
+        const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(photoBase64);
+        if (!match) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, error: "Photo must be a base64 image data URL" });
+        }
+        const [, mimeType, base64Data] = match;
+        const buffer = Buffer.from(base64Data, "base64");
+        if (buffer.length > 8 * 1024 * 1024) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, error: "Photo exceeds 8MB limit" });
+        }
+        photoKey = makeStylePhotoKey(photoFilename || "");
+        await uploadBufferToS3(buffer, photoKey, mimeType);
         photoUrl = generatePresignedGetUrl(photoKey, 3600);
       }
 
@@ -435,14 +482,14 @@ function registerWorkOrders(
       let created = 0, reused = 0;
       const codeToId = {};
       for (const cell of cells) {
-        const code = `${T}${M}${C}${cell.talla}${CLI}-${cell.color}-${EST}`;
+        const code = `${T}${M}${C}${cell.talla}${CLI}-${cell.color}-${cell.estilo}`;
         const r = await client.query(
           `INSERT INTO master_codes
              (code,type,modelo,correlativo,talla,cliente,color,estilo,description,sam_minutes,photo_url,photo_filename,created_by,created_at,updated_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW(),NOW())
            ON CONFLICT (code) DO UPDATE SET updated_at = NOW()
            RETURNING id, (xmax = 0) AS inserted`,
-          [code, T, M, C, cell.talla, CLI, cell.color, EST, description, samNum, photoUrl, photoKey, req.user.id]
+          [code, T, M, C, cell.talla, CLI, cell.color, cell.estilo, description, samNum, photoUrl, photoKey, req.user.id]
         );
         codeToId[`${cell.talla}|${cell.color}`] = r.rows[0].id;
         if (r.rows[0].inserted) created++; else reused++;
@@ -455,6 +502,10 @@ function registerWorkOrders(
       const colorSummary = [...new Set(cells.map((c) => c.color))].join(", ");
       const styleCode = `${T}${M}${C}`;
       const primaryMasterCodeId = codeToId[`${cells[0].talla}|${cells[0].color}`];
+      // estilo now varies per color; the PO row stores the primary one. The full
+      // per-color mapping lives in work_order_lines.estilo (and each master code).
+      const primaryEstilo = cells[0].estilo;
+      const estiloSummary = [...new Set(cells.map((c) => c.estilo))].join(", ");
 
       const woResult = await client.query(
         `INSERT INTO work_orders (
@@ -467,7 +518,7 @@ function registerWorkOrders(
          RETURNING *`,
         [
           workOrderNo, orderedQty, parseInt(customerId), customerName, description,
-          colorSummary, (Array.isArray(fabrics) ? fabrics[0] : null) || null, styleCode, EST,
+          colorSummary, (Array.isArray(fabrics) ? fabrics[0] : null) || null, styleCode, primaryEstilo,
           Array.isArray(fabrics) ? fabrics : [], wStock, xtra, totalToProduce,
           commitmentDate || null, primaryMasterCodeId, samNum, season || null,
         ]
@@ -476,15 +527,16 @@ function registerWorkOrders(
 
       for (const cell of cells) {
         await client.query(
-          `INSERT INTO work_order_lines (work_order_id, master_code_id, talla, color, quantity)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [workOrder.id, codeToId[`${cell.talla}|${cell.color}`], cell.talla, cell.color, cell.quantity]
+          `INSERT INTO work_order_lines (work_order_id, master_code_id, talla, color, estilo, quantity)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [workOrder.id, codeToId[`${cell.talla}|${cell.color}`], cell.talla, cell.color, cell.estilo, cell.quantity]
         );
       }
 
       await client.query("COMMIT");
 
-      workOrder.lines = cells;
+      workOrder.lines = cells; // each { talla, color, estilo, quantity }
+      workOrder.estilos = estiloSummary;
       if (photoKey) workOrder.master_code_photo_url = generatePresignedGetUrl(photoKey, 3600);
 
       res.json({
