@@ -110,11 +110,28 @@ const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, 
  */
 function registerWorkOrders(
   app,
-  // server.js passes `getCachedPresignedUrl` (the cached presigner). Bind it to the
-  // local name this module calls. Its calls pass an expiry arg (…, 3600) which the
-  // cache function simply ignores — harmless.
-  { authenticateToken, pool, setSchema, getCachedPresignedUrl: generatePresignedGetUrl, uploadBufferToS3, makeStylePhotoKey }
+  // The presigner may arrive under either name: server.js currently passes it as
+  // `generatePresignedGetUrl` (the raw s3-raw presigner), while this module was
+  // originally written to expect `getCachedPresignedUrl` (a cached variant).
+  // Accept both and bind whichever is provided to the local name we call. Either
+  // works — this module only builds signed GET URLs; the expiry arg (…, 3600) is
+  // honoured by the raw presigner and ignored by the cache, both harmless.
+  {
+    authenticateToken,
+    pool,
+    setSchema,
+    getCachedPresignedUrl,
+    generatePresignedGetUrl: rawPresignedGetUrl,
+    uploadBufferToS3,
+    makeStylePhotoKey,
+  }
 ) {
+  const generatePresignedGetUrl = getCachedPresignedUrl || rawPresignedGetUrl;
+  if (typeof generatePresignedGetUrl !== "function") {
+    throw new Error(
+      "work-orders.js: no presigner provided — pass generatePresignedGetUrl (or getCachedPresignedUrl) into registerWorkOrders()"
+    );
+  }
   // =====================================================================
   //  WORK-ORDER ROUTES (per-color breakdown)
   // =====================================================================
