@@ -393,7 +393,8 @@ function registerWorkOrders(
         tipo, modelo, correlativo,
         clienteCode, customerId, estilo,
         description, sam,
-        photoBase64, photoFilename,   // wizard sends the image inline as a base64 data URL
+        photoKey: incomingPhotoKey,   // browser uploaded straight to S3, sends only the key
+        photoBase64, photoFilename,   // legacy: inline base64 data URL (kept as fallback)
         lines,
         workOrderNo,
         commitmentDate, season, fabrics, warehouseStock, extraQuantity,
@@ -458,9 +459,16 @@ function registerWorkOrders(
       }
       const customerName = cust.rows[0].name;
 
-      // The wizard sends the image inline as a base64 data URL. Decode it, upload
-      // to S3, and keep the object key — same flow as server.js's master-codes route.
-      if (photoBase64) {
+      // Preferred path: the browser already uploaded the raw file straight to S3
+      // via a presigned URL and just sends us the object key. Nothing to upload
+      // here — persist the key and sign a fresh GET URL for the response.
+      if (incomingPhotoKey) {
+        photoKey = incomingPhotoKey;
+        photoUrl = generatePresignedGetUrl(photoKey, 3600);
+      } else if (photoBase64) {
+        // Legacy fallback: image inlined as a base64 data URL. This path is
+        // capped by the Lambda/API Gateway request-body limit (~6–10 MB) and can
+        // 413 before it ever reaches here — prefer the presigned path above.
         const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(photoBase64);
         if (!match) {
           await client.query("ROLLBACK");
