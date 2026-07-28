@@ -134,8 +134,10 @@ function registerWorkOrders(app, deps) {
         SELECT
           wo.id, wo.work_order_no, wo.quantity, wo.customer_id, wo.customer_name,
           wo.style_description, wo.color, wo.fabric_supplier, wo.fabrics,
-          wo.style_code, wo.estilo, wo.line_no, wo.run_date, wo.warehouse_stock,
-          wo.extra_quantity, wo.total_to_produce, wo.commitment_date,
+          wo.style_code, wo.estilo, wo.line_no,
+          to_char(wo.run_date, 'YYYY-MM-DD') AS run_date, wo.warehouse_stock,
+          wo.extra_quantity, wo.total_to_produce,
+          to_char(wo.commitment_date, 'YYYY-MM-DD') AS commitment_date,
           wo.master_code_id, wo.sam_minutes, wo.created_at, wo.updated_at, wo.status,
           ${COLORS_SUBQUERY},
           MAX(mc.photo_filename) as master_code_photo_filename,
