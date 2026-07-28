@@ -80,7 +80,11 @@ async function initSchema({ pool, setSchema }) {
     // Additive migration for databases created before per-color estilo existed.
     await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS estilo VARCHAR(6);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_work_order_lines_wo ON work_order_lines(work_order_id);");
-    await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_order_lines_unique ON work_order_lines(work_order_id, talla, color);");
+    // Uniqueness must include estilo: the same color+talla can appear under two
+    // different estilos within one PO. Drop the older (wo,talla,color) index and
+    // recreate it with estilo so those legitimate rows don't collide.
+    await client.query("DROP INDEX IF EXISTS idx_work_order_lines_unique;");
+    await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_order_lines_unique ON work_order_lines(work_order_id, talla, color, estilo);");
     console.log("✅ work_order_lines table ready in prod_db_schema");
   } finally {
     client.release();
