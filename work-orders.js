@@ -99,6 +99,18 @@ const COLORS_SUBQUERY = `
   ), '[]') AS colors
 `;
 
+const LINES_SUBQUERY = `
+  COALESCE((
+    SELECT json_agg(json_build_object(
+             'talla', l.talla,
+             'color', l.color,
+             'estilo', l.estilo,
+             'quantity', l.quantity
+           ) ORDER BY l.color, l.talla)
+    FROM work_order_lines l WHERE l.work_order_id = wo.id
+  ), '[]') AS lines
+`;
+
 const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, n);
 
 /**
@@ -140,6 +152,7 @@ function registerWorkOrders(app, deps) {
           to_char(wo.commitment_date, 'YYYY-MM-DD') AS commitment_date,
           wo.master_code_id, wo.sam_minutes, wo.created_at, wo.updated_at, wo.status,
           ${COLORS_SUBQUERY},
+          ${LINES_SUBQUERY},
           MAX(mc.photo_filename) as master_code_photo_filename,
           COALESCE(SUM(la.assigned_quantity) FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) as assigned_quantity
         FROM work_orders wo

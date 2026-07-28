@@ -4377,7 +4377,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
     await setSchema(client);
     await client.query("BEGIN");
 
-    const { workOrderId, lineNo, assignedDate, quantity, plannedStartDate } = req.body;
+    const { workOrderId, lineNo, assignedDate, quantity, plannedStartDate,color  } = req.body;
 
     if (!workOrderId || !lineNo || !assignedDate || !quantity || parseFloat(quantity) <= 0) {
       await client.query("ROLLBACK");
@@ -4439,9 +4439,9 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
     const result = await client.query(
       `INSERT INTO line_assignments (
         work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
-        available_minutes, required_production_rate, planned_start_date, planned_end_date, status
+        available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'planned')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'planned', $10)
       RETURNING *`,
       [
         parseInt(workOrderId),
@@ -4453,6 +4453,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
         piecesPerDay,
         startDate,
         plannedEndDate,
+        color || null
       ]
     );
 
