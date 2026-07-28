@@ -108,13 +108,13 @@ const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, 
  * @param {(buffer: Buffer, key: string, mime: string) => Promise<{url:string}>} [deps.uploadBufferToS3]
  * @param {(filename: string) => string} [deps.makeStylePhotoKey]
  */
-function registerWorkOrders(
-  app,
-  // server.js passes `getCachedPresignedUrl` (the cached presigner). Bind it to the
-  // local name this module calls. Its calls pass an expiry arg (…, 3600) which the
-  // cache function simply ignores — harmless.
-  { authenticateToken, pool, setSchema, getCachedPresignedUrl: generatePresignedGetUrl, uploadBufferToS3, makeStylePhotoKey }
-) {
+function registerWorkOrders(app, deps) {
+  const { authenticateToken, pool, setSchema, uploadBufferToS3, makeStylePhotoKey } = deps;
+  // Different server files inject the presigned-GET helper under different names:
+  //   server1.js → generatePresignedGetUrl (from s3-raw)
+  //   server.js  → getCachedPresignedUrl   (from presignCache)
+  // Accept whichever is provided so this module works with either.
+  const generatePresignedGetUrl = deps.generatePresignedGetUrl || deps.getCachedPresignedUrl;
   // =====================================================================
   //  WORK-ORDER ROUTES (per-color breakdown)
   // =====================================================================
@@ -399,7 +399,7 @@ function registerWorkOrders(
         tipo, modelo, correlativo,
         clienteCode, customerId, estilo,
         description, sam,
-        photoBase64, photoFilename,
+        photoKey: incomingPhotoKey,   // browser uploaded the image straight to S3 (presigned PUT)
         lines, orders, workOrderNo,
         commitmentDate, season, fabrics, warehouseStock, extraQuantity,
       } = req.body;
@@ -446,15 +446,10 @@ function registerWorkOrders(
       }
       const customerName = cust.rows[0].name;
 
-      // Photo is shared across every PO in this submission — upload once.
-      if (photoBase64) {
-        const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(photoBase64);
-        if (!match) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "Photo must be a base64 image data URL" }); }
-        const [, mimeType, base64Data] = match;
-        const buffer = Buffer.from(base64Data, "base64");
-        if (buffer.length > 8 * 1024 * 1024) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "Photo exceeds 8MB limit" }); }
-        photoKey = makeStylePhotoKey(photoFilename || "");
-        await uploadBufferToS3(buffer, photoKey, mimeType);
+      // Photo was uploaded straight to S3 by the browser (presigned PUT); the
+      // request carries only its key. Shared across every PO in this submission.
+      if (incomingPhotoKey) {
+        photoKey = incomingPhotoKey;
         photoUrl = generatePresignedGetUrl(photoKey, 3600);
       }
 
