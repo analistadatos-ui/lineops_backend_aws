@@ -4326,6 +4326,7 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
              to_char(la.planned_end_date, 'YYYY-MM-DD')    AS planned_end_date,
              la.priority,
              la.status,
+             la.color,
              la.created_at,
              la.updated_at,
              wo.work_order_no,
