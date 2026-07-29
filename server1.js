@@ -6832,7 +6832,7 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
       status,
       masterCodeId,
       samMinutes,
-      customerPO,
+      customerPo,
     } = req.body;
     
     // Build update query dynamically
@@ -6876,9 +6876,9 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
       values.push(Array.isArray(fabrics) ? fabrics : []);
     }
 
-    if (customerPO !== undefined) {
+    if (customerPo !== undefined) {
       updates.push(`customer_po = $${paramIndex++}`);
-      values.push(customerPO || null);
+      values.push(customerPo || null);
     }
 
     if (styleCode !== undefined) {
