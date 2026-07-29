@@ -86,6 +86,9 @@ async function initSchema({ pool, setSchema }) {
     await client.query("DROP INDEX IF EXISTS idx_work_order_lines_unique;");
     await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_order_lines_unique ON work_order_lines(work_order_id, talla, color, estilo);");
     console.log("✅ work_order_lines table ready in prod_db_schema");
+
+    // Per-PO customer purchase-order reference (nullable).
+    await client.query("ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS customer_po VARCHAR(60);");
   } finally {
     client.release();
   }
@@ -150,7 +153,7 @@ function registerWorkOrders(app, deps) {
           to_char(wo.run_date, 'YYYY-MM-DD') AS run_date, wo.warehouse_stock,
           wo.extra_quantity, wo.total_to_produce,
           to_char(wo.commitment_date, 'YYYY-MM-DD') AS commitment_date,
-          wo.master_code_id, wo.sam_minutes, wo.created_at, wo.updated_at, wo.status,
+          wo.master_code_id, wo.sam_minutes, wo.customer_po, wo.created_at, wo.updated_at, wo.status,
           ${COLORS_SUBQUERY},
           ${LINES_SUBQUERY},
           MAX(mc.photo_filename) as master_code_photo_filename,
@@ -420,7 +423,7 @@ function registerWorkOrders(app, deps) {
         description, sam,
         photoKey: incomingPhotoKey,   // browser uploaded the image straight to S3 (presigned PUT)
         lines, orders, workOrderNo,
-        commitmentDate, season, fabrics, warehouseStock, extraQuantity,
+        commitmentDate, season, fabrics, warehouseStock, extraQuantity, customerPo,
       } = req.body;
 
       const T = up(tipo, 3), M = up(modelo, 3), C = up(correlativo, 2);
@@ -441,7 +444,11 @@ function registerWorkOrders(app, deps) {
       // Normalise into a list of PO specs (each: its own cells + delivery date).
       const rawOrders = multi ? orders : [{ lines, commitmentDate }];
       const orderSpecs = rawOrders
-        .map((o) => ({ cells: parseCells(o.lines), commitmentDate: o.commitmentDate || commitmentDate || null }))
+        .map((o) => ({
+          cells: parseCells(o.lines),
+          commitmentDate: o.commitmentDate || commitmentDate || null,
+          customerPo: (o.customerPo || customerPo || "").toString().trim() || null,
+        }))
         .filter((o) => o.cells.length > 0);
 
       if (!T || !M || !C || !CLI || !description || !sam) {
@@ -489,7 +496,7 @@ function registerWorkOrders(app, deps) {
       const createdOrders = [];
 
       for (let i = 0; i < orderSpecs.length; i++) {
-        const { cells, commitmentDate: cDate } = orderSpecs[i];
+        const { cells, commitmentDate: cDate, customerPo: cPo } = orderSpecs[i];
 
         // Upsert the master codes this PO needs (deduped across the whole request).
         for (const cell of cells) {
@@ -537,15 +544,15 @@ function registerWorkOrders(app, deps) {
               work_order_no, quantity, customer_id, customer_name, style_description,
               color, fabric_supplier, style_code, estilo, fabrics, warehouse_stock,
               extra_quantity, total_to_produce, commitment_date, master_code_id,
-              sam_minutes, season, created_at, updated_at, status
+              sam_minutes, season, customer_po, created_at, updated_at, status
            )
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW(),NOW(),'pending')
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW(),'pending')
            RETURNING *`,
           [
             woNo, orderedQty, parseInt(customerId), customerName, description,
             colorSummary, (Array.isArray(fabrics) ? fabrics[0] : null) || null, styleCode, primaryEstilo,
             Array.isArray(fabrics) ? fabrics : [], wStock, xtra, totalToProduce,
-            cDate || null, primaryMasterCodeId, samNum, season || null,
+            cDate || null, primaryMasterCodeId, samNum, season || null, cPo || null,
           ]
         );
         const workOrder = woResult.rows[0];
