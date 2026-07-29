@@ -79,6 +79,7 @@ async function initSchema({ pool, setSchema }) {
     `);
     // Additive migration for databases created before per-color estilo existed.
     await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS estilo VARCHAR(6);");
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS customer_po VARCHAR(60);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_work_order_lines_wo ON work_order_lines(work_order_id);");
     // Uniqueness must include estilo: the same color+talla can appear under two
     // different estilos within one PO. Drop the older (wo,talla,color) index and
@@ -108,6 +109,7 @@ const LINES_SUBQUERY = `
              'talla', l.talla,
              'color', l.color,
              'estilo', l.estilo,
+             'customerPo', l.customer_po,
              'quantity', l.quantity
            ) ORDER BY l.color, l.talla)
     FROM work_order_lines l WHERE l.work_order_id = wo.id
@@ -437,6 +439,7 @@ function registerWorkOrders(app, deps) {
             talla: up(l.talla, 3),
             color: up(l.color, 3),
             estilo: up(l.estilo, 6) || EST,
+            customerPo: (l.customerPo || "").toString().trim() || null, // per-line customer PO
             quantity: parseFloat(l.quantity),
           }))
           .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0);
@@ -447,7 +450,6 @@ function registerWorkOrders(app, deps) {
         .map((o) => ({
           cells: parseCells(o.lines),
           commitmentDate: o.commitmentDate || commitmentDate || null,
-          customerPo: (o.customerPo || customerPo || "").toString().trim() || null,
         }))
         .filter((o) => o.cells.length > 0);
 
@@ -496,7 +498,11 @@ function registerWorkOrders(app, deps) {
       const createdOrders = [];
 
       for (let i = 0; i < orderSpecs.length; i++) {
-        const { cells, commitmentDate: cDate, customerPo: cPo } = orderSpecs[i];
+        const { cells, commitmentDate: cDate } = orderSpecs[i];
+        // A PO may carry several customer POs (one per line). Store a distinct,
+        // comma-joined summary on the header for display/search; the authoritative
+        // per-line values live in work_order_lines.customer_po.
+        const cPo = [...new Set(cells.map((c) => c.customerPo).filter(Boolean))].join(", ") || null;
 
         // Upsert the master codes this PO needs (deduped across the whole request).
         for (const cell of cells) {
@@ -560,9 +566,9 @@ function registerWorkOrders(app, deps) {
         for (const cell of cells) {
           const code = `${T}${M}${C}${cell.talla}${CLI}-${cell.color}-${cell.estilo}`;
           await client.query(
-            `INSERT INTO work_order_lines (work_order_id, master_code_id, talla, color, estilo, quantity)
-             VALUES ($1,$2,$3,$4,$5,$6)`,
-            [workOrder.id, codeToId[code], cell.talla, cell.color, cell.estilo, cell.quantity]
+            `INSERT INTO work_order_lines (work_order_id, master_code_id, talla, color, estilo, customer_po, quantity)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+            [workOrder.id, codeToId[code], cell.talla, cell.color, cell.estilo, cell.customerPo || null, cell.quantity]
           );
         }
 
