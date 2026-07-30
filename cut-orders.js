@@ -46,6 +46,7 @@ async function initSchema({ pool, setSchema }) {
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS amount_cut NUMERIC(12,2);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS remaining_to_cut NUMERIC(12,2);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS color VARCHAR(50);`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS sizes JSONB;`);
     console.log("✅ cut_orders table ready in prod_db_schema");
   } finally {
     client.release();
@@ -77,6 +78,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                co.panels,
                co.amount_cut,
                co.remaining_to_cut,
+               co.sizes,
                co.notes,
                co.status,
                co.created_at,
@@ -104,7 +106,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { workOrderId, fabric, cutDate, quantity, notes, yieldPerPiece, color } = req.body;
+      const { workOrderId, fabric, cutDate, quantity, notes, yieldPerPiece, color, sizes } = req.body;
 
       if (!workOrderId || !cutDate || !quantity || parseFloat(quantity) <= 0) {
         return res.status(400).json({
@@ -127,10 +129,11 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       }
 
       const result = await client.query(
-        `INSERT INTO cut_orders (work_order_id, fabric, cut_date, quantity, notes, yield_per_piece, total_length, color)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `INSERT INTO cut_orders (work_order_id, fabric, cut_date, quantity, notes, yield_per_piece, total_length, color, sizes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
          RETURNING *`,
-        [parseInt(workOrderId), fabric || null, cutDate, parseFloat(quantity), notes || null, y, totalLength, color || null]
+        [parseInt(workOrderId), fabric || null, cutDate, parseFloat(quantity), notes || null, y, totalLength, color || null,
+         Array.isArray(sizes) && sizes.length ? JSON.stringify(sizes) : null]
       );
       res.json({ success: true, cutOrder: result.rows[0] });
     } catch (err) {
