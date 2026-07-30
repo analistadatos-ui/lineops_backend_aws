@@ -48,6 +48,8 @@ async function initSchema({ pool, setSchema }) {
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS color VARCHAR(50);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS sizes JSONB;`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS size_progress JSONB;`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS style_no VARCHAR(50);`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS season VARCHAR(50);`);
     console.log("✅ cut_orders table ready in prod_db_schema");
   } finally {
     client.release();
@@ -89,7 +91,9 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                wo.style_description,
                wo.style_code,
                wo.estilo,
-               COALESCE(co.color, wo.color) AS color
+               COALESCE(co.color, wo.color) AS color,
+               COALESCE(co.style_no, wo.style_code) AS style_no,
+               COALESCE(co.season, wo.season) AS season
           FROM cut_orders co
           JOIN work_orders wo ON wo.id = co.work_order_id
          ORDER BY co.created_at DESC
@@ -108,7 +112,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { workOrderId, fabric, cutDate, quantity, notes, yieldPerPiece, color, sizes } = req.body;
+      const { workOrderId, fabric, cutDate, quantity, notes, yieldPerPiece, color, sizes, styleNo, season } = req.body;
 
       if (!workOrderId || !cutDate || !quantity || parseFloat(quantity) <= 0) {
         return res.status(400).json({
@@ -125,17 +129,19 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       }
       const totalLength = y !== null ? y * parseFloat(quantity) : null;
 
-      const wo = await client.query("SELECT id FROM work_orders WHERE id = $1", [parseInt(workOrderId)]);
+      const wo = await client.query("SELECT id, style_code, season FROM work_orders WHERE id = $1", [parseInt(workOrderId)]);
       if (wo.rows.length === 0) {
         return res.status(404).json({ success: false, error: "Work order not found" });
       }
+      const styleNoFinal = styleNo || wo.rows[0].style_code || null;
+      const seasonFinal = season || wo.rows[0].season || null;
 
       const result = await client.query(
-        `INSERT INTO cut_orders (work_order_id, fabric, cut_date, quantity, notes, yield_per_piece, total_length, color, sizes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+        `INSERT INTO cut_orders (work_order_id, fabric, cut_date, quantity, notes, yield_per_piece, total_length, color, sizes, style_no, season)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
          RETURNING *`,
         [parseInt(workOrderId), fabric || null, cutDate, parseFloat(quantity), notes || null, y, totalLength, color || null,
-         Array.isArray(sizes) && sizes.length ? JSON.stringify(sizes) : null]
+         Array.isArray(sizes) && sizes.length ? JSON.stringify(sizes) : null, styleNoFinal, seasonFinal]
       );
       res.json({ success: true, cutOrder: result.rows[0] });
     } catch (err) {

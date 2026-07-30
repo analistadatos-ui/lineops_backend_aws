@@ -155,7 +155,7 @@ function registerWorkOrders(app, deps) {
           to_char(wo.run_date, 'YYYY-MM-DD') AS run_date, wo.warehouse_stock,
           wo.extra_quantity, wo.total_to_produce,
           to_char(wo.commitment_date, 'YYYY-MM-DD') AS commitment_date,
-          wo.master_code_id, wo.sam_minutes, wo.customer_po, wo.created_at, wo.updated_at, wo.status,
+          wo.master_code_id, wo.sam_minutes, wo.customer_po, wo.created_at, wo.updated_at,wo.season,wo.status,
           ${COLORS_SUBQUERY},
           ${LINES_SUBQUERY},
           MAX(mc.photo_filename) as master_code_photo_filename,
