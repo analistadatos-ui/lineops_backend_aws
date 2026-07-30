@@ -47,6 +47,7 @@ async function initSchema({ pool, setSchema }) {
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS remaining_to_cut NUMERIC(12,2);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS color VARCHAR(50);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS sizes JSONB;`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS size_progress JSONB;`);
     console.log("✅ cut_orders table ready in prod_db_schema");
   } finally {
     client.release();
@@ -79,6 +80,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                co.amount_cut,
                co.remaining_to_cut,
                co.sizes,
+               co.size_progress,
                co.notes,
                co.status,
                co.created_at,
@@ -150,11 +152,26 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { panels, amountCut, remainingToCut } = req.body;
+      const { panels, amountCut, remainingToCut, sizeProgress } = req.body;
 
-      const p = panels === undefined || panels === null || panels === "" ? null : parseInt(panels);
-      const cut = amountCut === undefined || amountCut === null || amountCut === "" ? null : parseFloat(amountCut);
-      const rem = remainingToCut === undefined || remainingToCut === null || remainingToCut === "" ? null : parseFloat(remainingToCut);
+      // Per-size progress (talla, quantity, panels, amountCut, remaining).
+      let sp = Array.isArray(sizeProgress) ? sizeProgress : null;
+      let p, cut, rem;
+      if (sp && sp.length > 0) {
+        // Aggregate from the size rows.
+        p = sp.reduce((s, r) => s + (parseInt(r.panels) || 0), 0);
+        cut = sp.reduce((s, r) => s + (parseFloat(r.amountCut) || 0), 0);
+        rem = sp.reduce((s, r) => {
+          const q = parseFloat(r.quantity) || 0;
+          const c = parseFloat(r.amountCut) || 0;
+          const rr = r.remaining != null && r.remaining !== "" ? parseFloat(r.remaining) : Math.max(q - c, 0);
+          return s + (isNaN(rr) ? 0 : rr);
+        }, 0);
+      } else {
+        p = panels === undefined || panels === null || panels === "" ? null : parseInt(panels);
+        cut = amountCut === undefined || amountCut === null || amountCut === "" ? null : parseFloat(amountCut);
+        rem = remainingToCut === undefined || remainingToCut === null || remainingToCut === "" ? null : parseFloat(remainingToCut);
+      }
 
       if (cut !== null && (isNaN(cut) || cut < 0)) {
         return res.status(400).json({ success: false, error: "Cantidad cortada inválida" });
@@ -174,11 +191,12 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
             SET panels = COALESCE($1, panels),
                 amount_cut = COALESCE($2, amount_cut),
                 remaining_to_cut = COALESCE($3, remaining_to_cut),
-                status = $4,
+                size_progress = COALESCE($4::jsonb, size_progress),
+                status = $5,
                 updated_at = now()
-          WHERE id = $5
+          WHERE id = $6
           RETURNING *`,
-        [p, cut, rem, newStatus, parseInt(req.params.id)]
+        [p, cut, rem, sp ? JSON.stringify(sp) : null, newStatus, parseInt(req.params.id)]
       );
       if (result.rows.length === 0) {
         return res.status(404).json({ success: false, error: "Cut order not found" });
