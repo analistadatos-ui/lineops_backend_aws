@@ -80,6 +80,11 @@ async function initSchema({ pool, setSchema }) {
     // Additive migration for databases created before per-color estilo existed.
     await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS estilo VARCHAR(6);");
     await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS customer_po VARCHAR(60);");
+    // Per-line delivery date, fabric, and yield (entered per color/estilo row in step 2).
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS commitment_date DATE;");
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS fabric_name VARCHAR(150);");
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS fabric_code VARCHAR(60);");
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS yield_per_piece NUMERIC(10,4);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_work_order_lines_wo ON work_order_lines(work_order_id);");
     // Uniqueness must include estilo: the same color+talla can appear under two
     // different estilos within one PO. Drop the older (wo,talla,color) index and
@@ -110,6 +115,10 @@ const LINES_SUBQUERY = `
              'color', l.color,
              'estilo', l.estilo,
              'customerPo', l.customer_po,
+             'commitmentDate', to_char(l.commitment_date, 'YYYY-MM-DD'),
+             'fabricName', l.fabric_name,
+             'fabricCode', l.fabric_code,
+             'yield', l.yield_per_piece,
              'quantity', l.quantity
            ) ORDER BY l.color, l.talla)
     FROM work_order_lines l WHERE l.work_order_id = wo.id
@@ -440,6 +449,11 @@ function registerWorkOrders(app, deps) {
             color: up(l.color, 3),
             estilo: up(l.estilo, 6) || EST,
             customerPo: (l.customerPo || "").toString().trim() || null, // per-line customer PO
+            commitmentDate: (l.commitmentDate || "").toString().slice(0, 10) || null,
+            fabricName: (l.fabricName || "").toString().trim() || null,
+            fabricCode: (l.fabricCode || "").toString().trim() || null,
+            yieldPerPiece:
+              l.yield === "" || l.yield == null || isNaN(parseFloat(l.yield)) ? null : parseFloat(l.yield),
             quantity: parseFloat(l.quantity),
           }))
           .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0);
@@ -503,6 +517,12 @@ function registerWorkOrders(app, deps) {
         // comma-joined summary on the header for display/search; the authoritative
         // per-line values live in work_order_lines.customer_po.
         const cPo = [...new Set(cells.map((c) => c.customerPo).filter(Boolean))].join(", ") || null;
+        // Delivery date, fabric and yield are per-line now. The PO header keeps a
+        // representative value for display: the first line's date, and the distinct
+        // set of fabric names (fabric_supplier = the first fabric).
+        const headerDate = cells.find((c) => c.commitmentDate)?.commitmentDate || cDate || null;
+        const fabricNamesArr = [...new Set(cells.map((c) => c.fabricName).filter(Boolean))];
+        const fabricSupplier = fabricNamesArr[0] || (Array.isArray(fabrics) ? fabrics[0] : null) || null;
 
         // Upsert the master codes this PO needs (deduped across the whole request).
         for (const cell of cells) {
@@ -556,9 +576,10 @@ function registerWorkOrders(app, deps) {
            RETURNING *`,
           [
             woNo, orderedQty, parseInt(customerId), customerName, description,
-            colorSummary, (Array.isArray(fabrics) ? fabrics[0] : null) || null, styleCode, primaryEstilo,
-            Array.isArray(fabrics) ? fabrics : [], wStock, xtra, totalToProduce,
-            cDate || null, primaryMasterCodeId, samNum, season || null, cPo || null,
+            colorSummary, fabricSupplier, styleCode, primaryEstilo,
+            fabricNamesArr.length ? fabricNamesArr : (Array.isArray(fabrics) ? fabrics : []),
+            wStock, xtra, totalToProduce,
+            headerDate, primaryMasterCodeId, samNum, season || null, cPo || null,
           ]
         );
         const workOrder = woResult.rows[0];
@@ -566,9 +587,12 @@ function registerWorkOrders(app, deps) {
         for (const cell of cells) {
           const code = `${T}${M}${C}${cell.talla}${CLI}-${cell.color}-${cell.estilo}`;
           await client.query(
-            `INSERT INTO work_order_lines (work_order_id, master_code_id, talla, color, estilo, customer_po, quantity)
-             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-            [workOrder.id, codeToId[code], cell.talla, cell.color, cell.estilo, cell.customerPo || null, cell.quantity]
+            `INSERT INTO work_order_lines
+               (work_order_id, master_code_id, talla, color, estilo, customer_po, commitment_date, fabric_name, fabric_code, yield_per_piece, quantity)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+            [workOrder.id, codeToId[code], cell.talla, cell.color, cell.estilo,
+             cell.customerPo || null, cell.commitmentDate || null, cell.fabricName || null,
+             cell.fabricCode || null, cell.yieldPerPiece, cell.quantity]
           );
         }
 
