@@ -6834,6 +6834,9 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
       masterCodeId,
       samMinutes,
       customerPo,
+      fabricName,        // ← new
+      fabricCode,        // ← new
+      yieldPerPiece,
     } = req.body;
     
     // Build update query dynamically
@@ -6880,6 +6883,29 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
     if (customerPo !== undefined) {
       updates.push(`customer_po = $${paramIndex++}`);
       values.push(customerPo || null);
+    }
+
+    // Header copy of the line-level fabric/yield, kept for the PO list view.
+    if (fabricName !== undefined) {
+      updates.push(`fabric_name = $${paramIndex++}`);
+      values.push(fabricName || null);
+      // keep the legacy display column in sync
+      updates.push(`fabric_supplier = $${paramIndex++}`);
+      values.push(fabricName || null);
+    }
+
+    if (fabricCode !== undefined) {
+      updates.push(`fabric_code = $${paramIndex++}`);
+      values.push(fabricCode || null);
+    }
+
+    if (yieldPerPiece !== undefined) {
+      updates.push(`yield_per_piece = $${paramIndex++}`);
+      values.push(
+        yieldPerPiece === "" || yieldPerPiece === null || isNaN(parseFloat(yieldPerPiece))
+          ? null
+          : parseFloat(yieldPerPiece)
+      );
     }
 
     if (styleCode !== undefined) {
