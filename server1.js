@@ -6771,22 +6771,15 @@ app.post("/api/fabrics", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
-    const { name, code } = req.body;
-if (!name || !name.trim()) {
-  return res.status(400).json({ success: false, error: "Fabric name is required" });
-}
-const cleanName = name.trim();
-const cleanCode = (code || "").trim() || null;
-// Register the tela + its code so both are reusable on future orders. If the
-// name already exists, keep its current code but backfill it when missing.
-const result = await client.query(
-  `INSERT INTO fabrics (name, code) VALUES ($1, $2)
-     ON CONFLICT (name)
-     DO UPDATE SET code = COALESCE(EXCLUDED.code, fabrics.code)
-   RETURNING id, name, code, created_at`,
-  [cleanName, cleanCode]
-);
-res.json({ success: true, fabric: result.rows[0] });
+   const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, error: "Fabric name is required" });
+    }
+    const result = await client.query(
+      "INSERT INTO fabrics (name, code) VALUES ($1, $2) RETURNING id, name, code, created_at",
+      [name.trim(), null]
+    );
+    res.json({ success: true, fabric: result.rows[0] });
   } catch (err) {
     logger.error("❌ Error creating fabric:", err.message);
     if (err.code === "23505") {
