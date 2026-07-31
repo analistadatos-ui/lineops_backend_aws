@@ -46,6 +46,7 @@ async function initSchema({ pool, setSchema }) {
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS amount_cut NUMERIC(12,2);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS remaining_to_cut NUMERIC(12,2);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS color VARCHAR(50);`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS fabric_code VARCHAR(60);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS sizes JSONB;`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS size_progress JSONB;`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS style_no VARCHAR(50);`);
@@ -74,6 +75,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
         SELECT co.id,
                co.work_order_id,
                co.fabric,
+               co.fabric_code,
                to_char(co.cut_date, 'YYYY-MM-DD') AS cut_date,
                co.quantity,
                co.yield_per_piece,
@@ -112,7 +114,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { workOrderId, fabric, cutDate, quantity, notes, yieldPerPiece, color, sizes, styleNo, season } = req.body;
+      const { workOrderId, fabric, fabricCode, cutDate, quantity, notes, yieldPerPiece, color, sizes, styleNo, season } = req.body;
 
       if (!workOrderId || !cutDate || !quantity || parseFloat(quantity) <= 0) {
         return res.status(400).json({
@@ -137,10 +139,10 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       const seasonFinal = season || wo.rows[0].season || null;
 
       const result = await client.query(
-        `INSERT INTO cut_orders (work_order_id, fabric, cut_date, quantity, notes, yield_per_piece, total_length, color, sizes, style_no, season)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
+        `INSERT INTO cut_orders (work_order_id, fabric, fabric_code, cut_date, quantity, notes, yield_per_piece, total_length, color, sizes, style_no, season)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12)
          RETURNING *`,
-        [parseInt(workOrderId), fabric || null, cutDate, parseFloat(quantity), notes || null, y, totalLength, color || null,
+        [parseInt(workOrderId), fabric || null, fabricCode || null, cutDate, parseFloat(quantity), notes || null, y, totalLength, color || null,
          Array.isArray(sizes) && sizes.length ? JSON.stringify(sizes) : null, styleNoFinal, seasonFinal]
       );
       res.json({ success: true, cutOrder: result.rows[0] });
