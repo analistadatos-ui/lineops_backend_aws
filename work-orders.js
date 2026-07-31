@@ -754,18 +754,31 @@ function registerWorkOrders(app, deps) {
 
       // -------- breakdown ---------------------------------------------------
       if (Array.isArray(lines)) {
+        // The edit modal sends each line's telas as a `fabrics: [{ name, code }]`
+        // array; older payloads use scalar fabricName/fabricCode. Accept both and
+        // persist the first tela (work_order_lines stores one fabric per line).
+        const primaryFabric = (l) => {
+          if (Array.isArray(l.fabrics)) {
+            const f = l.fabrics.find((x) => (x?.name || "").toString().trim());
+            if (f) return { name: f.name, code: f.code };
+          }
+          return { name: l.fabricName, code: l.fabricCode };
+        };
         const cells = lines
-          .map((l) => ({
-            talla: up(l.talla, 3),
-            color: up(l.color, 3),
-            estilo: up(l.estilo, 6),
-            customerPo: txt(l.customerPo),
-            commitmentDate: (l.commitmentDate || "").toString().slice(0, 10) || null,
-            fabricName: txt(l.fabricName),
-            fabricCode: txt(l.fabricCode),
-            yieldPerPiece: num(l.yield),
-            quantity: parseFloat(l.quantity),
-          }))
+          .map((l) => {
+            const pf = primaryFabric(l);
+            return {
+              talla: up(l.talla, 3),
+              color: up(l.color, 3),
+              estilo: up(l.estilo, 6),
+              customerPo: txt(l.customerPo),
+              commitmentDate: (l.commitmentDate || "").toString().slice(0, 10) || null,
+              fabricName: txt(pf.name),
+              fabricCode: txt(pf.code),
+              yieldPerPiece: num(l.yield),
+              quantity: parseFloat(l.quantity),
+            };
+          })
           .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0);
 
         if (cells.length === 0) {
