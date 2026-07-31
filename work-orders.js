@@ -164,6 +164,8 @@ const LINES_SUBQUERY = `
 
 const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, n);
 
+const VALID_STATUSES = ["pending", "assigned", "in_progress", "completed", "cancelled"];
+
 /**
  * Registers the work-order + production-order routes on the given Express app.
  * @param {import('express').Express} app
@@ -679,6 +681,241 @@ function registerWorkOrders(app, deps) {
       await client.query("ROLLBACK").catch(() => {});
       console.error("❌ Error creating production order:", err.message);
       if (err.code === "23505") return res.status(400).json({ success: false, error: "PO number already exists" });
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ---- full update: header + size/color breakdown -----------------------
+  // PUT /api/production-orders/:id
+  //
+  // Unlike PUT /api/work-orders/:id (header columns only), this rewrites
+  // work_order_lines, so the edit modal can change colors, estilos, tallas,
+  // quantities, PO cliente, delivery date, fabric, code and yield. Body:
+  //   { customerId?, styleDescription?, status?, season?, samMinutes?,
+  //     warehouseStock?, extraQuantity?, totalToProduce?, customerPo?,
+  //     commitmentDate?, fabricName?, fabricCode?, yield?,
+  //     lines?: [{ talla, color, estilo, customerPo, commitmentDate,
+  //                fabricName, fabricCode, yield, quantity }] }
+  // Omit `lines` to leave the breakdown untouched. When `lines` IS sent it
+  // replaces the whole set, and quantity / color / estilo / master_code_id /
+  // total_to_produce plus the header fabric+date copies are recomputed.
+  app.put("/api/production-orders/:id", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { id } = req.params;
+      const {
+        customerId, styleDescription, status, season, samMinutes,
+        warehouseStock, extraQuantity, totalToProduce,
+        customerPo, commitmentDate, fabricName, fabricCode, yield: yieldPerPiece,
+        lines,
+      } = req.body;
+
+      const txt = (v) => (v == null ? null : String(v).trim() || null);
+      const num = (v) =>
+        v === "" || v == null || isNaN(parseFloat(v)) ? null : parseFloat(v);
+
+      if (status !== undefined && !VALID_STATUSES.includes(status)) {
+        return res.status(400).json({ success: false, error: `Invalid status. Must be one of: ${VALID_STATUSES.join(", ")}` });
+      }
+
+      await client.query("BEGIN");
+
+      const cur = await client.query("SELECT * FROM work_orders WHERE id = $1 FOR UPDATE", [id]);
+      if (cur.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, error: "Work order not found" });
+      }
+      const wo = cur.rows[0];
+
+      const set = {};   // column -> value
+
+      // -------- header fields the caller sent explicitly -------------------
+      if (customerId !== undefined) {
+        const c = await client.query("SELECT name FROM customers WHERE id = $1", [parseInt(customerId)]);
+        if (c.rows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, error: "Customer not found" });
+        }
+        set.customer_id = parseInt(customerId);
+        set.customer_name = c.rows[0].name;
+      }
+      if (styleDescription !== undefined) set.style_description = txt(styleDescription) || wo.style_description;
+      if (status !== undefined) set.status = status;
+      if (season !== undefined) set.season = txt(season);
+      if (samMinutes !== undefined) set.sam_minutes = num(samMinutes);
+
+      const wStock = warehouseStock !== undefined ? (parseFloat(warehouseStock) || 0) : parseFloat(wo.warehouse_stock) || 0;
+      const xtra = extraQuantity !== undefined ? (parseFloat(extraQuantity) || 0) : parseFloat(wo.extra_quantity) || 0;
+      if (warehouseStock !== undefined) set.warehouse_stock = wStock;
+      if (extraQuantity !== undefined) set.extra_quantity = xtra;
+
+      // -------- breakdown ---------------------------------------------------
+      if (Array.isArray(lines)) {
+        const cells = lines
+          .map((l) => ({
+            talla: up(l.talla, 3),
+            color: up(l.color, 3),
+            estilo: up(l.estilo, 6),
+            customerPo: txt(l.customerPo),
+            commitmentDate: (l.commitmentDate || "").toString().slice(0, 10) || null,
+            fabricName: txt(l.fabricName),
+            fabricCode: txt(l.fabricCode),
+            yieldPerPiece: num(l.yield),
+            quantity: parseFloat(l.quantity),
+          }))
+          .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0);
+
+        if (cells.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, error: "Enter at least one size/color quantity" });
+        }
+        const badEstilo = cells.find((c) => !c.estilo || c.estilo.length !== 6);
+        if (badEstilo) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, error: `Falta el estilo cliente (6 caracteres) para el color ${badEstilo.color || "?"}` });
+        }
+        // One PO cannot hold the same talla+color+estilo twice (unique index).
+        const dupKey = new Set();
+        for (const c of cells) {
+          const k = `${c.talla}|${c.color}|${c.estilo}`;
+          if (dupKey.has(k)) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({ success: false, error: `Línea repetida: ${c.color} · ${c.estilo} · talla ${c.talla}. Un color+estilo repetido necesita su propia orden.` });
+          }
+          dupKey.add(k);
+        }
+
+        // Master codes for the (possibly new) combinations. The style prefix is
+        // fixed for this PO; the 3-letter customer code comes from an existing
+        // master code, falling back to customers.code.
+        const styleCode = wo.style_code || "";
+        let CLI = null;
+        let photoUrl = null, photoKey = null;   // reuse the style photo for new codes
+        if (wo.master_code_id) {
+          const mc = await client.query(
+            "SELECT cliente, photo_url, photo_filename FROM master_codes WHERE id = $1",
+            [wo.master_code_id]
+          );
+          CLI = mc.rows[0]?.cliente || null;
+          photoUrl = mc.rows[0]?.photo_url || null;
+          photoKey = mc.rows[0]?.photo_filename || null;
+        }
+        if (!CLI) {
+          const cid = set.customer_id ?? wo.customer_id;
+          const cc = await client.query("SELECT code FROM customers WHERE id = $1", [cid]);
+          CLI = up(cc.rows[0]?.code, 3) || null;
+        }
+        if (!styleCode || !CLI) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, error: "No se pudo resolver el código de estilo o el código de cliente de esta orden" });
+        }
+
+        const T = styleCode.slice(0, 3), M = styleCode.slice(3, 6), C = styleCode.slice(6, 8);
+        const description = set.style_description ?? wo.style_description;
+        const samNum = set.sam_minutes ?? (parseFloat(wo.sam_minutes) || 0);
+        const codeToId = {};
+        for (const cell of cells) {
+          const code = `${styleCode}${cell.talla}${CLI}-${cell.color}-${cell.estilo}`;
+          if (codeToId[code] === undefined) {
+            const r = await client.query(
+              `INSERT INTO master_codes
+                 (code,type,modelo,correlativo,talla,cliente,color,estilo,description,sam_minutes,photo_url,photo_filename,created_by,created_at,updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW(),NOW())
+               ON CONFLICT (code) DO UPDATE SET updated_at = NOW()
+               RETURNING id`,
+              [code, T, M, C, cell.talla, CLI, cell.color, cell.estilo, description, samNum, photoUrl, photoKey, req.user.id]
+            );
+            codeToId[code] = r.rows[0].id;
+          }
+        }
+
+        // Replace the whole breakdown.
+        await client.query("DELETE FROM work_order_lines WHERE work_order_id = $1", [id]);
+        for (const cell of cells) {
+          const code = `${styleCode}${cell.talla}${CLI}-${cell.color}-${cell.estilo}`;
+          await client.query(
+            `INSERT INTO work_order_lines
+               (work_order_id, master_code_id, talla, color, estilo, customer_po,
+                commitment_date, fabric_name, fabric_code, yield_per_piece, quantity)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+            [id, codeToId[code], cell.talla, cell.color, cell.estilo,
+             cell.customerPo, cell.commitmentDate, cell.fabricName,
+             cell.fabricCode, cell.yieldPerPiece, cell.quantity]
+          );
+        }
+
+        // Recompute everything the breakdown owns.
+        const orderedQty = cells.reduce((s, c) => s + c.quantity, 0);
+        const firstOf = (k) => cells.find((c) => c[k] != null && c[k] !== "")?.[k] ?? null;
+        set.quantity = orderedQty;
+        set.color = [...new Set(cells.map((c) => c.color))].join(", ");
+        set.estilo = cells[0].estilo;
+        set.master_code_id = codeToId[`${styleCode}${cells[0].talla}${CLI}-${cells[0].color}-${cells[0].estilo}`];
+        set.total_to_produce = Math.max(orderedQty - wStock + xtra, 0);
+        set.customer_po = [...new Set(cells.map((c) => c.customerPo).filter(Boolean))].join(", ") || null;
+        set.commitment_date = firstOf("commitmentDate");
+        set.fabric_name = firstOf("fabricName");
+        set.fabric_code = firstOf("fabricCode");
+        set.yield_per_piece = firstOf("yieldPerPiece");
+        set.fabrics = [...new Set(cells.map((c) => c.fabricName).filter(Boolean))];
+        set.fabric_supplier = set.fabric_name;
+      }
+
+      // Explicit header values win over the ones derived from the lines.
+      if (customerPo !== undefined) set.customer_po = txt(customerPo);
+      if (commitmentDate !== undefined) set.commitment_date = commitmentDate || null;
+      if (fabricName !== undefined) {
+        set.fabric_name = txt(fabricName);
+        set.fabric_supplier = txt(fabricName);
+      }
+      if (fabricCode !== undefined) set.fabric_code = txt(fabricCode);
+      if (yieldPerPiece !== undefined) set.yield_per_piece = num(yieldPerPiece);
+      if (totalToProduce !== undefined && totalToProduce !== "") set.total_to_produce = parseFloat(totalToProduce) || 0;
+      else if (!Array.isArray(lines) && (warehouseStock !== undefined || extraQuantity !== undefined)) {
+        set.total_to_produce = Math.max((parseFloat(wo.quantity) || 0) - wStock + xtra, 0);
+      }
+
+      const cols = Object.keys(set);
+      if (cols.length === 0 && !Array.isArray(lines)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, error: "No fields to update" });
+      }
+
+      let workOrder = wo;
+      if (cols.length > 0) {
+        const assigns = cols.map((c, i) => `${c} = $${i + 1}`).join(", ");
+        const upd = await client.query(
+          `UPDATE work_orders SET ${assigns}, updated_at = NOW() WHERE id = $${cols.length + 1} RETURNING *`,
+          [...cols.map((c) => set[c]), id]
+        );
+        workOrder = upd.rows[0];
+      }
+
+      await client.query("COMMIT");
+
+      // Return the saved row with its fresh breakdown.
+      const back = await client.query(
+        `SELECT wo.*, to_char(wo.commitment_date, 'YYYY-MM-DD') AS commitment_date,
+                ${LINES_SUBQUERY}, mc.photo_filename AS master_code_photo_filename
+           FROM work_orders wo
+           LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
+          WHERE wo.id = $1`,
+        [id]
+      );
+      const row = back.rows[0] || workOrder;
+      if (row.master_code_photo_filename) {
+        row.master_code_photo_url = generatePresignedGetUrl(row.master_code_photo_filename, 3600);
+        delete row.master_code_photo_filename;
+      }
+
+      res.json({ success: true, message: "Production order updated", workOrder: row });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("❌ Error updating production order:", err.message);
+      if (err.code === "23505") return res.status(400).json({ success: false, error: "Línea duplicada para esta orden (talla+color+estilo)" });
       res.status(500).json({ success: false, error: err.message });
     } finally {
       client.release();
