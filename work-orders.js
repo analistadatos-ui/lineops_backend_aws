@@ -87,6 +87,10 @@ async function initSchema({ pool, setSchema }) {
     await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS fabric_name VARCHAR(150);");
     await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS fabric_code VARCHAR(60);");
     await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS yield_per_piece NUMERIC(10,4);");
+    // Full list of telas for the line: [{ name, code, yield }, ...]. The scalar
+    // fabric_name/fabric_code/yield_per_piece above are kept as a representative
+    // (first-tela) copy for the header and list views.
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS fabrics JSONB NOT NULL DEFAULT '[]'::jsonb;");
     await client.query("CREATE INDEX IF NOT EXISTS idx_work_order_lines_wo ON work_order_lines(work_order_id);");
     // Uniqueness must include estilo: the same color+talla can appear under two
     // different estilos within one PO. Drop the older (wo,talla,color) index and
@@ -155,6 +159,7 @@ const LINES_SUBQUERY = `
              'commitmentDate', to_char(l.commitment_date, 'YYYY-MM-DD'),
              'fabricName', l.fabric_name,
              'fabricCode', l.fabric_code,
+             'fabrics', COALESCE(l.fabrics, '[]'::jsonb),
              'yield', l.yield_per_piece,
              'quantity', l.quantity
            ) ORDER BY l.color, l.talla)
@@ -163,6 +168,33 @@ const LINES_SUBQUERY = `
 `;
 
 const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, n);
+
+const toTxt = (v) => (v == null ? null : String(v).trim() || null);
+const toNum = (v) => (v === "" || v == null || isNaN(parseFloat(v)) ? null : parseFloat(v));
+
+// Normalise a line's telas into [{ name, code, yield }], dropping blank names
+// and duplicate name+code pairs. Each tela keeps its OWN yield. Accepts the new
+// `fabrics` array or a legacy scalar {fabricName, fabricCode, yield}; `fb`
+// supplies order-level fallbacks used by the create route.
+const buildLineFabrics = (l, fb = {}) => {
+  const out = [];
+  const seen = new Set();
+  const push = (name, code, y) => {
+    const nm = toTxt(name);
+    if (!nm) return;
+    const cd = toTxt(code);
+    const key = `${nm}|${cd || ""}`.toUpperCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ name: nm, code: cd, yield: toNum(y) });
+  };
+  if (Array.isArray(l.fabrics) && l.fabrics.length) {
+    for (const f of l.fabrics) push(f?.name, f?.code, f?.yield ?? f?.yieldPerPiece);
+  } else {
+    push(l.fabricName ?? fb.fabricName, l.fabricCode ?? fb.fabricCode, l.yield ?? fb.yieldPerPiece);
+  }
+  return out;
+};
 
 const VALID_STATUSES = ["pending", "assigned", "in_progress", "completed", "cancelled"];
 
@@ -495,17 +527,24 @@ function registerWorkOrders(app, deps) {
       // values are used as a fallback for lines that leave them blank.
       const parseCells = (arr, fb = {}) =>
         (Array.isArray(arr) ? arr : [])
-          .map((l) => ({
-            talla: up(l.talla, 3),
-            color: up(l.color, 3),
-            estilo: up(l.estilo, 6) || EST,
-            customerPo: txt(l.customerPo),
-            commitmentDate: (l.commitmentDate || fb.commitmentDate || "").toString().slice(0, 10) || null,
-            fabricName: txt(l.fabricName) || fb.fabricName || null,
-            fabricCode: txt(l.fabricCode) || fb.fabricCode || null,
-            yieldPerPiece: num(l.yield) ?? fb.yieldPerPiece ?? null,
-            quantity: parseFloat(l.quantity),
-          }))
+          .map((l) => {
+            // Each line may carry several telas, each with its own code and yield.
+            const fabrics = buildLineFabrics(l, fb);
+            const primary = fabrics[0] || {};
+            return {
+              talla: up(l.talla, 3),
+              color: up(l.color, 3),
+              estilo: up(l.estilo, 6) || EST,
+              customerPo: txt(l.customerPo),
+              commitmentDate: (l.commitmentDate || fb.commitmentDate || "").toString().slice(0, 10) || null,
+              fabrics,
+              // Representative (first-tela) scalars for the header/list views.
+              fabricName: primary.name || fb.fabricName || null,
+              fabricCode: primary.code || fb.fabricCode || null,
+              yieldPerPiece: primary.yield ?? fb.yieldPerPiece ?? null,
+              quantity: parseFloat(l.quantity),
+            };
+          })
           .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0);
 
       // Normalise into a list of PO specs.
@@ -584,7 +623,9 @@ function registerWorkOrders(app, deps) {
         const hFabricName = firstOf("fabricName") || specFabricName || null;
         const hFabricCode = firstOf("fabricCode") || specFabricCode || null;
         const hYield = firstOf("yieldPerPiece") ?? specYield ?? null;
-        const fabricNamesArr = [...new Set(cells.map((c) => c.fabricName).filter(Boolean))];
+        const fabricNamesArr = [...new Set(
+          cells.flatMap((c) => (c.fabrics || []).map((f) => f.name)).filter(Boolean)
+        )];
         const fabricSupplier = hFabricName || fabricNamesArr[0] || null;
 
         // Upsert the master codes this PO needs (deduped across the whole request).
@@ -654,11 +695,12 @@ function registerWorkOrders(app, deps) {
           await client.query(
             `INSERT INTO work_order_lines
                (work_order_id, master_code_id, talla, color, estilo, customer_po,
-                commitment_date, fabric_name, fabric_code, yield_per_piece, quantity)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+                commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
             [workOrder.id, codeToId[code], cell.talla, cell.color, cell.estilo,
              cell.customerPo || null, cell.commitmentDate || null, cell.fabricName || null,
-             cell.fabricCode || null, cell.yieldPerPiece, cell.quantity]
+             cell.fabricCode || null, cell.yieldPerPiece, cell.quantity,
+             JSON.stringify(cell.fabrics || [])]
           );
         }
 
@@ -754,28 +796,22 @@ function registerWorkOrders(app, deps) {
 
       // -------- breakdown ---------------------------------------------------
       if (Array.isArray(lines)) {
-        // The edit modal sends each line's telas as a `fabrics: [{ name, code }]`
-        // array; older payloads use scalar fabricName/fabricCode. Accept both and
-        // persist the first tela (work_order_lines stores one fabric per line).
-        const primaryFabric = (l) => {
-          if (Array.isArray(l.fabrics)) {
-            const f = l.fabrics.find((x) => (x?.name || "").toString().trim());
-            if (f) return { name: f.name, code: f.code };
-          }
-          return { name: l.fabricName, code: l.fabricCode };
-        };
+        // Each line may carry several telas, each with its own code and yield.
+        // The scalars below stay as the representative (first-tela) header copy.
         const cells = lines
           .map((l) => {
-            const pf = primaryFabric(l);
+            const fabrics = buildLineFabrics(l);
+            const primary = fabrics[0] || {};
             return {
               talla: up(l.talla, 3),
               color: up(l.color, 3),
               estilo: up(l.estilo, 6),
               customerPo: txt(l.customerPo),
               commitmentDate: (l.commitmentDate || "").toString().slice(0, 10) || null,
-              fabricName: txt(pf.name),
-              fabricCode: txt(pf.code),
-              yieldPerPiece: num(l.yield),
+              fabrics,
+              fabricName: primary.name || null,
+              fabricCode: primary.code || null,
+              yieldPerPiece: primary.yield ?? null,
               quantity: parseFloat(l.quantity),
             };
           })
@@ -852,11 +888,12 @@ function registerWorkOrders(app, deps) {
           await client.query(
             `INSERT INTO work_order_lines
                (work_order_id, master_code_id, talla, color, estilo, customer_po,
-                commitment_date, fabric_name, fabric_code, yield_per_piece, quantity)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+                commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
             [id, codeToId[code], cell.talla, cell.color, cell.estilo,
              cell.customerPo, cell.commitmentDate, cell.fabricName,
-             cell.fabricCode, cell.yieldPerPiece, cell.quantity]
+             cell.fabricCode, cell.yieldPerPiece, cell.quantity,
+             JSON.stringify(cell.fabrics || [])]
           );
         }
 
@@ -873,7 +910,9 @@ function registerWorkOrders(app, deps) {
         set.fabric_name = firstOf("fabricName");
         set.fabric_code = firstOf("fabricCode");
         set.yield_per_piece = firstOf("yieldPerPiece");
-        set.fabrics = [...new Set(cells.map((c) => c.fabricName).filter(Boolean))];
+        set.fabrics = [...new Set(
+          cells.flatMap((c) => (c.fabrics || []).map((f) => f.name)).filter(Boolean)
+        )];
         set.fabric_supplier = set.fabric_name;
       }
 
