@@ -1289,6 +1289,13 @@ app.get("/api/line-runs/:lineNo", authenticateToken, async (req, res, next) => {
 // ---------------------------------------------------------------------------
 app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) => {
   const client = await pool.connect();
+  // Add whole days to a YYYY-MM-DD string without any timezone drift.
+  const addDaysStr = (ymdStr, n) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + n);
+    return dt.toISOString().slice(0, 10);
+  };
   try {
     await setSchema(client);
     const id = parseInt(req.params.id);
@@ -1298,63 +1305,104 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       return res.status(400).json({ success: false, error: "lineNo y assignedDate son obligatorios" });
     }
 
+    await client.query("BEGIN");
+
     const cur = await client.query(
-      "SELECT id, assigned_quantity FROM line_assignments WHERE id = $1",
+      "SELECT id, work_order_id, assigned_quantity, color, status FROM line_assignments WHERE id = $1",
       [id]
     );
     if (cur.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ success: false, error: "Assignment not found" });
     }
-    const qty = parseFloat(cur.rows[0].assigned_quantity) || 0;
+    const original = cur.rows[0];
+    const totalQty = parseFloat(original.assigned_quantity) || 0;
+    const workOrderId = original.work_order_id;
+    const color = original.color || null;
+    const status = ["planned", "released", "completed", "cancelled"].includes(original.status)
+      ? original.status
+      : "planned";
 
-    // Target capacity: exact run for that line+date, else the line's latest run.
-    let capRes = await client.query(
-      "SELECT id, target_pcs FROM line_runs WHERE line_no = $1 AND run_date = $2 ORDER BY updated_at DESC LIMIT 1",
-      [String(lineNo), assignedDate]
+    // Prefer the work order's own SAM for the informational rate columns.
+    const woRes = await client.query(
+      "SELECT sam_minutes FROM work_orders WHERE id = $1",
+      [workOrderId]
     );
-    if (capRes.rows.length === 0) {
-      capRes = await client.query(
-        "SELECT id, target_pcs FROM line_runs WHERE line_no = $1 ORDER BY run_date DESC LIMIT 1",
-        [String(lineNo)]
+    const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
+
+    // Free the original's capacity first so the re-flow can reuse its old slot.
+    // Everything happens in one transaction, so a shortfall rolls this back and
+    // leaves the assignment exactly where it was.
+    await client.query("DELETE FROM line_assignments WHERE id = $1", [id]);
+
+    // Walk the target line day by day from assignedDate, filling each day's
+    // remaining capacity and carrying the remainder forward — the same packing
+    // rule as a pool placement. Days with no run configured, or already full,
+    // are skipped. All-or-nothing: if the whole quantity can't fit within the
+    // horizon, roll back and report the shortfall.
+    const MAX_DAYS = 180;
+    let remaining = totalQty;
+    let dayStr = assignedDate;
+    let scanned = 0;
+    const createdRows = [];
+
+    while (remaining > 0 && scanned < MAX_DAYS) {
+      scanned++;
+      const { lines } = await getLineCapacityForDate(client, dayStr);
+      const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
+      if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no capacity configured -> skip
+
+      const usedRes = await client.query(
+        `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
+           FROM line_assignments
+          WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
+        [String(lineNo), dayStr]
       );
-    }
-    if (capRes.rows.length === 0) {
-      return res.status(400).json({ success: false, error: `Línea ${lineNo} sin capacidad configurada` });
-    }
-    const capacity = parseFloat(capRes.rows[0].target_pcs) || 0;
-    const runId = capRes.rows[0].id;
+      const used = parseFloat(usedRes.rows[0].used) || 0;
+      const capacity = parseFloat(lineData.target_pcs) || 0;
+      const available = Math.max(0, capacity - used);
+      if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
 
-    // Already assigned on the target line/day, excluding this assignment.
-    const usedRes = await client.query(
-      `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
-         FROM line_assignments
-        WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled') AND id <> $3`,
-      [String(lineNo), assignedDate, id]
-    );
-    const used = parseFloat(usedRes.rows[0].used) || 0;
-    const available = capacity - used;
+      const chunk = Math.min(remaining, available);
 
-    if (qty > available) {
+      const operators = parseInt(lineData.operators_count) || 20;
+      const workingHours = parseFloat(lineData.working_hours) || 8;
+      const efficiency = parseFloat(lineData.efficiency) || 0.85;
+      const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
+      const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
+      const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
+
+      const ins = await client.query(
+        `INSERT INTO line_assignments
+           (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+            available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $4, $4, $9, $8)
+         RETURNING *`,
+        [workOrderId, lineData.id || null, String(lineNo), dayStr, chunk,
+         effectiveDailyMinutes, piecesPerDay, color, status]
+      );
+      createdRows.push(ins.rows[0]);
+      remaining -= chunk;
+      dayStr = addDaysStr(dayStr, 1);
+    }
+
+    if (remaining > 0) {
+      await client.query("ROLLBACK");
       return res.status(400).json({
         success: false,
-        error: `La línea ${lineNo} solo tiene ${Math.max(0, Math.round(available))} pzas disponibles el ${assignedDate}`,
+        error: `La línea ${lineNo} no tiene capacidad suficiente para mover ${Math.round(totalQty)} pzas desde el ${assignedDate} (faltan ${Math.round(remaining)}).`,
       });
     }
 
-    const upd = await client.query(
-      `UPDATE line_assignments
-          SET line_no = $1,
-              line_run_id = $2,
-              assigned_date = $3,
-              planned_start_date = $3,
-              planned_end_date = $3,
-              updated_at = now()
-        WHERE id = $4
-        RETURNING *`,
-      [String(lineNo), runId, assignedDate, id]
-    );
-    res.json({ success: true, assignment: upd.rows[0] });
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      assignment: createdRows[0] || null,
+      assignments: createdRows,
+      cells: createdRows.length,
+    });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error("❌ Error moving line assignment:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
