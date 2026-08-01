@@ -136,6 +136,9 @@ async function initSchema({ pool, setSchema }) {
   } finally {
     client.release();
   }
+
+  // Detecta como leer la produccion real desde las corridas del lider de linea.
+  await resolveProducedSubquery({ pool, setSchema });
 }
 
 // The per-color breakdown as a JSON array, reused by both GET routes.
@@ -166,6 +169,118 @@ const LINES_SUBQUERY = `
     FROM work_order_lines l WHERE l.work_order_id = wo.id
   ), '[]') AS lines
 `;
+
+// --------------------------------------------------------------------------
+// PRODUCED QUANTITY (lo realmente cosido en piso)
+// --------------------------------------------------------------------------
+// La produccion NO se captura aparte: ya vive en la data por hora que el lider
+// de linea guarda con POST /api/lineleader/update-sewed/:runId. Aqui solo se
+// LEE para que el planeador vea el avance real contra la meta.
+//
+// Se cuentan unicamente las operaciones de empaque/terminado. Sumar todas las
+// operaciones multiplicaria cada pieza por el numero de operaciones de la
+// linea. Estas palabras clave son las mismas que usa finishedGarmentsTotal en
+// LineLeaderPage.jsx: si cambias una, cambia la otra.
+const PACKING_KEYWORDS = ["pack", "emp", "termin", "finish"];
+
+// Se resuelve en initSchema contra el esquema real. Si algo no cuadra queda en
+// 0 y la app sigue funcionando (la barra de produccion se queda en cero) en vez
+// de tronar cada consulta del planeador.
+let PRODUCED_SUBQUERY = "0::numeric AS produced_quantity";
+
+// Tablas reales donde vive la captura por hora del lider de linea:
+//   line_runs                (id, ... , enlace a la orden)
+//   operator_operations      (id, run_id, operation_name, ...)
+//   operation_sewed_entries  (run_id, operation_id, slot_id, sewed_qty)
+//
+// Lo unico que varia entre instalaciones es COMO line_runs apunta a la orden,
+// asi que eso si se detecta. Se prueban en orden; el primero que exista gana.
+const RUN_LINK_CANDIDATES = [
+  { column: "work_order_id", on: "lr.work_order_id = wo.id" },
+  { column: "work_order_no", on: "lr.work_order_no = wo.work_order_no" },
+  { column: "work_order",    on: "lr.work_order = wo.work_order_no" },
+  { column: "po_id",         on: "lr.po_id = wo.id" },
+];
+
+async function tableColumns(client, table) {
+  const { rows } = await client.query(
+    `SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = $1`,
+    [table]
+  );
+  return new Set(rows.map((r) => r.column_name));
+}
+
+// Construye el subquery de produccion. Se llama una sola vez al arranque.
+async function resolveProducedSubquery({ pool, setSchema }) {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const runCols = await tableColumns(client, "line_runs");
+    const sewCols = await tableColumns(client, "operation_sewed_entries");
+    const opCols = await tableColumns(client, "operator_operations");
+
+    const missing = [];
+    if (runCols.size === 0) missing.push("line_runs");
+    if (!sewCols.has("sewed_qty") || !sewCols.has("operation_id")) missing.push("operation_sewed_entries");
+    if (!opCols.has("operation_name")) missing.push("operator_operations");
+
+    if (missing.length) {
+      console.warn(
+        "\u26a0\ufe0f  produced_quantity quedara en 0. Tablas no encontradas o sin las " +
+        `columnas esperadas: ${missing.join(", ")}.`
+      );
+      return;
+    }
+
+    const link = RUN_LINK_CANDIDATES.find((c) => runCols.has(c.column));
+    if (!link) {
+      console.warn(
+        "\u26a0\ufe0f  produced_quantity quedara en 0: line_runs no tiene ninguna columna " +
+        `conocida hacia la orden (${RUN_LINK_CANDIDATES.map((c) => c.column).join(", ")}). ` +
+        "Agrega la correcta a RUN_LINK_CANDIDATES en work-orders.js."
+      );
+      return;
+    }
+
+    const likes = PACKING_KEYWORDS
+      .map((k) => `lower(oo.operation_name) LIKE '%${k}%'`)
+      .join(" OR ");
+
+    // Solo las operaciones de empaque/terminado. Sumar todas las operaciones
+    // contaria cada prenda una vez por operacion de la linea.
+    PRODUCED_SUBQUERY = `
+      COALESCE((
+        SELECT SUM(se.sewed_qty)
+          FROM operation_sewed_entries se
+          JOIN operator_operations oo ON oo.id = se.operation_id
+          JOIN line_runs lr           ON lr.id = se.run_id
+         WHERE ${link.on}
+           AND (${likes})
+      ), 0) AS produced_quantity
+    `;
+
+    console.log(`\u2705 produced_quantity resuelto (line_runs.${link.column})`);
+
+    // Aviso temprano: si ninguna operacion capturada coincide con las palabras
+    // clave, el total sera 0 aunque la linea si este produciendo.
+    const { rows } = await client.query(
+      `SELECT COUNT(*)::int AS n FROM operator_operations oo WHERE ${likes}`
+    );
+    if (rows[0].n === 0) {
+      console.warn(
+        "\u26a0\ufe0f  Ninguna operacion coincide con PACKING_KEYWORDS " +
+        `[${PACKING_KEYWORDS.join(", ")}]; produced_quantity sera 0. ` +
+        "Revisa como se llaman tus operaciones de empaque y ajusta la lista."
+      );
+    }
+  } catch (err) {
+    console.warn("\u26a0\ufe0f  resolveProducedSubquery fallo:", err.message);
+  } finally {
+    client.release();
+  }
+}
 
 const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, n);
 
@@ -241,7 +356,8 @@ function registerWorkOrders(app, deps) {
           ${COLORS_SUBQUERY},
           ${LINES_SUBQUERY},
           MAX(mc.photo_filename) as master_code_photo_filename,
-          COALESCE(SUM(la.assigned_quantity) FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) as assigned_quantity
+          COALESCE(SUM(la.assigned_quantity) FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) as assigned_quantity,
+          ${PRODUCED_SUBQUERY}
         FROM work_orders wo
         LEFT JOIN line_assignments la ON la.work_order_id = wo.id
         LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
@@ -315,6 +431,7 @@ function registerWorkOrders(app, deps) {
         SELECT
           wo.*,
           ${COLORS_SUBQUERY},
+          ${PRODUCED_SUBQUERY},
           mc.code as master_code,
           mc.photo_filename as master_code_photo_filename,
           json_agg(
