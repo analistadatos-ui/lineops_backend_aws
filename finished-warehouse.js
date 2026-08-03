@@ -21,6 +21,9 @@
 
 const DEFAULT_BOX_CODE = "CT_KUBOT_STANDARD";
 
+// Reused for the order-level "producido" total (production isn't tracked per size).
+const workOrders = require("./work-orders");
+
 // The columns that identify one finished-goods SKU. Confirming a list adds the
 // box quantity onto the matching SKU (or creates it).
 const SKU_FIELDS = ["customer_code", "po", "style", "color_code", "size_code", "sex", "fabric_code"];
@@ -30,6 +33,136 @@ const skuKeyOf = (b) => SKU_FIELDS.map((f) => String(b[f] ?? "").trim()).join("|
 // boots (and CSV export still works) if the package isn't installed yet.
 let XLSX = null;
 try { XLSX = require("xlsx"); } catch { /* run `npm install xlsx` to enable .xlsx/.xls */ }
+
+// Codigo de color = color + talla (e.g. color "NEG" + talla "M" -> "NEGM").
+const colorCodeOf = (color, talla) => `${String(color ?? "").trim()}${String(talla ?? "").trim()}`;
+
+// Size code -> printable label for the packing list. The DB stores only the code
+// (work_order_lines.talla / master_codes.talla); this maps it to the label the
+// customer expects. PARTIAL LIST — extend as new size codes appear. Any code not
+// found here falls back to printing the code itself, so a size is never blank.
+const SIZE_LABELS = {
+  "130": "xxs",
+  "132": "xs",
+  "134": "xs",
+  "136": "(S)",
+  "138": "(M)",
+  "140": "L",
+  "142": "XL",
+  "144": "XXL",
+  "004": "I-XS",
+  "006": "S",
+  "008": "M",
+  "010": "L",
+};
+const sizeLabelOf = (code) => {
+  const k = String(code ?? "").trim();
+  return SIZE_LABELS[k] ?? k;
+};
+
+// BoxRegistry rule agreed with the team: for cliente C&A it is "NCA", blank otherwise.
+// Detection is by customer name containing "C&A" (case-insensitive).
+const boxRegistryFor = (customerName) =>
+  String(customerName ?? "").toUpperCase().includes("C&A") ? "NCA" : null;
+
+// Split an integer `total` across `weights` proportionally, returning whole
+// numbers that sum EXACTLY to `total` (largest-remainder / Hamilton method).
+// Used to spread the order-level producido across size×color lines by ordered qty.
+function allocateProportional(total, weights) {
+  const n = weights.length;
+  if (n === 0) return [];
+  const T = Math.max(0, Math.round(Number(total) || 0));
+  const w = weights.map((x) => Math.max(0, Number(x) || 0));
+  const sum = w.reduce((s, x) => s + x, 0);
+
+  // No ordered basis to split on -> fall back to an even split.
+  const shares = sum > 0 ? w.map((x) => (x / sum) * T) : w.map(() => T / n);
+
+  const parts = shares.map(Math.floor);
+  let left = T - parts.reduce((s, x) => s + x, 0);
+
+  // Hand the leftover units to the largest fractional remainders, one each.
+  const order = shares
+    .map((s, i) => ({ i, frac: s - Math.floor(s) }))
+    .sort((a, b) => b.frac - a.frac);
+  for (let k = 0; k < order.length && left > 0; k++, left--) parts[order[k].i]++;
+
+  return parts;
+}
+
+// Build the box rows for a list straight from its work order's size×color lines.
+// One box per work_order_lines row, every field pre-filled from the DB so the
+// operator only has to export. Inserts the rows and returns them.
+// NOTE: caller runs inside its own transaction; this only issues queries.
+async function generateBoxesFromOrder(client, list) {
+  if (!list.work_order_id) return [];
+
+  const woRes = await client.query(
+    `SELECT work_order_no AS po, customer_po AS mo FROM work_orders WHERE id = $1`,
+    [list.work_order_id]
+  );
+  if (woRes.rows.length === 0) return [];
+  const header = woRes.rows[0];
+
+  const linesRes = await client.query(
+    `SELECT talla        AS size_code,
+            color        AS color_name,
+            estilo       AS style,
+            customer_po  AS mo,
+            fabric_code,
+            quantity
+       FROM work_order_lines
+      WHERE work_order_id = $1
+      ORDER BY color, talla`,
+    [list.work_order_id]
+  );
+
+  const po = header.po || list.po || null;
+  const boxRegistry = boxRegistryFor(list.customer_name);
+
+  // Producido is an order-level total (production isn't captured per talla/color),
+  // so split it across the size×color lines in proportion to the ordered quantity.
+  const producedTotal = await workOrders.producedQuantityFor(client, list.work_order_id);
+  const allocation = allocateProportional(
+    producedTotal,
+    linesRes.rows.map((l) => Number(l.quantity) || 0)
+  );
+
+  const inserted = [];
+  for (let i = 0; i < linesRes.rows.length; i++) {
+    const l = linesRes.rows[i];
+    const { rows } = await client.query(
+      `INSERT INTO pre_packing_boxes
+         (list_id, box_qrcode, encasement_qrcode, mo, po, style, fabric_code, sex,
+          size_code, color_name, color_code, quantity, box_code, box_registry,
+          gross_weight, net_weight, customer_code, customer_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+       RETURNING *`,
+      [
+        list.id,
+        null,                                   // box_qrcode — ticket is the PO on export
+        null,                                   // encasement_qrcode (system field)
+        l.mo || header.mo || list.mo || null,
+        po,
+        l.style || null,                        // "label" = estilo -> Estyle column
+        l.fabric_code || null,
+        null,                                   // sex -> Genero 0 on export
+        l.size_code || null,
+        l.color_name || null,
+        colorCodeOf(l.color_name, l.size_code) || null,
+        allocation[i],                          // producido split proportionally by size
+        DEFAULT_BOX_CODE,
+        boxRegistry,
+        0,
+        0,
+        list.customer_code || null,
+        list.customer_name || null,
+      ]
+    );
+    inserted.push(rows[0]);
+  }
+  return inserted;
+}
 
 async function initSchema({ pool, setSchema }) {
   const client = await pool.connect();
@@ -272,6 +405,24 @@ function registerFinishedWarehouse(app, deps) {
     res.json({ success: true, list: listRes.rows[0], boxes: boxesRes.rows });
   }));
 
+  // (Re)build a draft list's boxes from its work order. Clears existing boxes
+  // and regenerates one per size×color line — used to seed older lists or to
+  // refresh after the order's lines changed.
+  app.post("/api/pre-packing-lists/:id/generate-boxes", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    await client.query("BEGIN");
+    const listRes = await client.query(`SELECT * FROM pre_packing_lists WHERE id = $1 FOR UPDATE`, [id]);
+    if (listRes.rows.length === 0) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, error: "Lista no encontrada" }); }
+    const list = listRes.rows[0];
+    if (list.status !== "draft") { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "La lista ya fue confirmada" }); }
+    if (!list.work_order_id) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "La lista no tiene una orden asociada" }); }
+
+    await client.query(`DELETE FROM pre_packing_boxes WHERE list_id = $1`, [id]);
+    const boxes = await generateBoxesFromOrder(client, list);
+    await client.query("COMMIT");
+    res.json({ success: true, boxes, boxesGenerated: boxes.length });
+  }));
+
   // Export a list's boxes as CSV (opens in Excel). One row per box.
   app.get("/api/pre-packing-lists/:id/export", authenticateToken, withClient(async (req, res, client) => {
     const id = parseInt(req.params.id, 10);
@@ -284,13 +435,13 @@ function registerFinishedWarehouse(app, deps) {
     // numeric cells). Constants per the agreed format: Genero=0, BoxType="no",
     // and BoxNo / GrossWeight / NetWeight / Material box barcode left blank.
     const columns = [
-      ["ticket",               (b) => b.box_qrcode],
+      ["ticket",               (b) => b.po],          // ticket = PO number
       ["Orden Produccion",     (b) => b.mo],
       ["PO",                   (b) => b.po],
       ["Estyle",               (b) => b.style],
       ["Genero",               () => 0, "num"],
       ["Codigo Fabric",        (b) => b.fabric_code],
-      ["Size",                 (b) => b.size_code],
+      ["Size",                 (b) => sizeLabelOf(b.size_code)],
       ["Color",                (b) => b.color_name],
       ["Codigo De Color",      (b) => b.color_code],
       ["Piezas",               (b) => b.quantity, "num"],
@@ -382,8 +533,12 @@ function registerFinishedWarehouse(app, deps) {
       [list.id, `PP-${String(list.id).padStart(6, "0")}`]
     );
 
+    // Auto-fill the whole list from the order: one box per size×color line, all
+    // fields pulled from the DB. The operator just reviews and exports.
+    const boxes = await generateBoxesFromOrder(client, upd.rows[0]);
+
     await client.query("COMMIT");
-    res.json({ success: true, list: upd.rows[0] });
+    res.json({ success: true, list: upd.rows[0], boxes, boxesGenerated: boxes.length });
   }));
 
   // Update header (only while draft).

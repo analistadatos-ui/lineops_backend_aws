@@ -1093,5 +1093,18 @@ function registerWorkOrders(app, deps) {
 }
 
 
+// Produced (producido) total for a single work order, using the same packing-
+// operation subquery the planner uses. Order-level only — production is not
+// captured per talla/color. Other modules (e.g. finished-warehouse) reuse this
+// so the logic lives in exactly one place.
+async function producedQuantityFor(client, workOrderId) {
+  const { rows } = await client.query(
+    `SELECT ${PRODUCED_SUBQUERY} FROM work_orders wo WHERE wo.id = $1`,
+    [workOrderId]
+  );
+  return Number(rows[0]?.produced_quantity) || 0;
+}
+
 registerWorkOrders.initSchema = initSchema;
+registerWorkOrders.producedQuantityFor = producedQuantityFor;
 module.exports = registerWorkOrders;
