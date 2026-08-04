@@ -277,3 +277,4 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
 
 registerCutOrders.initSchema = initSchema;
 module.exports = registerCutOrders;
+
