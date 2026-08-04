@@ -49,6 +49,8 @@ async function initSchema({ pool, setSchema }) {
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS fabric_code VARCHAR(60);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS sizes JSONB;`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS size_progress JSONB;`);
+    // marcadas / trazos: [{ id, name, panels, piecesPerPanel, totalPieces, lines:[{talla, perPanel, pieces}] }]
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS markers JSONB;`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS style_no VARCHAR(50);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS season VARCHAR(50);`);
     console.log("✅ cut_orders table ready in prod_db_schema");
@@ -85,6 +87,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                co.remaining_to_cut,
                co.sizes,
                co.size_progress,
+               co.markers,
                co.notes,
                co.status,
                co.created_at,
@@ -160,14 +163,20 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { panels, amountCut, remainingToCut, sizeProgress } = req.body;
+      const { panels, amountCut, remainingToCut, sizeProgress, markers } = req.body;
+
+      // Marcadas (trazos): each groups sizes and carries its own panel count.
+      const mk = Array.isArray(markers) ? markers : null;
 
       // Per-size progress (talla, quantity, panels, amountCut, remaining).
       let sp = Array.isArray(sizeProgress) ? sizeProgress : null;
       let p, cut, rem;
       if (sp && sp.length > 0) {
-        // Aggregate from the size rows.
-        p = sp.reduce((s, r) => s + (parseInt(r.panels) || 0), 0);
+        // Panels: from the marcadas when present (a panel serves several sizes,
+        // so summing the per-size rows would double count it).
+        p = mk && mk.length
+          ? mk.reduce((s, m) => s + (parseInt(m.panels) || 0), 0)
+          : sp.reduce((s, r) => s + (parseInt(r.panels) || 0), 0);
         cut = sp.reduce((s, r) => s + (parseFloat(r.amountCut) || 0), 0);
         rem = sp.reduce((s, r) => {
           const q = parseFloat(r.quantity) || 0;
@@ -200,11 +209,12 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                 amount_cut = COALESCE($2, amount_cut),
                 remaining_to_cut = COALESCE($3, remaining_to_cut),
                 size_progress = COALESCE($4::jsonb, size_progress),
-                status = $5,
+                markers = COALESCE($5::jsonb, markers),
+                status = $6,
                 updated_at = now()
-          WHERE id = $6
+          WHERE id = $7
           RETURNING *`,
-        [p, cut, rem, sp ? JSON.stringify(sp) : null, newStatus, parseInt(req.params.id)]
+        [p, cut, rem, sp ? JSON.stringify(sp) : null, mk ? JSON.stringify(mk) : null, newStatus, parseInt(req.params.id)]
       );
       if (result.rows.length === 0) {
         return res.status(404).json({ success: false, error: "Cut order not found" });
