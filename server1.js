@@ -505,7 +505,7 @@ await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_wo_no ON work_ord
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_line ON line_assignments(line_no, assigned_date);");
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_work_order ON line_assignments(work_order_id);");
 
-
+await registerMerchantPlan.initSchema({ pool, setSchema });
 await registerCutOrders.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
 
@@ -738,6 +738,10 @@ app.post(
 app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
+
+
+const registerMerchantPlan = require("./merchant-plan");
+registerMerchantPlan(app, { authenticateToken, pool, setSchema });
 
 const registerFinishedWarehouse = require("./finished-warehouse");
 registerFinishedWarehouse(app, { authenticateToken, pool, setSchema });
