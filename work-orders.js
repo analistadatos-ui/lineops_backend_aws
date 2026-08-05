@@ -692,6 +692,71 @@ function registerWorkOrders(app, deps) {
         if (bad) return res.status(400).json({ success: false, error: `Falta el estilo cliente (6 caracteres) para el color ${bad.color || "?"}` });
       }
 
+      // ------------------------------------------------------------------
+      // ONE PO PER (color + estilo + customer PO + delivery date).
+      // Whatever grouping the client sent — a single `lines` payload or an
+      // `orders` array — is re-bucketed here so every distinct combination of
+      // color, estilo cliente, PO cliente and fecha de entrega becomes its own
+      // auto-numbered work order. The rest of the details (tallas, cantidades,
+      // telas, código de tela, rendimiento) travel with the bucket.
+      //
+      // Cells that fall in the same bucket are merged; a repeated talla within a
+      // bucket has its quantity summed and its telas unioned, because the
+      // (work_order_id, talla, color, estilo) unique index allows only one line
+      // per size in a PO.
+      const bucketKey = (c) =>
+        [c.color, c.estilo, c.customerPo || "", c.commitmentDate || ""].join("\u0001");
+      const unionFabrics = (a = [], b = []) => {
+        const out = [];
+        const seen = new Set();
+        for (const f of [...a, ...b]) {
+          const nm = toTxt(f?.name);
+          if (!nm) continue;
+          const cd = toTxt(f?.code);
+          const key = `${nm}|${cd || ""}`.toUpperCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({ name: nm, code: cd, yield: toNum(f?.yield) });
+        }
+        return out;
+      };
+      const poSpecs = [];
+      for (const spec of orderSpecs) {
+        const byKey = new Map();
+        for (const cell of spec.cells) {
+          const key = bucketKey(cell);
+          let bucket = byKey.get(key);
+          if (!bucket) {
+            bucket = {
+              cells: [],
+              commitmentDate: cell.commitmentDate ?? spec.commitmentDate ?? null,
+              fabricName: spec.fabricName ?? null,
+              fabricCode: spec.fabricCode ?? null,
+              yieldPerPiece: spec.yieldPerPiece ?? null,
+            };
+            byKey.set(key, bucket);
+          }
+          const dup = bucket.cells.find((x) => x.talla === cell.talla);
+          if (dup) {
+            dup.quantity += cell.quantity;
+            dup.fabrics = unionFabrics(dup.fabrics, cell.fabrics);
+            const primary = dup.fabrics[0] || {};
+            dup.fabricName = primary.name || dup.fabricName;
+            dup.fabricCode = primary.code || dup.fabricCode;
+            dup.yieldPerPiece = primary.yield ?? dup.yieldPerPiece;
+          } else {
+            bucket.cells.push({ ...cell });
+          }
+        }
+        for (const bucket of byKey.values()) poSpecs.push(bucket);
+      }
+      if (poSpecs.length === 0) return res.status(400).json({ success: false, error: "Enter at least one size/color quantity" });
+
+      // Auto-number whenever more than one PO results (the split created extras)
+      // or the caller is already in multi mode. A lone legacy PO keeps using the
+      // caller-provided workOrderNo.
+      const autoNumber = multi || poSpecs.length > 1;
+
       await client.query("BEGIN");
 
       const cust = await client.query("SELECT name FROM customers WHERE id = $1", [parseInt(customerId)]);
@@ -710,9 +775,9 @@ function registerWorkOrders(app, deps) {
 
       const samNum = parseFloat(sam) || 0;
 
-      // For multi-PO submissions we assign sequential SKM#### numbers ourselves.
+      // For auto-numbered submissions we assign sequential SKM#### numbers ourselves.
       let seq = 0;
-      if (multi) {
+      if (autoNumber) {
         const maxRes = await client.query(
           `SELECT COALESCE(MAX((substring(work_order_no from '^SKM([0-9]+)'))::int), 0) AS maxseq
              FROM work_orders WHERE work_order_no LIKE 'SKM%'`
@@ -724,9 +789,9 @@ function registerWorkOrders(app, deps) {
       let created = 0, reused = 0;
       const createdOrders = [];
 
-      for (let i = 0; i < orderSpecs.length; i++) {
+      for (let i = 0; i < poSpecs.length; i++) {
         const { cells, commitmentDate: specDate, fabricName: specFabricName,
-                fabricCode: specFabricCode, yieldPerPiece: specYield } = orderSpecs[i];
+                fabricCode: specFabricCode, yieldPerPiece: specYield } = poSpecs[i];
         // A PO may carry several customer POs (one per line). Store a distinct,
         // comma-joined summary on the header for display/search; the authoritative
         // per-line values live in work_order_lines.customer_po.
@@ -762,9 +827,10 @@ function registerWorkOrders(app, deps) {
           }
         }
 
-        // PO number: auto sequence for multi; provided number for the legacy case.
+        // PO number: auto sequence when splitting/multi; provided number only for
+        // a single legacy PO.
         let woNo;
-        if (multi) {
+        if (autoNumber) {
           seq += 1;
           woNo = `SKM${String(seq).padStart(4, "0")}-${CLI}-${styleCode}`;
         } else {
