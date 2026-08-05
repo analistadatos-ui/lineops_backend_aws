@@ -93,8 +93,14 @@ function allocateProportional(total, weights) {
 // Build the box rows for a list straight from its work order's size×color lines.
 // One box per work_order_lines row, every field pre-filled from the DB so the
 // operator only has to export. Inserts the rows and returns them.
+//
+// `moFilter` (optional): when given, only the lines whose PO cliente (line
+// customer_po, or the order MO if the line has none) equals it are used — this
+// is how one order is split into one list per PO cliente. If nothing matches
+// (e.g. a legacy list whose mo is a combined value), it falls back to all lines.
+//
 // NOTE: caller runs inside its own transaction; this only issues queries.
-async function generateBoxesFromOrder(client, list) {
+async function generateBoxesFromOrder(client, list, moFilter) {
   if (!list.work_order_id) return [];
 
   const woRes = await client.query(
@@ -120,18 +126,31 @@ async function generateBoxesFromOrder(client, list) {
   const po = header.po || list.po || null;
   const boxRegistry = boxRegistryFor(list.customer_name);
 
-  // Producido is an order-level total (production isn't captured per talla/color),
-  // so split it across the size×color lines in proportion to the ordered quantity.
+  // Each line's effective PO cliente: its own customer_po, else the order MO.
+  const headerMo = String(header.mo ?? "").trim();
+  const effMo = (l) => { const m = String(l.mo ?? "").trim(); return m || headerMo; };
+
+  // Producido is an order-level total (production isn't captured per talla/color).
+  // Split it across ALL size×color lines by ordered quantity FIRST, so that when
+  // a list is scoped to one PO cliente it still gets only its own lines' share,
+  // and the shares across every PO cliente of the order still sum to producido.
   const producedTotal = await workOrders.producedQuantityFor(client, list.work_order_id);
   const allocation = allocateProportional(
     producedTotal,
     linesRes.rows.map((l) => Number(l.quantity) || 0)
   );
+  let rows = linesRes.rows.map((l, i) => ({ ...l, _alloc: allocation[i] }));
+
+  // Scope to one PO cliente when asked (fall back to all lines if none match).
+  if (moFilter != null && String(moFilter).trim() !== "") {
+    const want = String(moFilter).trim();
+    const scoped = rows.filter((l) => effMo(l) === want);
+    if (scoped.length > 0) rows = scoped;
+  }
 
   const inserted = [];
-  for (let i = 0; i < linesRes.rows.length; i++) {
-    const l = linesRes.rows[i];
-    const { rows } = await client.query(
+  for (const l of rows) {
+    const { rows: ins } = await client.query(
       `INSERT INTO pre_packing_boxes
          (list_id, box_qrcode, encasement_qrcode, mo, po, style, fabric_code, sex,
           size_code, color_name, color_code, quantity, box_code, box_registry,
@@ -142,7 +161,7 @@ async function generateBoxesFromOrder(client, list) {
         list.id,
         null,                                   // box_qrcode — ticket is the PO on export
         null,                                   // encasement_qrcode (system field)
-        l.mo || header.mo || list.mo || null,
+        effMo(l) || list.mo || null,
         po,
         l.style || null,                        // "label" = estilo -> Estyle column
         l.fabric_code || null,
@@ -150,7 +169,7 @@ async function generateBoxesFromOrder(client, list) {
         l.size_code || null,
         l.color_name || null,
         colorCodeOf(l.color_name, l.size_code) || null,
-        allocation[i],                          // producido split proportionally by size
+        l._alloc,                               // producido split proportionally by size
         DEFAULT_BOX_CODE,
         boxRegistry,
         0,
@@ -159,9 +178,25 @@ async function generateBoxesFromOrder(client, list) {
         list.customer_name || null,
       ]
     );
-    inserted.push(rows[0]);
+    inserted.push(ins[0]);
   }
   return inserted;
+}
+
+// Distinct PO cliente (MO) values across a work order's lines. A line with no
+// customer_po falls back to the order-level MO. Drives the "one list per PO
+// cliente" split at create time. Returned sorted for stable list numbering.
+async function distinctLineMos(client, workOrderId, headerMo) {
+  const { rows } = await client.query(
+    `SELECT DISTINCT COALESCE(NULLIF(TRIM(customer_po), ''), $2) AS mo
+       FROM work_order_lines
+      WHERE work_order_id = $1`,
+    [workOrderId, String(headerMo ?? "").trim()]
+  );
+  return rows
+    .map((r) => String(r.mo ?? "").trim())
+    .filter((m) => m.length > 0)
+    .sort((a, b) => a.localeCompare(b));
 }
 
 async function initSchema({ pool, setSchema }) {
@@ -418,7 +453,7 @@ function registerFinishedWarehouse(app, deps) {
     if (!list.work_order_id) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "La lista no tiene una orden asociada" }); }
 
     await client.query(`DELETE FROM pre_packing_boxes WHERE list_id = $1`, [id]);
-    const boxes = await generateBoxesFromOrder(client, list);
+    const boxes = await generateBoxesFromOrder(client, list, list.mo);
     await client.query("COMMIT");
     res.json({ success: true, boxes, boxesGenerated: boxes.length });
   }));
@@ -513,32 +548,47 @@ function registerFinishedWarehouse(app, deps) {
     if (cRes.rows.length === 0) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "Cliente no válido" }); }
     const cust = cRes.rows[0];
 
-    let po = null, mo = null, woId = null;
+    let woId = null, po = null, headerMo = null;
     if (workOrderId) {
       const wRes = await client.query(`SELECT id, work_order_no, customer_po FROM work_orders WHERE id = $1`, [workOrderId]);
-      if (wRes.rows.length) { woId = wRes.rows[0].id; po = wRes.rows[0].work_order_no; mo = wRes.rows[0].customer_po; }
+      if (wRes.rows.length) { woId = wRes.rows[0].id; po = wRes.rows[0].work_order_no; headerMo = wRes.rows[0].customer_po; }
     }
 
-    const insRes = await client.query(
-      `INSERT INTO pre_packing_lists
-         (customer_id, customer_code, customer_name, work_order_id, po, mo, notes, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING *`,
-      [cust.id, cust.code, cust.name, woId, po, mo, notes || null, req.user?.id ?? null]
-    );
-    const list = insRes.rows[0];
+    // One order can carry several PO cliente (customer_po) across its lines. When
+    // it does, create ONE pre-packing list per PO cliente, each seeded only with
+    // that PO cliente's size×color lines (e.g. PP-000010 → 23456, PP-000011 → po-1234).
+    let mos = [];
+    if (woId) mos = await distinctLineMos(client, woId, headerMo);
+    if (mos.length === 0) mos = [headerMo ? String(headerMo).trim() : null]; // no order / no per-line PO cliente
 
-    const upd = await client.query(
-      `UPDATE pre_packing_lists SET list_no = $2 WHERE id = $1 RETURNING *`,
-      [list.id, `PP-${String(list.id).padStart(6, "0")}`]
-    );
-
-    // Auto-fill the whole list from the order: one box per size×color line, all
-    // fields pulled from the DB. The operator just reviews and exports.
-    const boxes = await generateBoxesFromOrder(client, upd.rows[0]);
+    const created = [];
+    for (const mo of mos) {
+      const insRes = await client.query(
+        `INSERT INTO pre_packing_lists
+           (customer_id, customer_code, customer_name, work_order_id, po, mo, notes, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         RETURNING *`,
+        [cust.id, cust.code, cust.name, woId, po, mo, notes || null, req.user?.id ?? null]
+      );
+      const listRow = insRes.rows[0];
+      const upd = await client.query(
+        `UPDATE pre_packing_lists SET list_no = $2 WHERE id = $1 RETURNING *`,
+        [listRow.id, `PP-${String(listRow.id).padStart(6, "0")}`]
+      );
+      // Auto-fill this list from the order, scoped to its PO cliente.
+      const boxes = await generateBoxesFromOrder(client, upd.rows[0], mo);
+      created.push({ list: upd.rows[0], boxesGenerated: boxes.length });
+    }
 
     await client.query("COMMIT");
-    res.json({ success: true, list: upd.rows[0], boxes, boxesGenerated: boxes.length });
+    // `lists` is the full set; `list`/`boxesGenerated` (first list) kept for compat.
+    res.json({
+      success: true,
+      lists: created,
+      count: created.length,
+      list: created[0]?.list ?? null,
+      boxesGenerated: created[0]?.boxesGenerated ?? 0,
+    });
   }));
 
   // Update header (only while draft).
