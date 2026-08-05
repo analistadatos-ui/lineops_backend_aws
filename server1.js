@@ -3161,7 +3161,7 @@ app.get("/api/run-capacity-history/:runId", authenticateToken, async (req, res) 
 
 // Helper middleware for quality inspector access
 const requireQualityInspector = (req, res, next) => {
-  const allowedRoles = ['quality_inspector', 'engineer', 'supervisor', 'soporte_it', 'master'];
+  const allowedRoles = ['quality_inspector', 'engineer', 'supervisor', 'soporte_it', 'master','quality_head'];
   if (!allowedRoles.includes(req.user?.role)) {
     return res.status(403).json({
       success: false,
@@ -3563,7 +3563,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
   try {
     await setSchema(client);
 
-    if (!['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'quality_inspector'].includes(req.user?.role)) {
+    if (!['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'quality_inspector', 'quality_head'].includes(req.user?.role)) {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
 
