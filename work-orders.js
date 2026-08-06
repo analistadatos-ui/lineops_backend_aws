@@ -512,6 +512,312 @@ function registerWorkOrders(app, deps) {
     }
   });
 
+  // ---- GET /api/line-assignments/day-balances ---------------------------
+  //
+  // Una fila por celda del tablero (orden + linea + dia):
+  //   assigned    piezas que el planeador puso en esa celda
+  //   produced    piezas de empaque/terminado que reporto esa linea ESE dia
+  //   balance     assigned - produced  (nunca negativo)
+  //   run_linked  si existe corrida de esa linea ese dia ligada a la orden
+  //
+  // Hasta ahora la produccion se conocia a nivel ORDEN (produced_quantity) y a
+  // nivel ORDEN+LINEA (producedByLineFor). Ninguno decia EN QUE DIA se cosio,
+  // asi que el planeador no podia ver que el martes se asignaron 501 pzas y
+  // solo entraron 301. line_runs si tiene run_date: agrupando por
+  // (orden, linea, run_date) sale el tercer eje que faltaba.
+  //
+  // run_linked=false con balance completo casi siempre significa que el lider
+  // guardo la corrida SIN seleccionar la orden, no que la linea no cosio. Sin
+  // ese dato el planeador reasignaria piezas que ya estan hechas.
+  //
+  // Se agrupa por (orden, linea, dia) y NO por asignacion: una celda puede
+  // tener varias filas en line_assignments (una por color) y la produccion no
+  // se captura por color, asi que restarla contra cada fila la contaria de mas.
+  app.get("/api/line-assignments/day-balances", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      await ensureProducedResolved(client);
+
+      const { from, to, workOrderId, lineNo, onlyPending } = req.query;
+
+      // Sin deteccion resuelta no hay forma de saber que se cosio: mejor decirlo
+      // que devolver saldos que serian el 100% de lo asignado.
+      if (!RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) {
+        return res.json({
+          success: true,
+          resolved: false,
+          rows: [],
+          warning:
+            "No se pudo ligar la captura de piso con las ordenes; el saldo por dia no esta disponible.",
+        });
+      }
+
+      const params = [];
+      const where = ["la.status NOT IN ('cancelled', 'rejected')"];
+
+      if (from) { params.push(from); where.push(`la.assigned_date >= $${params.length}::date`); }
+      if (to)   { params.push(to);   where.push(`la.assigned_date <= $${params.length}::date`); }
+      if (workOrderId) { params.push(parseInt(workOrderId, 10)); where.push(`la.work_order_id = $${params.length}`); }
+      if (lineNo)      { params.push(String(lineNo));            where.push(`la.line_no = $${params.length}`); }
+
+      const { rows } = await client.query(
+        `
+        WITH prod AS (
+          SELECT wo.id       AS work_order_id,
+                 lr.line_no,
+                 lr.run_date,
+                 COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced,
+                 MAX(se.updated_at) AS last_reported_at
+            FROM work_orders wo
+            JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+            JOIN operation_sewed_entries se ON se.run_id = lr.id
+            JOIN operator_operations oo     ON oo.id = se.operation_id
+           GROUP BY wo.id, lr.line_no, lr.run_date
+        ),
+        runs AS (
+          SELECT lr.line_no,
+                 lr.run_date,
+                 COUNT(*)::int AS n_runs
+            FROM line_runs lr
+           GROUP BY lr.line_no, lr.run_date
+        ),
+        cells AS (
+          SELECT la.work_order_id,
+                 la.line_no,
+                 la.assigned_date,
+                 SUM(la.assigned_quantity)       AS assigned,
+                 ARRAY_AGG(la.id ORDER BY la.id) AS assignment_ids,
+                 ARRAY_AGG(DISTINCT la.color) FILTER (WHERE la.color IS NOT NULL) AS colors
+            FROM line_assignments la
+           WHERE ${where.join(" AND ")}
+           GROUP BY la.work_order_id, la.line_no, la.assigned_date
+        )
+        SELECT c.work_order_id,
+               wo.work_order_no,
+               wo.style_description,
+               wo.customer_name,
+               c.line_no,
+               to_char(c.assigned_date, 'YYYY-MM-DD') AS assigned_date,
+               c.assigned::numeric                     AS assigned,
+               COALESCE(p.produced, 0)::numeric        AS produced,
+               GREATEST(c.assigned - COALESCE(p.produced, 0), 0)::numeric AS balance,
+               GREATEST(COALESCE(p.produced, 0) - c.assigned, 0)::numeric AS over_qty,
+               c.assignment_ids,
+               COALESCE(c.colors, ARRAY[]::text[])     AS colors,
+               p.last_reported_at,
+               COALESCE(r.n_runs, 0)                   AS runs_on_day,
+               (p.produced IS NOT NULL)                AS run_linked,
+               (COALESCE(r.n_runs, 0) > 1)             AS shared_day,
+               (c.assigned_date <  CURRENT_DATE)       AS is_past,
+               (c.assigned_date =  CURRENT_DATE)       AS is_today
+          FROM cells c
+          JOIN work_orders wo ON wo.id = c.work_order_id
+          LEFT JOIN prod p ON p.work_order_id = c.work_order_id
+                          AND p.line_no       = c.line_no
+                          AND p.run_date      = c.assigned_date
+          LEFT JOIN runs r ON r.line_no  = c.line_no
+                          AND r.run_date = c.assigned_date
+         ORDER BY c.assigned_date DESC, c.line_no
+        `,
+        params
+      );
+
+      const out = rows.map((r) => {
+        const assigned = Number(r.assigned) || 0;
+        const produced = Number(r.produced) || 0;
+        const balance = Number(r.balance) || 0;
+        const state = r.is_today ? "today"
+          : !r.is_past ? "future"
+          : balance > 0 ? "short"
+          : "met";
+        return {
+          work_order_id: Number(r.work_order_id),
+          work_order_no: r.work_order_no,
+          style_description: r.style_description,
+          customer_name: r.customer_name,
+          line_no: r.line_no,
+          assigned_date: r.assigned_date,
+          assigned,
+          produced,
+          balance,
+          over: Number(r.over_qty) || 0,
+          pct: assigned > 0 ? Math.min((produced / assigned) * 100, 100) : 0,
+          assignment_ids: r.assignment_ids || [],
+          colors: r.colors || [],
+          run_linked: !!r.run_linked,
+          runs_on_day: Number(r.runs_on_day) || 0,
+          shared_day: !!r.shared_day,
+          is_past: !!r.is_past,
+          is_today: !!r.is_today,
+          last_reported_at: r.last_reported_at,
+          state,
+        };
+      });
+
+      const pending = out.filter((r) => r.is_past && r.balance > 0);
+
+      res.json({
+        success: true,
+        resolved: true,
+        rows: onlyPending ? pending : out,
+        totals: {
+          cells: out.length,
+          pendingCells: pending.length,
+          pendingPieces: Math.round(pending.reduce((s, r) => s + r.balance, 0)),
+          unlinkedCells: pending.filter((r) => !r.run_linked && r.runs_on_day > 0).length,
+        },
+      });
+    } catch (err) {
+      console.error("\u274c Error en day-balances:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ---- POST /api/line-assignments/settle-day ----------------------------
+  //
+  // Cierra una celda por lo que REALMENTE se cosio y devuelve el saldo.
+  //
+  // Hace falta antes de reasignar. Si se crean celdas nuevas dejando la vieja
+  // intacta, el martes queda con 501 pzas asignadas (de las que solo se hicieron
+  // 301) MAS 200 el miercoles: 701 asignadas para 501 de trabajo real. Como el
+  // pool del tablero se llena con total - assigned_quantity, la orden se veria
+  // totalmente asignada y el saldo desapareceria de Estado de Ordenes justo
+  // cuando el planeador mas lo necesita.
+  //
+  // El reparto entre colores es proporcional porque la produccion se captura por
+  // orden, no por color: no hay dato para hacerlo de otra forma.
+  app.post("/api/line-assignments/settle-day", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      await ensureProducedResolved(client);
+
+      const { workOrderId, lineNo, date } = req.body || {};
+      if (!workOrderId || !lineNo || !date) {
+        return res.status(400).json({ success: false, error: "Faltan workOrderId, lineNo o date." });
+      }
+      if (!RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) {
+        return res.status(409).json({
+          success: false,
+          error: "No se puede liquidar el dia: la captura de piso no esta ligada a las ordenes.",
+        });
+      }
+
+      await client.query("BEGIN");
+
+      // Bloquear las filas para que dos planeadores no liquiden el mismo dia al
+      // mismo tiempo y el saldo salga reasignado dos veces.
+      const cellRes = await client.query(
+        `SELECT id, color, assigned_quantity
+           FROM line_assignments
+          WHERE work_order_id = $1
+            AND line_no = $2
+            AND assigned_date = $3::date
+            AND status NOT IN ('cancelled', 'rejected')
+          ORDER BY id
+          FOR UPDATE`,
+        [parseInt(workOrderId, 10), String(lineNo), date]
+      );
+
+      if (cellRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, error: "No hay asignacion en esa celda." });
+      }
+
+      const prodRes = await client.query(
+        `SELECT COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced
+           FROM work_orders wo
+           JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+           JOIN operation_sewed_entries se ON se.run_id = lr.id
+           JOIN operator_operations oo     ON oo.id = se.operation_id
+          WHERE wo.id = $1
+            AND lr.line_no = $2
+            AND lr.run_date = $3::date`,
+        [parseInt(workOrderId, 10), String(lineNo), date]
+      );
+
+      const produced = Number(prodRes.rows[0]?.produced) || 0;
+      const assigned = cellRes.rows.reduce((s, r) => s + (Number(r.assigned_quantity) || 0), 0);
+      const balance = Math.max(assigned - produced, 0);
+
+      if (balance <= 0) {
+        await client.query(
+          `UPDATE line_assignments SET status = 'completed', updated_at = now() WHERE id = ANY($1)`,
+          [cellRes.rows.map((r) => r.id)]
+        );
+        await client.query("COMMIT");
+        return res.json({
+          success: true,
+          settled: true,
+          assigned, produced, balance: 0,
+          updated: cellRes.rows.length, deleted: 0,
+          message: "El dia alcanzo su meta; no hay saldo que reasignar.",
+        });
+      }
+
+      // Reparto proporcional. El residuo del redondeo va a la fila mas grande,
+      // para que la suma de las partes sea exactamente `produced` y no aparezcan
+      // saldos fantasma de 1 pza.
+      const parts = cellRes.rows.map((r) => ({
+        id: r.id,
+        color: r.color,
+        assigned: Number(r.assigned_quantity) || 0,
+      }));
+      let repartido = 0;
+      parts.forEach((r) => {
+        r.keep = assigned > 0 ? Math.floor((r.assigned / assigned) * produced) : 0;
+        repartido += r.keep;
+      });
+      const residuo = produced - repartido;
+      if (residuo > 0) {
+        parts.slice().sort((a, b) => b.assigned - a.assigned)[0].keep += residuo;
+      }
+
+      const toDelete = parts.filter((r) => r.keep <= 0).map((r) => r.id);
+      const toUpdate = parts.filter((r) => r.keep > 0);
+
+      for (const r of toUpdate) {
+        await client.query(
+          `UPDATE line_assignments
+              SET assigned_quantity = $2, status = 'completed', updated_at = now()
+            WHERE id = $1`,
+          [r.id, r.keep]
+        );
+      }
+      // assigned_quantity tiene CHECK (> 0): una celda sin nada cosido no se
+      // puede dejar en cero, hay que borrarla.
+      if (toDelete.length) {
+        await client.query(`DELETE FROM line_assignments WHERE id = ANY($1)`, [toDelete]);
+      }
+
+      await client.query("COMMIT");
+
+      // El saldo NO se reasigna aqui a proposito: a donde van esas piezas es
+      // decision del planeador (misma linea manana, otra linea, o de regreso al
+      // pool). El frontend recibe `balance` y llama a la asignacion normal, que
+      // ya sabe repartir respetando la capacidad diaria de cada linea.
+      res.json({
+        success: true,
+        settled: true,
+        assigned,
+        produced,
+        balance,
+        updated: toUpdate.length,
+        deleted: toDelete.length,
+        colors: parts.filter((r) => r.color).map((r) => r.color),
+      });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("\u274c Error en settle-day:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
   // ---- POST /api/work-orders --------------------------------------------
   app.post("/api/work-orders", authenticateToken, async (req, res) => {
     const client = await pool.connect();
@@ -1263,8 +1569,63 @@ async function producedByLineFor(client, workOrderId) {
   return map.get(Number(workOrderId)) || [];
 }
 
+// Piezas terminadas por (ORDEN, LINEA, DIA). Mismo enlace line_runs->orden y
+// las mismas operaciones de empaque/terminado que producedQuantityFor, solo
+// que ademas agrupado por lr.run_date: ese es el eje que faltaba para saber
+// que un dia cerro incompleto. Regresa [] si la deteccion no resolvio.
+//
+//   [{ work_order_id, line_no, day: 'YYYY-MM-DD', produced, last_reported_at }]
+//
+// OJO con line_runs: la UNIQUE es (line_no, run_date, style), o sea UNA corrida
+// por linea/dia/estilo, y esa corrida apunta a UNA orden. Si una linea cose dos
+// ordenes distintas el mismo dia (el tablero si permite varios POs por celda),
+// el piso solo puede reportar contra una de ellas y el saldo de la otra saldra
+// completo. No es un bug de esta consulta: es el limite del modelo actual.
+async function producedByLineDayForMany(client, { workOrderIds = null, from = null, to = null } = {}) {
+  await ensureProducedResolved(client);
+  if (!RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) return [];
+
+  const params = [];
+  const where = [];
+
+  const ids = Array.isArray(workOrderIds)
+    ? workOrderIds.map(Number).filter(Number.isFinite)
+    : null;
+  if (ids && ids.length) {
+    params.push(ids);
+    where.push(`wo.id = ANY($${params.length})`);
+  }
+  if (from) { params.push(from); where.push(`lr.run_date >= $${params.length}::date`); }
+  if (to)   { params.push(to);   where.push(`lr.run_date <= $${params.length}::date`); }
+
+  const { rows } = await client.query(
+    `SELECT wo.id                              AS work_order_id,
+            lr.line_no,
+            to_char(lr.run_date, 'YYYY-MM-DD') AS day,
+            COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced,
+            MAX(se.updated_at)                 AS last_reported_at
+       FROM work_orders wo
+       JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+       JOIN operation_sewed_entries se ON se.run_id = lr.id
+       JOIN operator_operations oo     ON oo.id = se.operation_id
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      GROUP BY wo.id, lr.line_no, lr.run_date
+      ORDER BY lr.run_date, lr.line_no`,
+    params
+  );
+
+  return rows.map((r) => ({
+    work_order_id: Number(r.work_order_id),
+    line_no: r.line_no,
+    day: r.day,
+    produced: Number(r.produced) || 0,
+    last_reported_at: r.last_reported_at,
+  }));
+}
+
 registerWorkOrders.initSchema = initSchema;
 registerWorkOrders.producedQuantityFor = producedQuantityFor;
 registerWorkOrders.producedByLineFor = producedByLineFor;
 registerWorkOrders.producedByLineForMany = producedByLineForMany;
+registerWorkOrders.producedByLineDayForMany = producedByLineDayForMany;
 module.exports = registerWorkOrders;
