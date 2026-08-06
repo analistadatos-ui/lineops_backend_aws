@@ -218,79 +218,107 @@ async function tableColumns(client, table) {
   return new Set(rows.map((r) => r.column_name));
 }
 
-// Construye el subquery de produccion. Se llama una sola vez al arranque.
+// Construye el subquery de produccion.
+// Wrapper para el flujo de migraciones: abre su propio client. initSchema lo
+// sigue llamando igual que antes.
 async function resolveProducedSubquery({ pool, setSchema }) {
   const client = await pool.connect();
   try {
     await setSchema(client);
-
-    const runCols = await tableColumns(client, "line_runs");
-    const sewCols = await tableColumns(client, "operation_sewed_entries");
-    const opCols = await tableColumns(client, "operator_operations");
-
-    const missing = [];
-    if (runCols.size === 0) missing.push("line_runs");
-    if (!sewCols.has("sewed_qty") || !sewCols.has("operation_id")) missing.push("operation_sewed_entries");
-    if (!opCols.has("operation_name")) missing.push("operator_operations");
-
-    if (missing.length) {
-      console.warn(
-        "\u26a0\ufe0f  produced_quantity quedara en 0. Tablas no encontradas o sin las " +
-        `columnas esperadas: ${missing.join(", ")}.`
-      );
-      return;
-    }
-
-    const link = RUN_LINK_CANDIDATES.find((c) => runCols.has(c.column));
-    if (!link) {
-      console.warn(
-        "\u26a0\ufe0f  produced_quantity quedara en 0: line_runs no tiene ninguna columna " +
-        `conocida hacia la orden (${RUN_LINK_CANDIDATES.map((c) => c.column).join(", ")}). ` +
-        "Agrega la correcta a RUN_LINK_CANDIDATES en work-orders.js."
-      );
-      return;
-    }
-
-    const likes = PACKING_KEYWORDS
-      .map((k) => `lower(oo.operation_name) LIKE '%${k}%'`)
-      .join(" OR ");
-
-    // Solo las operaciones de empaque/terminado. Sumar todas las operaciones
-    // contaria cada prenda una vez por operacion de la linea.
-    PRODUCED_SUBQUERY = `
-      COALESCE((
-        SELECT SUM(se.sewed_qty)
-          FROM operation_sewed_entries se
-          JOIN operator_operations oo ON oo.id = se.operation_id
-          JOIN line_runs lr           ON lr.id = se.run_id
-         WHERE ${link.on}
-           AND (${likes})
-      ), 0) AS produced_quantity
-    `;
-
-    // Guardar para el desglose por linea (finished-warehouse los reutiliza).
-    RESOLVED_RUN_LINK = link;
-    PACKING_LIKES_SQL = likes;
-
-    console.log(`\u2705 produced_quantity resuelto (line_runs.${link.column})`);
-
-    // Aviso temprano: si ninguna operacion capturada coincide con las palabras
-    // clave, el total sera 0 aunque la linea si este produciendo.
-    const { rows } = await client.query(
-      `SELECT COUNT(*)::int AS n FROM operator_operations oo WHERE ${likes}`
-    );
-    if (rows[0].n === 0) {
-      console.warn(
-        "\u26a0\ufe0f  Ninguna operacion coincide con PACKING_KEYWORDS " +
-        `[${PACKING_KEYWORDS.join(", ")}]; produced_quantity sera 0. ` +
-        "Revisa como se llaman tus operaciones de empaque y ajusta la lista."
-      );
-    }
+    await detectProducedSubquery(client);
   } catch (err) {
     console.warn("\u26a0\ufe0f  resolveProducedSubquery fallo:", err.message);
   } finally {
     client.release();
   }
+}
+
+// La deteccion real. Recibe un client que YA tiene el search_path puesto, para
+// poder reusar el de la peticion en curso sin abrir otra conexion.
+async function detectProducedSubquery(client) {
+  const runCols = await tableColumns(client, "line_runs");
+  const sewCols = await tableColumns(client, "operation_sewed_entries");
+  const opCols = await tableColumns(client, "operator_operations");
+
+  const missing = [];
+  if (runCols.size === 0) missing.push("line_runs");
+  if (!sewCols.has("sewed_qty") || !sewCols.has("operation_id")) missing.push("operation_sewed_entries");
+  if (!opCols.has("operation_name")) missing.push("operator_operations");
+
+  if (missing.length) {
+    console.warn(
+      "\u26a0\ufe0f  produced_quantity quedara en 0. Tablas no encontradas o sin las " +
+      `columnas esperadas: ${missing.join(", ")}.`
+    );
+    return;
+  }
+
+  const link = RUN_LINK_CANDIDATES.find((c) => runCols.has(c.column));
+  if (!link) {
+    console.warn(
+      "\u26a0\ufe0f  produced_quantity quedara en 0: line_runs no tiene ninguna columna " +
+      `conocida hacia la orden (${RUN_LINK_CANDIDATES.map((c) => c.column).join(", ")}). ` +
+      "Agrega la correcta a RUN_LINK_CANDIDATES en work-orders.js."
+    );
+    return;
+  }
+
+  const likes = PACKING_KEYWORDS
+    .map((k) => `lower(oo.operation_name) LIKE '%${k}%'`)
+    .join(" OR ");
+
+  // Solo las operaciones de empaque/terminado. Sumar todas las operaciones
+  // contaria cada prenda una vez por operacion de la linea.
+  PRODUCED_SUBQUERY = `
+    COALESCE((
+      SELECT SUM(se.sewed_qty)
+        FROM operation_sewed_entries se
+        JOIN operator_operations oo ON oo.id = se.operation_id
+        JOIN line_runs lr           ON lr.id = se.run_id
+       WHERE ${link.on}
+         AND (${likes})
+    ), 0) AS produced_quantity
+  `;
+
+  // Guardar para el desglose por linea (finished-warehouse los reutiliza).
+  RESOLVED_RUN_LINK = link;
+  PACKING_LIKES_SQL = likes;
+
+  console.log(`\u2705 produced_quantity resuelto (line_runs.${link.column})`);
+
+  // Aviso temprano: si ninguna operacion capturada coincide con las palabras
+  // clave, el total sera 0 aunque la linea si este produciendo.
+  const { rows } = await client.query(
+    `SELECT COUNT(*)::int AS n FROM operator_operations oo WHERE ${likes}`
+  );
+  if (rows[0].n === 0) {
+    console.warn(
+      "\u26a0\ufe0f  Ninguna operacion coincide con PACKING_KEYWORDS " +
+      `[${PACKING_KEYWORDS.join(", ")}]; produced_quantity sera 0. ` +
+      "Revisa como se llaman tus operaciones de empaque y ajusta la lista."
+    );
+  }
+}
+
+// Detección resuelta una sola vez por proceso, bajo demanda.
+//
+// NO puede depender de runMigrations(): en Lambda RUN_MIGRATIONS=false y esa
+// funcion ni siquiera se invoca, asi que initSchema nunca corre. Sin este
+// candado PRODUCED_SUBQUERY se queda en el literal "0::numeric" durante toda la
+// vida del proceso y el planeador ve 0 producido aunque el piso si haya cosido.
+let producedResolution = null;
+
+async function ensureProducedResolved(client) {
+  if (RESOLVED_RUN_LINK) return;              // ya resuelto en este proceso
+  if (!producedResolution) {
+    producedResolution = detectProducedSubquery(client).catch((err) => {
+      // Se limpia el memo para reintentar en la siguiente peticion en vez de
+      // quedarse en 0 para siempre por un error transitorio de conexion.
+      producedResolution = null;
+      console.warn("\u26a0\ufe0f  detectProducedSubquery fallo:", err.message);
+    });
+  }
+  await producedResolution;
 }
 
 const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, n);
@@ -351,6 +379,9 @@ function registerWorkOrders(app, deps) {
     const client = await pool.connect();
     try {
       await setSchema(client);
+      // PRODUCED_SUBQUERY se interpola abajo: hay que resolverlo ANTES de armar
+      // el string de la consulta, o se cuela el literal 0.
+      await ensureProducedResolved(client);
       const { status, lineNo, startDate, endDate } = req.query;
 
       let query = `
@@ -435,6 +466,7 @@ function registerWorkOrders(app, deps) {
     const client = await pool.connect();
     try {
       await setSchema(client);
+      await ensureProducedResolved(client);
       const { id } = req.params;
 
       const result = await client.query(
@@ -1175,6 +1207,7 @@ function registerWorkOrders(app, deps) {
 // captured per talla/color. Other modules (e.g. finished-warehouse) reuse this
 // so the logic lives in exactly one place.
 async function producedQuantityFor(client, workOrderId) {
+  await ensureProducedResolved(client);
   const { rows } = await client.query(
     `SELECT ${PRODUCED_SUBQUERY} FROM work_orders wo WHERE wo.id = $1`,
     [workOrderId]
@@ -1187,6 +1220,7 @@ async function producedQuantityFor(client, workOrderId) {
 // last_reported_at }]>. Mismo enlace y mismas operaciones de empaque/terminado
 // que producedQuantityFor. Vacio si la deteccion no resolvio.
 async function producedByLineForMany(client, workOrderIds) {
+  await ensureProducedResolved(client);
   const ids = (workOrderIds || []).map((x) => Number(x)).filter((x) => Number.isFinite(x));
   if (ids.length === 0 || !RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) return new Map();
   const { rows } = await client.query(
