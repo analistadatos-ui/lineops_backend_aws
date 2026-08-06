@@ -508,7 +508,7 @@ await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_work_order O
 await registerMerchantPlan.initSchema({ pool, setSchema });
 await registerCutOrders.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
-
+await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
     // Create index for faster queries
     await client.query("CREATE INDEX IF NOT EXISTS idx_capacity_history_operation ON operator_capacity_history(operation_id);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_capacity_history_changed_at ON operator_capacity_history(changed_at);");
