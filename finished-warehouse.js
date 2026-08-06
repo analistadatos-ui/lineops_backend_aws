@@ -399,6 +399,103 @@ function registerFinishedWarehouse(app, deps) {
     res.json({ success: true, header, lines: linesRes.rows });
   }));
 
+  // Line-leader INPUT for one work order: what each production line has reported
+  // as finished (packing/terminado ops), plus ordered vs produced totals. Lets
+  // the Almacén PT operator see "qué entró de cada línea" and judge WHEN a work
+  // order has enough finished to build its pre-packing list. Read-only.
+  app.get("/api/finished-warehouse/work-orders/:workOrderId/line-production", authenticateToken, withClient(async (req, res, client) => {
+    const woId = parseInt(req.params.workOrderId, 10);
+    const woRes = await client.query(
+      `SELECT id, work_order_no AS po, customer_po AS mo FROM work_orders WHERE id = $1`, [woId]
+    );
+    if (woRes.rows.length === 0) return res.status(404).json({ success: false, error: "Orden de trabajo no encontrada" });
+
+    // Ordered = sum of the order's size×color lines. Produced = order-level total
+    // from the same packing-operation logic the planner uses (single source).
+    const ordRes = await client.query(
+      `SELECT COALESCE(SUM(quantity), 0) AS ordered FROM work_order_lines WHERE work_order_id = $1`, [woId]
+    );
+    const orderedTotal = Number(ordRes.rows[0].ordered) || 0;
+
+    const lines = await workOrders.producedByLineFor(client, woId);   // [{ line_no, finished, last_reported_at }]
+    const producedTotal = await workOrders.producedQuantityFor(client, woId);
+
+    res.json({ success: true, workOrder: woRes.rows[0], orderedTotal, producedTotal, lines });
+  }));
+
+  // DASHBOARD feed: work orders that have line production, most recently active
+  // first, each with ordered/produced totals, the per-line breakdown, and any
+  // pre-packing lists already started. This is what the "Entrada de líneas" view
+  // reads so the operator can spot which orders are ready to pre-empaque.
+  app.get("/api/finished-warehouse/line-input", authenticateToken, withClient(async (req, res, client) => {
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 60));
+
+    // Candidate orders: any with production runs, not cancelled, newest activity first.
+    const woRes = await client.query(
+      `SELECT wo.id,
+              wo.work_order_no                   AS po,
+              wo.customer_po                     AS mo,
+              COALESCE(wo.estilo, wo.style_code) AS style,
+              wo.customer_id,
+              wo.customer_name,
+              c.code                             AS customer_code,
+              MAX(lr.updated_at)                 AS last_activity
+         FROM work_orders wo
+         JOIN line_runs lr ON lr.work_order_id = wo.id
+         LEFT JOIN customers c ON c.id = wo.customer_id
+        WHERE wo.status <> 'cancelled'
+        GROUP BY wo.id, c.code
+        ORDER BY MAX(lr.updated_at) DESC NULLS LAST
+        LIMIT $1`,
+      [limit]
+    );
+    const orders = woRes.rows;
+    if (orders.length === 0) return res.json({ success: true, orders: [] });
+    const ids = orders.map((o) => o.id);
+
+    // Ordered totals, existing lists, and per-line production — one query each.
+    const ordRes = await client.query(
+      `SELECT work_order_id, COALESCE(SUM(quantity), 0) AS ordered
+         FROM work_order_lines WHERE work_order_id = ANY($1) GROUP BY work_order_id`, [ids]
+    );
+    const orderedBy = new Map(ordRes.rows.map((r) => [Number(r.work_order_id), Number(r.ordered) || 0]));
+
+    const listRes = await client.query(
+      `SELECT work_order_id, list_no, status FROM pre_packing_lists
+        WHERE work_order_id = ANY($1) ORDER BY id ASC`, [ids]
+    );
+    const listsBy = new Map();
+    for (const r of listRes.rows) {
+      const key = Number(r.work_order_id);
+      const arr = listsBy.get(key) || [];
+      arr.push({ list_no: r.list_no, status: r.status });
+      listsBy.set(key, arr);
+    }
+
+    const lineMap = await workOrders.producedByLineForMany(client, ids);
+
+    const result = orders.map((o) => {
+      const lines = lineMap.get(Number(o.id)) || [];
+      const producedTotal = lines.reduce((s, l) => s + (Number(l.finished) || 0), 0);
+      return {
+        id: o.id,
+        po: o.po,
+        mo: o.mo,
+        style: o.style,
+        customer_id: o.customer_id,
+        customer_name: o.customer_name,
+        customer_code: o.customer_code,
+        orderedTotal: orderedBy.get(Number(o.id)) || 0,
+        producedTotal,
+        lastActivity: o.last_activity,
+        lines,
+        lists: listsBy.get(Number(o.id)) || [],
+      };
+    });
+
+    res.json({ success: true, orders: result });
+  }));
+
   // ======================================================================
   //  PRE-PACKING LISTS
   // ======================================================================

@@ -188,6 +188,13 @@ const PACKING_KEYWORDS = ["pack", "emp", "termin", "finish"];
 // de tronar cada consulta del planeador.
 let PRODUCED_SUBQUERY = "0::numeric AS produced_quantity";
 
+// Resolvidos en resolveProducedSubquery() y guardados a nivel de modulo para que
+// producedByLineFor() reutilice EXACTAMENTE la misma deteccion (mismo enlace
+// line_runs -> orden y las mismas operaciones de empaque/terminado). Si quedan
+// en null es que la deteccion fallo; el desglose por linea regresa vacio.
+let RESOLVED_RUN_LINK = null;   // { column, on }  — on usa alias lr y wo
+let PACKING_LIKES_SQL = null;   // "lower(oo.operation_name) LIKE '%..%' OR ..."
+
 // Tablas reales donde vive la captura por hora del lider de linea:
 //   line_runs                (id, ... , enlace a la orden)
 //   operator_operations      (id, run_id, operation_name, ...)
@@ -260,6 +267,10 @@ async function resolveProducedSubquery({ pool, setSchema }) {
            AND (${likes})
       ), 0) AS produced_quantity
     `;
+
+    // Guardar para el desglose por linea (finished-warehouse los reutiliza).
+    RESOLVED_RUN_LINK = link;
+    PACKING_LIKES_SQL = likes;
 
     console.log(`\u2705 produced_quantity resuelto (line_runs.${link.column})`);
 
@@ -1171,6 +1182,55 @@ async function producedQuantityFor(client, workOrderId) {
   return Number(rows[0]?.produced_quantity) || 0;
 }
 
+// Produccion terminada por LINEA para VARIAS ordenes en una sola consulta (evita
+// N+1 en el dashboard). Regresa Map<work_order_id, [{ line_no, finished,
+// last_reported_at }]>. Mismo enlace y mismas operaciones de empaque/terminado
+// que producedQuantityFor. Vacio si la deteccion no resolvio.
+async function producedByLineForMany(client, workOrderIds) {
+  const ids = (workOrderIds || []).map((x) => Number(x)).filter((x) => Number.isFinite(x));
+  if (ids.length === 0 || !RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) return new Map();
+  const { rows } = await client.query(
+    `SELECT wo.id AS work_order_id,
+            lr.line_no,
+            COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS finished,
+            MAX(se.updated_at) AS last_reported_at
+       FROM work_orders wo
+       JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+       JOIN operation_sewed_entries se ON se.run_id = lr.id
+       JOIN operator_operations oo     ON oo.id = se.operation_id
+      WHERE wo.id = ANY($1)
+      GROUP BY wo.id, lr.line_no
+      ORDER BY wo.id, lr.line_no`,
+    [ids]
+  );
+  const map = new Map();
+  for (const r of rows) {
+    const key = Number(r.work_order_id);
+    const arr = map.get(key) || [];
+    arr.push({ line_no: r.line_no, finished: Number(r.finished) || 0, last_reported_at: r.last_reported_at });
+    map.set(key, arr);
+  }
+  return map;
+}
+
+// Produccion terminada por LINEA para una orden. Usa el mismo enlace
+// line_runs->orden y las mismas operaciones de empaque/terminado que
+// producedQuantityFor, pero agrupado por line_no y con la ultima captura del
+// lider de linea, para que el Almacen PT vea "que entro de cada linea" y decida
+// cuando armar la lista de pre-empaque. Regresa [] si la deteccion no resolvio.
+//
+//   [{ line_no, finished, last_reported_at }]
+//
+// finished          = piezas terminadas reportadas por esa linea para la orden
+// last_reported_at  = ultima captura por hora de esa linea (cualquier operacion),
+//                     para que se vea actividad aunque aun no llegue a empaque.
+async function producedByLineFor(client, workOrderId) {
+  const map = await producedByLineForMany(client, [workOrderId]);
+  return map.get(Number(workOrderId)) || [];
+}
+
 registerWorkOrders.initSchema = initSchema;
 registerWorkOrders.producedQuantityFor = producedQuantityFor;
+registerWorkOrders.producedByLineFor = producedByLineFor;
+registerWorkOrders.producedByLineForMany = producedByLineForMany;
 module.exports = registerWorkOrders;
