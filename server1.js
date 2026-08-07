@@ -1109,7 +1109,27 @@ app.post(
       }
 
       await client.query("COMMIT");
-      res.json({ success: true, updatedCount });
+
+       let autoCompleted = null;
+      try {
+        const runInfo = await client.query(
+          `SELECT work_order_id, line_no, to_char(run_date, 'YYYY-MM-DD') AS day
+             FROM line_runs WHERE id = $1`,
+          [runId]
+        );
+        const r = runInfo.rows[0];
+        if (r && r.work_order_id) {
+          autoCompleted = await registerWorkOrders.autoCompleteDay(client, {
+            workOrderId: r.work_order_id,
+            lineNo: r.line_no,
+            day: r.day,
+          });
+        }
+      } catch (e) {
+        console.warn("⚠️  auto-cierre de celda falló (el guardado sí se realizó):", e.message);
+      }
+
+      res.json({ success: true, updatedCount, autoCompleted });
     } catch (err) {
       await client.query("ROLLBACK");
       next(err);
@@ -4438,6 +4458,8 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
              la.priority,
              la.status,
              la.color,
+             la.produced_quantity,
+             la.completed_at,
              la.created_at,
              la.updated_at,
              wo.work_order_no,

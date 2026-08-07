@@ -133,6 +133,14 @@ async function initSchema({ pool, setSchema }) {
               OR wo.yield_per_piece IS NULL OR wo.commitment_date IS NULL);
     `);
     console.log("\u2705 work_orders fabric/yield header columns ready in prod_db_schema");
+
+    // Auto-cierre de celda: cuando el lider de linea captura >= lo asignado ese
+    // dia, la asignacion se marca 'completed' y aqui se guarda CUANTAS piezas se
+    // cosieron ese dia (produced_quantity) y CUANDO se cerro (completed_at).
+    // Ambas nullable: las asignaciones abiertas las dejan en NULL.
+    await client.query("ALTER TABLE line_assignments ADD COLUMN IF NOT EXISTS produced_quantity NUMERIC(12,2);");
+    await client.query("ALTER TABLE line_assignments ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;");
+    console.log("\u2705 line_assignments produced_quantity/completed_at columns ready in prod_db_schema");
   } finally {
     client.release();
   }
@@ -1623,7 +1631,104 @@ async function producedByLineDayForMany(client, { workOrderIds = null, from = nu
   }));
 }
 
+// Marca como 'completed' las asignaciones de UNA celda del tablero (orden +
+// linea + dia) cuando lo COSIDO ese dia ya alcanzo o supero lo ASIGNADO, y
+// guarda cuanto se produjo (produced_quantity) y cuando se cerro (completed_at).
+//
+// Es el gemelo AUTOMATICO de settle-day: settle-day lo dispara el planeador a
+// mano y ademas reasigna el faltante cuando la linea quedo corta. Esto, en
+// cambio, lo dispara la propia captura del lider de linea, y SOLO actua en el
+// caso "meta alcanzada" (producido >= asignado): no encoge cantidades, no borra
+// filas y no reasigna nada. El faltante se sigue manejando con settle-day.
+//
+// Propiedades importantes:
+//   • Una sola direccion: nunca "descompleta" una celda. Asi no pelea con el
+//     flujo manual del planeador si despues corrige la captura hacia abajo.
+//   • Idempotente: si la celda ya esta completa no toca nada.
+//   • Multi-color: una celda puede tener varias filas (una por color) y la
+//     produccion se captura por ORDEN, no por color, asi que produced_quantity
+//     se reparte proporcional (residuo del redondeo a la fila mas grande) para
+//     que SUM(produced_quantity) de la celda == lo cosido ese dia.
+//   • Abre su PROPIA transaccion, asi que el client que reciba NO debe estar ya
+//     dentro de un BEGIN. Devuelve null si no hubo cambios.
+//
+// Regresa null (sin cambios) o
+//   { workOrderId, lineNo, day, assigned, produced, completed: [ids...] }
+async function autoCompleteDay(client, { workOrderId, lineNo, day }) {
+  await ensureProducedResolved(client);
+  if (!RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) return null;
+
+  const wo = Number(workOrderId);
+  const ln = String(lineNo == null ? "" : lineNo);
+  if (!Number.isFinite(wo) || !ln || !day) return null;
+
+  await client.query("BEGIN");
+  try {
+    // Piezas de empaque/terminado que reporto esa linea para esa orden ESE dia.
+    // Mismo enlace y mismas operaciones que producedQuantityFor / day-balances.
+    const prodRes = await client.query(
+      `SELECT COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced
+         FROM work_orders wo
+         JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+         JOIN operation_sewed_entries se ON se.run_id = lr.id
+         JOIN operator_operations oo     ON oo.id = se.operation_id
+        WHERE wo.id = $1
+          AND lr.line_no = $2
+          AND lr.run_date = $3::date`,
+      [wo, ln, day]
+    );
+    const produced = Number(prodRes.rows[0]?.produced) || 0;
+    if (produced <= 0) { await client.query("ROLLBACK"); return null; }
+
+    // Filas de la celda que aun estan abiertas. Se bloquean para no competir con
+    // settle-day ni con dos capturas simultaneas.
+    const cellRes = await client.query(
+      `SELECT id, color, assigned_quantity
+         FROM line_assignments
+        WHERE work_order_id = $1
+          AND line_no = $2
+          AND assigned_date = $3::date
+          AND status NOT IN ('completed', 'cancelled', 'rejected')
+        ORDER BY id
+        FOR UPDATE`,
+      [wo, ln, day]
+    );
+    if (cellRes.rows.length === 0) { await client.query("ROLLBACK"); return null; }
+
+    const assigned = cellRes.rows.reduce((s, r) => s + (Number(r.assigned_quantity) || 0), 0);
+    // Aun no alcanza la meta: se deja abierta (en proceso) y no se toca nada.
+    if (assigned <= 0 || produced < assigned) { await client.query("ROLLBACK"); return null; }
+
+    // Reparto proporcional de lo cosido entre las filas de color; el residuo del
+    // redondeo va a la fila mas grande para que la suma cuadre exacto.
+    const parts = cellRes.rows.map((r) => ({ id: r.id, assigned: Number(r.assigned_quantity) || 0, share: 0 }));
+    let repartido = 0;
+    parts.forEach((r) => { r.share = assigned > 0 ? Math.floor((r.assigned / assigned) * produced) : 0; repartido += r.share; });
+    const residuo = produced - repartido;
+    if (residuo > 0) parts.slice().sort((a, b) => b.assigned - a.assigned)[0].share += residuo;
+
+    for (const r of parts) {
+      await client.query(
+        `UPDATE line_assignments
+            SET status = 'completed',
+                produced_quantity = $2,
+                completed_at = now(),
+                updated_at = now()
+          WHERE id = $1`,
+        [r.id, r.share]
+      );
+    }
+
+    await client.query("COMMIT");
+    return { workOrderId: wo, lineNo: ln, day, assigned, produced, completed: parts.map((r) => r.id) };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  }
+}
+
 registerWorkOrders.initSchema = initSchema;
+registerWorkOrders.autoCompleteDay = autoCompleteDay;
 registerWorkOrders.producedQuantityFor = producedQuantityFor;
 registerWorkOrders.producedByLineFor = producedByLineFor;
 registerWorkOrders.producedByLineForMany = producedByLineForMany;
