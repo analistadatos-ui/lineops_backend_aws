@@ -1154,6 +1154,52 @@ app.get("/api/get-run-data/:runId", authenticateToken, async (req, res, next) =>
       [runId]
     );
 
+    // ---- Merchant size breakdown (talla + color + PO + cantidad) ----------
+    // One row per talla+color+PO so each printed ticket can carry its own color
+    // and PO cliente. Prefer lines matching this run's estilo; fall back to all
+    // lines on the work order. Wrapped in try/catch so an older DB without
+    // work_order_lines never breaks the run screen (sizes just come back []).
+    let sizes = [];
+    try {
+      const woId = runResult.rows[0].work_order_id;
+      if (woId) {
+        const styleName = runResult.rows[0].style;
+        let sizesResult = await client.query(
+          `SELECT talla,
+                  COALESCE(color, '')       AS color,
+                  COALESCE(customer_po, '') AS customer_po,
+                  SUM(quantity)::numeric    AS quantity
+             FROM work_order_lines
+            WHERE work_order_id = $1 AND estilo = $2
+            GROUP BY talla, color, customer_po
+            ORDER BY talla, color`,
+          [woId, styleName]
+        );
+        if (sizesResult.rows.length === 0) {
+          sizesResult = await client.query(
+            `SELECT talla,
+                    COALESCE(color, '')       AS color,
+                    COALESCE(customer_po, '') AS customer_po,
+                    SUM(quantity)::numeric    AS quantity
+               FROM work_order_lines
+              WHERE work_order_id = $1
+              GROUP BY talla, color, customer_po
+              ORDER BY talla, color`,
+            [woId]
+          );
+        }
+        sizes = sizesResult.rows.map((r) => ({
+          talla: r.talla,
+          color: r.color || "",
+          customerPo: r.customer_po || "",
+          quantity: Number(r.quantity) || 0,
+        }));
+      }
+    } catch (e) {
+      console.warn("get-run-data: size breakdown unavailable:", e.message);
+      sizes = [];
+    }
+
     const operationsData = [];
     for (const operator of operatorsResult.rows) {
       const opsResult = await client.query(
@@ -1180,6 +1226,7 @@ app.get("/api/get-run-data/:runId", authenticateToken, async (req, res, next) =>
       operators: operatorsResult.rows,
       operations: operationsData,
       slotTargets: slotTargetsResult.rows,
+      sizes,
     });
   } catch (err) {
     next(err);
