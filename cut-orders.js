@@ -93,6 +93,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                co.created_at,
                wo.work_order_no,
                wo.customer_name,
+               wo.customer_po,
                wo.style_description,
                wo.style_code,
                wo.estilo,
