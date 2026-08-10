@@ -40,6 +40,15 @@
 //    the plain work-order routes ignore them. Gated by authenticateToken only,
 //    because requireMerchantAccess is defined lower in server.js than this
 //    registration point. created_by uses req.user.id.
+// --------------------------------------------------------------------------
+// AUTOR DE LA ORDEN (work_orders.created_by)
+// --------------------------------------------------------------------------
+// Las dos rutas que crean ordenes (POST /api/work-orders y
+// POST /api/production-orders) guardan req.user.id en work_orders.created_by,
+// e initSchema crea la columna. Sin eso el dashboard de merchants no puede
+// decir QUIEN capturo cada PO. Las ordenes anteriores quedan en NULL; el
+// backfill desde merchant_week_plan vive en merchant-analytics.js.
+// GET /api/work-orders ya regresa created_by y created_by_name.
 // ==========================================================================
 
 // --- Startup migration: both breakdown tables ----------------------------
@@ -133,6 +142,15 @@ async function initSchema({ pool, setSchema }) {
               OR wo.yield_per_piece IS NULL OR wo.commitment_date IS NULL);
     `);
     console.log("\u2705 work_orders fabric/yield header columns ready in prod_db_schema");
+
+    // Autor de la orden: QUIEN (que merchant) la capturo. Nullable, porque las
+    // ordenes creadas antes de que existiera esta columna no lo saben. El
+    // dashboard de merchants (merchant-analytics.js) lee de aqui y ademas
+    // rellena las viejas desde merchant_week_plan.created_by.
+    await client.query("ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS created_by BIGINT REFERENCES users(id) ON DELETE SET NULL;");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_created_by ON work_orders(created_by);");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_created_at ON work_orders(created_at);");
+    console.log("\u2705 work_orders.created_by ready in prod_db_schema");
 
     // Auto-cierre de celda: cuando el lider de linea captura >= lo asignado ese
     // dia, la asignacion se marca 'completed' y aqui se guarda CUANTAS piezas se
@@ -403,6 +421,9 @@ function registerWorkOrders(app, deps) {
           wo.master_code_id, wo.sam_minutes, wo.customer_po,
           wo.fabric_name, wo.fabric_code, wo.yield_per_piece,
           wo.created_at, wo.updated_at,wo.season,wo.status,
+          wo.created_by,
+          (SELECT COALESCE(NULLIF(TRIM(u.full_name), ''), u.username)
+             FROM users u WHERE u.id = wo.created_by) AS created_by_name,
           ${COLORS_SUBQUERY},
           ${LINES_SUBQUERY},
           MAX(mc.photo_filename) as master_code_photo_filename,
@@ -892,9 +913,9 @@ function registerWorkOrders(app, deps) {
           work_order_no, quantity, customer_id, customer_name, style_description,
           color, fabric_supplier, style_code, estilo, fabrics, line_no, run_date,
           warehouse_stock, extra_quantity, total_to_produce, commitment_date,
-          master_code_id, sam_minutes, created_at, updated_at, status
+          master_code_id, sam_minutes, created_by, created_at, updated_at, status
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW(),'pending')
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW(),NOW(),'pending')
         RETURNING *
         `,
         [
@@ -903,6 +924,7 @@ function registerWorkOrders(app, deps) {
           styleCode || null, estilo || null, Array.isArray(fabrics) ? fabrics : [], lineNo || null,
           runDate || null, wStock, xtra, resolvedTotalToProduce, commitmentDate || null,
           masterCodeId ? parseInt(masterCodeId) : null, resolvedSamMinutes,
+          req.user?.id ?? null,                       // created_by: el merchant que la capturo
         ]
       );
 
@@ -1215,9 +1237,9 @@ function registerWorkOrders(app, deps) {
               color, fabric_supplier, style_code, estilo, fabrics, warehouse_stock,
               extra_quantity, total_to_produce, commitment_date, master_code_id,
               sam_minutes, season, customer_po, fabric_name, fabric_code,
-              yield_per_piece, created_at, updated_at, status
+              yield_per_piece, created_by, created_at, updated_at, status
            )
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,NOW(),NOW(),'pending')
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW(),NOW(),'pending')
            RETURNING *`,
           [
             woNo, orderedQty, parseInt(customerId), customerName, description,
@@ -1226,6 +1248,7 @@ function registerWorkOrders(app, deps) {
             wStock, xtra, totalToProduce,
             headerDate, primaryMasterCodeId, samNum, season || null, cPo || null,
             hFabricName, hFabricCode, hYield,
+            req.user?.id ?? null,                     // created_by: el merchant que la capturo
           ]
         );
         const workOrder = woResult.rows[0];
