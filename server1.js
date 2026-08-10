@@ -5222,6 +5222,119 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
 });
 
 /**
+ * Paste into server1.js next to the other /api/skyrina routes.
+ *
+ * GET /api/skyrina/daily-production?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ *
+ * Returns one row per calendar day in the range (days with no runs come back as
+ * zeros, so the chart keeps its gaps instead of silently closing them).
+ *
+ * Produced = packing/empaque sewed quantities, matching /api/skyrina/period-summary.
+ * Meta     = sum of target_pcs across that day's runs.
+ *
+ * Overview.jsx works without this — it falls back to one period-summary call per
+ * day. This route turns 30 round trips into 1.
+ */
+app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { startDate, endDate, style, lineNo } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        error: "startDate and endDate parameters required",
+      });
+    }
+
+    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    let runFilters = "";
+
+    if (style && style !== 'all') {
+      runFilters += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+    if (lineNo && lineNo !== 'all') {
+      runFilters += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+
+    const query = `
+      WITH calendar AS (
+        SELECT generate_series($1::date, $2::date, '1 day')::date AS day
+      ),
+      filtered_runs AS (
+        SELECT
+          lr.id         AS run_id,
+          lr.run_date   AS run_date,
+          lr.target_pcs AS target_pcs
+        FROM line_runs lr
+        WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
+      ),
+      daily_target AS (
+        SELECT run_date, COALESCE(SUM(target_pcs), 0) AS target
+        FROM filtered_runs
+        GROUP BY run_date
+      ),
+      run_packing_totals AS (
+        SELECT
+          fr.run_id,
+          fr.run_date,
+          COALESCE(SUM(se.sewed_qty), 0) AS packing_total
+        FROM filtered_runs fr
+        JOIN run_operators ro          ON fr.run_id = ro.run_id
+        JOIN operator_operations oo    ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+        GROUP BY fr.run_id, fr.run_date
+      ),
+      daily_produced AS (
+        SELECT run_date, COALESCE(SUM(packing_total), 0) AS produced
+        FROM run_packing_totals
+        GROUP BY run_date
+      )
+      SELECT
+        c.day                              AS date,
+        COALESCE(dp.produced, 0)           AS produced,
+        COALESCE(dt.target, 0)             AS target
+      FROM calendar c
+      LEFT JOIN daily_produced dp ON dp.run_date = c.day
+      LEFT JOIN daily_target   dt ON dt.run_date = c.day
+      ORDER BY c.day ASC
+    `;
+
+    const result = await client.query(query, params);
+
+    const days = result.rows.map((row) => ({
+      // send a plain YYYY-MM-DD string so the client never re-parses in UTC
+      date: row.date instanceof Date
+        ? `${row.date.getFullYear()}-${String(row.date.getMonth() + 1).padStart(2, '0')}-${String(row.date.getDate()).padStart(2, '0')}`
+        : String(row.date).slice(0, 10),
+      produced: parseFloat(row.produced) || 0,
+      target: parseFloat(row.target) || 0,
+    }));
+
+    res.json({
+      success: true,
+      period: { startDate, endDate },
+      days,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching daily production:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+/**
  * GET /api/skyrina/product-breakdown?date=YYYY-MM-DD
  * Returns product (style) breakdown with sewed quantities for a specific date
  */
