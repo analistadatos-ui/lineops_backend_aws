@@ -40,6 +40,11 @@ const logger = winston.createLogger({
 const app = express();
 
 app.use(helmet());
+app.set("etag", false);
+app.use("/api/", (req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+});
 app.use(compression());
 app.use(express.json({ limit: "12mb" }));
 
