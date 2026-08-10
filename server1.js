@@ -1379,6 +1379,12 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     dt.setUTCDate(dt.getUTCDate() + n);
     return dt.toISOString().slice(0, 10);
   };
+  // True for Saturday/Sunday (no timezone drift). No production on weekends.
+  const isWeekend = (ymdStr) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sun, 6 = Sat
+    return dow === 0 || dow === 6;
+  };
   try {
     await setSchema(client);
     const id = parseInt(req.params.id);
@@ -1420,9 +1426,9 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
 
     // Walk the target line day by day from assignedDate, filling each day's
     // remaining capacity and carrying the remainder forward — the same packing
-    // rule as a pool placement. Days with no run configured, or already full,
-    // are skipped. All-or-nothing: if the whole quantity can't fit within the
-    // horizon, roll back and report the shortfall.
+    // rule as a pool placement. Weekends, days with no run configured, or days
+    // already full are skipped. All-or-nothing: if the whole quantity can't fit
+    // within the horizon, roll back and report the shortfall.
     const MAX_DAYS = 180;
     let remaining = totalQty;
     let dayStr = assignedDate;
@@ -1431,6 +1437,7 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
 
     while (remaining > 0 && scanned < MAX_DAYS) {
       scanned++;
+      if (isWeekend(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend work
       const { lines } = await getLineCapacityForDate(client, dayStr);
       const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
       if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no capacity configured -> skip
@@ -1487,6 +1494,148 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("❌ Error moving line assignment:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// POST /api/line-assignments/move-batch
+//
+// Pile several existing assignments into ONE target line, starting at
+// `assignedDate`, and re-pack them forward day by day. All selected blocks may
+// come from different lines, days, orders or colors; each keeps its own row.
+// The packing rule is identical to the single move: fill each day's remaining
+// capacity, spill the rest to the next day. Rows inserted earlier in this same
+// transaction count as "used", so consecutive blocks stack naturally onto the
+// following days. All-or-nothing: if the whole selection can't fit within the
+// horizon, roll back and leave every block exactly where it was.
+// ---------------------------------------------------------------------------
+app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  const addDaysStr = (ymdStr, n) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + n);
+    return dt.toISOString().slice(0, 10);
+  };
+  try {
+    await setSchema(client);
+    const { ids, lineNo, assignedDate } = req.body;
+    const idList = Array.isArray(ids)
+      ? [...new Set(ids.map((n) => parseInt(n)).filter((n) => Number.isInteger(n)))]
+      : [];
+
+    if (idList.length === 0 || !lineNo || !assignedDate) {
+      return res.status(400).json({
+        success: false,
+        error: "ids (no vacío), lineNo y assignedDate son obligatorios",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // Load the selected assignments. Order them by their current position so the
+    // re-pack is deterministic (earliest day first, then id).
+    const cur = await client.query(
+      `SELECT id, work_order_id, assigned_quantity, color, status
+         FROM line_assignments
+        WHERE id = ANY($1::int[])
+        ORDER BY assigned_date ASC, id ASC`,
+      [idList]
+    );
+    if (cur.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "No se encontraron las asignaciones" });
+    }
+
+    // Free every selected block first so their old slots can be reused.
+    await client.query("DELETE FROM line_assignments WHERE id = ANY($1::int[])", [idList]);
+
+    const MAX_DAYS = 180;
+    const createdRows = [];
+
+    for (const original of cur.rows) {
+      const totalQty = parseFloat(original.assigned_quantity) || 0;
+      if (totalQty <= 0) continue;
+      const workOrderId = original.work_order_id;
+      const color = original.color || null;
+      const status = ["planned", "released", "completed", "cancelled"].includes(original.status)
+        ? original.status
+        : "planned";
+
+      // Prefer the work order's own SAM for the informational rate columns.
+      const woRes = await client.query(
+        "SELECT sam_minutes FROM work_orders WHERE id = $1",
+        [workOrderId]
+      );
+      const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
+
+      let remaining = totalQty;
+      let dayStr = assignedDate;
+      let scanned = 0;
+
+      while (remaining > 0 && scanned < MAX_DAYS) {
+        scanned++;
+        const { lines } = await getLineCapacityForDate(client, dayStr);
+        const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
+        if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no run -> skip
+
+        const usedRes = await client.query(
+          `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
+             FROM line_assignments
+            WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
+          [String(lineNo), dayStr]
+        );
+        const used = parseFloat(usedRes.rows[0].used) || 0;
+        const capacity = parseFloat(lineData.target_pcs) || 0;
+        const available = Math.max(0, capacity - used);
+        if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
+
+        const chunk = Math.min(remaining, available);
+
+        const operators = parseInt(lineData.operators_count) || 20;
+        const workingHours = parseFloat(lineData.working_hours) || 8;
+        const efficiency = parseFloat(lineData.efficiency) || 0.85;
+        const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
+        const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
+        const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
+
+        const ins = await client.query(
+          `INSERT INTO line_assignments
+             (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+              available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $4, $4, $9, $8)
+           RETURNING *`,
+          [workOrderId, lineData.id || null, String(lineNo), dayStr, chunk,
+           effectiveDailyMinutes, piecesPerDay, color, status]
+        );
+        createdRows.push(ins.rows[0]);
+        remaining -= chunk;
+        dayStr = addDaysStr(dayStr, 1);
+      }
+
+      if (remaining > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          error: `La línea ${lineNo} no tiene capacidad suficiente para reacomodar todas las casillas seleccionadas desde el ${assignedDate}.`,
+        });
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      assignments: createdRows,
+      cells: createdRows.length,
+      moved: idList.length,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ Error moving batch of line assignments:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
