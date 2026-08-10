@@ -2171,6 +2171,8 @@ app.post(
     param("runId").isInt({ gt: 0 }).withMessage("Valid run ID required"),
     body("newDate").isDate().withMessage("Valid newDate (YYYY-MM-DD) required"),
     body("newLineNo").optional().isString().withMessage("newLineNo must be a string if provided"),
+    body("workOrderId").optional({ nullable: true }).isInt({ min: 1 }).withMessage("workOrderId must be a positive integer"),   // ← ADD THIS
+
   ]),
   async (req, res, next) => {
     const client = await pool.connect();
@@ -2181,6 +2183,7 @@ app.post(
       const { runId } = req.params;
       const { newDate } = req.body;            // required: YYYY-MM-DD
       const newLineNo = req.body.newLineNo;    // optional – if omitted, same line_no is used
+      const workOrderId = req.body.workOrderId; // ← ADD THIS
 
       // 1. Get source run
       const sourceRunRes = await client.query(
@@ -2196,23 +2199,24 @@ app.post(
 
       // 2. Insert new line_run
       const newRunRes = await client.query(
-        `INSERT INTO line_runs
-           (line_no, run_date, style, operators_count, working_hours,
-            sam_minutes, efficiency, target_pcs, target_per_hour, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-         RETURNING id`,
-        [
-          newLineNo || src.line_no,
-          newDate,
-          src.style,
-          src.operators_count,
-          src.working_hours,
-          src.sam_minutes,
-          src.efficiency,
-          src.target_pcs,
-          src.target_per_hour,
-        ]
-      );
+  `INSERT INTO line_runs
+     (line_no, run_date, style, operators_count, working_hours,
+      sam_minutes, efficiency, target_pcs, target_per_hour, work_order_id, created_at, updated_at)
+   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+   RETURNING id`,
+  [
+    newLineNo || src.line_no,
+    newDate,
+    src.style,
+    src.operators_count,
+    src.working_hours,
+    src.sam_minutes,
+    src.efficiency,
+    src.target_pcs,
+    src.target_per_hour,
+    workOrderId || null,   // ← ADD THIS (matches new $10)
+  ]
+);
       const newRunId = newRunRes.rows[0].id;
 
       // 3. Copy shift_slots – store mapping old slot_id -> new slot_id
