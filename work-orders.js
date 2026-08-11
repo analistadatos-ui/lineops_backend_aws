@@ -100,10 +100,13 @@ async function initSchema({ pool, setSchema }) {
     // fabric_name/fabric_code/yield_per_piece above are kept as a representative
     // (first-tela) copy for the header and list views.
     await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS fabrics JSONB NOT NULL DEFAULT '[]'::jsonb;");
-    // Empaque en caja (piezas por caja) por talla, capturado en el paso 2:
-    // una cifra para el empaque Pack (surtido) y otra para SKU (talla sólida).
-    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS pack_per_box INT;");
-    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS sku_per_box INT;");
+    // La cantidad de cada talla se captura en dos partes (piezas): packing
+    // (surtido) y SKU (talla sólida). quantity = packing_qty + sku_qty.
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS packing_qty NUMERIC(12,2) NOT NULL DEFAULT 0;");
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS sku_qty NUMERIC(12,2) NOT NULL DEFAULT 0;");
+    // Reemplaza el esquema anterior de piezas-por-caja (nunca llegó a producción).
+    await client.query("ALTER TABLE work_order_lines DROP COLUMN IF EXISTS pack_per_box;");
+    await client.query("ALTER TABLE work_order_lines DROP COLUMN IF EXISTS sku_per_box;");
     await client.query("CREATE INDEX IF NOT EXISTS idx_work_order_lines_wo ON work_order_lines(work_order_id);");
     // Uniqueness must include estilo: the same color+talla can appear under two
     // different estilos within one PO. Drop the older (wo,talla,color) index and
@@ -194,8 +197,8 @@ const LINES_SUBQUERY = `
              'fabricCode', l.fabric_code,
              'fabrics', COALESCE(l.fabrics, '[]'::jsonb),
              'yield', l.yield_per_piece,
-             'packPerBox', l.pack_per_box,
-             'skuPerBox', l.sku_per_box,
+             'packingQty', l.packing_qty,
+             'skuQty', l.sku_qty,
              'quantity', l.quantity
            ) ORDER BY l.color, l.talla)
     FROM work_order_lines l WHERE l.work_order_id = wo.id
@@ -1044,10 +1047,17 @@ function registerWorkOrders(app, deps) {
               fabricName: primary.name || fb.fabricName || null,
               fabricCode: primary.code || fb.fabricCode || null,
               yieldPerPiece: primary.yield ?? fb.yieldPerPiece ?? null,
-              // Empaque en caja por talla (piezas por caja) para Pack y SKU.
-              packPerBox: Number.isFinite(parseInt(l.packPerBox, 10)) ? parseInt(l.packPerBox, 10) : null,
-              skuPerBox: Number.isFinite(parseInt(l.skuPerBox, 10)) ? parseInt(l.skuPerBox, 10) : null,
-              quantity: parseFloat(l.quantity),
+              // Cantidad por talla en dos partes (piezas): packing + SKU.
+              // El servidor recalcula quantity = packing + sku (autoritativo);
+              // si no vienen, cae al quantity enviado por compatibilidad.
+              packingQty: Math.max(parseFloat(l.packingQty) || 0, 0),
+              skuQty: Math.max(parseFloat(l.skuQty) || 0, 0),
+              quantity: (() => {
+                const p = Math.max(parseFloat(l.packingQty) || 0, 0);
+                const s = Math.max(parseFloat(l.skuQty) || 0, 0);
+                const sum = p + s;
+                return sum > 0 ? sum : parseFloat(l.quantity);
+              })(),
             };
           })
           .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0);
@@ -1132,9 +1142,9 @@ function registerWorkOrders(app, deps) {
             dup.fabricName = primary.name || dup.fabricName;
             dup.fabricCode = primary.code || dup.fabricCode;
             dup.yieldPerPiece = primary.yield ?? dup.yieldPerPiece;
-            // Box-pack ratios describe the size, not the qty: keep first non-null.
-            if (dup.packPerBox == null) dup.packPerBox = cell.packPerBox ?? null;
-            if (dup.skuPerBox == null) dup.skuPerBox = cell.skuPerBox ?? null;
+            // packing y sku son piezas: se suman igual que la cantidad.
+            dup.packingQty = (dup.packingQty || 0) + (cell.packingQty || 0);
+            dup.skuQty = (dup.skuQty || 0) + (cell.skuQty || 0);
           } else {
             bucket.cells.push({ ...cell });
           }
@@ -1271,13 +1281,13 @@ function registerWorkOrders(app, deps) {
             `INSERT INTO work_order_lines
                (work_order_id, master_code_id, talla, color, estilo, customer_po,
                 commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics,
-                pack_per_box, sku_per_box)
+                packing_qty, sku_qty)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
             [workOrder.id, codeToId[code], cell.talla, cell.color, cell.estilo,
              cell.customerPo || null, cell.commitmentDate || null, cell.fabricName || null,
              cell.fabricCode || null, cell.yieldPerPiece, cell.quantity,
              JSON.stringify(cell.fabrics || []),
-             cell.packPerBox ?? null, cell.skuPerBox ?? null]
+             cell.packingQty ?? 0, cell.skuQty ?? 0]
           );
         }
 
@@ -1389,9 +1399,14 @@ function registerWorkOrders(app, deps) {
               fabricName: primary.name || null,
               fabricCode: primary.code || null,
               yieldPerPiece: primary.yield ?? null,
-              packPerBox: Number.isFinite(parseInt(l.packPerBox, 10)) ? parseInt(l.packPerBox, 10) : null,
-              skuPerBox: Number.isFinite(parseInt(l.skuPerBox, 10)) ? parseInt(l.skuPerBox, 10) : null,
-              quantity: parseFloat(l.quantity),
+              packingQty: Math.max(parseFloat(l.packingQty) || 0, 0),
+              skuQty: Math.max(parseFloat(l.skuQty) || 0, 0),
+              quantity: (() => {
+                const p = Math.max(parseFloat(l.packingQty) || 0, 0);
+                const s = Math.max(parseFloat(l.skuQty) || 0, 0);
+                const sum = p + s;
+                return sum > 0 ? sum : parseFloat(l.quantity);
+              })(),
             };
           })
           .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0);
@@ -1468,13 +1483,13 @@ function registerWorkOrders(app, deps) {
             `INSERT INTO work_order_lines
                (work_order_id, master_code_id, talla, color, estilo, customer_po,
                 commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics,
-                pack_per_box, sku_per_box)
+                packing_qty, sku_qty)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
             [id, codeToId[code], cell.talla, cell.color, cell.estilo,
              cell.customerPo, cell.commitmentDate, cell.fabricName,
              cell.fabricCode, cell.yieldPerPiece, cell.quantity,
              JSON.stringify(cell.fabrics || []),
-             cell.packPerBox ?? null, cell.skuPerBox ?? null]
+             cell.packingQty ?? 0, cell.skuQty ?? 0]
           );
         }
 
