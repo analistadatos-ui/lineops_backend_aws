@@ -97,11 +97,15 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                wo.style_description,
                wo.style_code,
                wo.estilo,
+               mc.code AS master_code,
+               -- "tipo modelo correlativo": e.g. DAM+CHA+01 -> DAMCHA01
+               NULLIF(CONCAT(mc.type, mc.modelo, mc.correlativo), '') AS modelo_code,
                COALESCE(co.color, wo.color) AS color,
                COALESCE(co.style_no, wo.style_code) AS style_no,
                COALESCE(co.season, wo.season) AS season
           FROM cut_orders co
           JOIN work_orders wo ON wo.id = co.work_order_id
+          LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
          ORDER BY co.created_at DESC
       `);
       res.json({ success: true, cutOrders: result.rows });
@@ -278,4 +282,3 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
 
 registerCutOrders.initSchema = initSchema;
 module.exports = registerCutOrders;
-
