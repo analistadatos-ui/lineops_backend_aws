@@ -53,6 +53,11 @@ async function initSchema({ pool, setSchema }) {
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS markers JSONB;`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS style_no VARCHAR(50);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS season VARCHAR(50);`);
+    // Todas las telas del corte: [{ name, code, yield, totalLength }]. Una CORTE
+    // puede llevar VARIAS telas que se cortan en la MISMA cantidad de piezas.
+    // fabric/fabric_code/yield_per_piece/total_length quedan como representativos
+    // (primera tela) para las vistas antiguas.
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS fabrics JSONB NOT NULL DEFAULT '[]'::jsonb;`);
     console.log("✅ cut_orders table ready in prod_db_schema");
   } finally {
     client.release();
@@ -78,6 +83,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                co.work_order_id,
                co.fabric,
                co.fabric_code,
+               co.fabrics,
                to_char(co.cut_date, 'YYYY-MM-DD') AS cut_date,
                co.quantity,
                co.yield_per_piece,
@@ -102,7 +108,22 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                NULLIF(CONCAT(mc.type, mc.modelo, mc.correlativo), '') AS modelo_code,
                COALESCE(co.color, wo.color) AS color,
                COALESCE(co.style_no, wo.style_code) AS style_no,
-               COALESCE(co.season, wo.season) AS season
+               COALESCE(co.season, wo.season) AS season,
+               -- Distinct telas (name+code+yield) across the work order's lines.
+               -- The scalar co.fabric_code is just ONE of these; the cutter picks
+               -- the código they are actually cutting inside CuttingEntry.
+               COALESCE((
+                 SELECT jsonb_agg(fab ORDER BY (fab->>'name'), (fab->>'code'))
+                   FROM (
+                     SELECT DISTINCT ON (upper(f->>'name'), upper(COALESCE(f->>'code','')))
+                            f AS fab
+                       FROM work_order_lines wl
+                       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(wl.fabrics, '[]'::jsonb)) AS f
+                      WHERE wl.work_order_id = wo.id
+                        AND COALESCE(f->>'name','') <> ''
+                      ORDER BY upper(f->>'name'), upper(COALESCE(f->>'code','')), (f->>'yield')
+                   ) d
+               ), '[]'::jsonb) AS wo_fabrics
           FROM cut_orders co
           JOIN work_orders wo ON wo.id = co.work_order_id
           LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
@@ -122,7 +143,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { workOrderId, fabric, fabricCode, cutDate, quantity, notes, yieldPerPiece, color, sizes, styleNo, season } = req.body;
+      const { workOrderId, fabric, fabricCode, cutDate, quantity, notes, yieldPerPiece, color, sizes, styleNo, season, fabrics } = req.body;
 
       if (!workOrderId || !cutDate || !quantity || parseFloat(quantity) <= 0) {
         return res.status(400).json({
@@ -131,13 +152,35 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
         });
       }
 
+      const qty = parseFloat(quantity);
+
       const y = yieldPerPiece === undefined || yieldPerPiece === null || yieldPerPiece === ""
         ? null
         : parseFloat(yieldPerPiece);
       if (y !== null && (isNaN(y) || y <= 0)) {
         return res.status(400).json({ success: false, error: "El rendimiento debe ser mayor a 0" });
       }
-      const totalLength = y !== null ? y * parseFloat(quantity) : null;
+
+      // Todas las telas del corte. Cada una lleva su propio rendimiento y su
+      // largo total (rendimiento × piezas); las piezas son las mismas para todas.
+      const toNum = (v) => (v === undefined || v === null || v === "" ? null : (isNaN(parseFloat(v)) ? null : parseFloat(v)));
+      const fabricsArr = (Array.isArray(fabrics) ? fabrics : [])
+        .map((f) => {
+          const name = (f?.name ?? "").toString().trim();
+          const code = (f?.code ?? "").toString().trim();
+          const fy = toNum(f?.yield);
+          return { name, code, yield: fy, totalLength: fy != null ? fy * qty : null };
+        })
+        .filter((f) => f.name || f.code);
+
+      // Representativos (primera tela) para las columnas escalares / vistas antiguas.
+      const repName = (fabric || fabricsArr[0]?.name || null) || null;
+      const repCode = (fabricCode || fabricsArr[0]?.code || null) || null;
+      const repYield = y != null ? y : (fabricsArr[0]?.yield ?? null);
+      // Largo total del encabezado: suma de las telas si traen rendimiento; si no,
+      // el cálculo simple con el rendimiento compartido.
+      const sumLen = fabricsArr.reduce((s, f) => s + (f.totalLength || 0), 0);
+      const totalLength = sumLen > 0 ? sumLen : (repYield != null ? repYield * qty : null);
 
       const wo = await client.query("SELECT id, style_code, season FROM work_orders WHERE id = $1", [parseInt(workOrderId)]);
       if (wo.rows.length === 0) {
@@ -147,11 +190,12 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       const seasonFinal = season || wo.rows[0].season || null;
 
       const result = await client.query(
-        `INSERT INTO cut_orders (work_order_id, fabric, fabric_code, cut_date, quantity, notes, yield_per_piece, total_length, color, sizes, style_no, season)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12)
+        `INSERT INTO cut_orders (work_order_id, fabric, fabric_code, cut_date, quantity, notes, yield_per_piece, total_length, color, sizes, style_no, season, fabrics)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13::jsonb)
          RETURNING *`,
-        [parseInt(workOrderId), fabric || null, fabricCode || null, cutDate, parseFloat(quantity), notes || null, y, totalLength, color || null,
-         Array.isArray(sizes) && sizes.length ? JSON.stringify(sizes) : null, styleNoFinal, seasonFinal]
+        [parseInt(workOrderId), repName, repCode, cutDate, qty, notes || null, repYield, totalLength, color || null,
+         Array.isArray(sizes) && sizes.length ? JSON.stringify(sizes) : null, styleNoFinal, seasonFinal,
+         JSON.stringify(fabricsArr)]
       );
       res.json({ success: true, cutOrder: result.rows[0] });
     } catch (err) {
