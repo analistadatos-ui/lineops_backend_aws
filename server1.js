@@ -754,6 +754,9 @@ app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
+const registerCutOrderAnalytics = require("./cut-order-analytics");
+registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema });
+
 const registerMerchantAnalytics = require("./merchant-analytics");
 registerMerchantAnalytics(app, { authenticateToken, pool, setSchema });
 
