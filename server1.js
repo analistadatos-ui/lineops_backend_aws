@@ -505,6 +505,37 @@ await client.query("CREATE INDEX IF NOT EXISTS idx_master_codes_talla ON master_
 await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS master_code_id BIGINT REFERENCES master_codes(id) ON DELETE SET NULL;`);
 console.log("✅ work_orders.master_code_id linked to master_codes");
 
+
+// ---- Printed production tickets --------------------------------------------
+// Every confirmed print batch from the line-leader ticket builder is logged
+// here (one row per talla+color+PO per confirm). The sum of `quantity` for a
+// (work_order_id, estilo, talla, color, customer_po) is subtracted from the
+// merchant size breakdown in /api/get-run-data, so the "Asignado" quantity the
+// builder shows keeps decreasing as tickets are printed. Scoped to the work
+// order (not the run) on purpose: a new run/day for the same WO still sees the
+// already-printed amounts removed.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS ticket_prints(
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES line_runs(id) ON DELETE CASCADE,
+    work_order_id BIGINT REFERENCES work_orders(id) ON DELETE SET NULL,
+    estilo VARCHAR(20),
+    talla VARCHAR(20) NOT NULL,
+    color VARCHAR(40) NOT NULL DEFAULT '',
+    customer_po VARCHAR(80) NOT NULL DEFAULT '',
+    quantity NUMERIC(12,2) NOT NULL,
+    ticket_count INT NOT NULL DEFAULT 0,
+    printed_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_ticket_print_qty_positive CHECK (quantity > 0)
+  );
+`);
+await client.query("CREATE INDEX IF NOT EXISTS idx_ticket_prints_run ON ticket_prints(run_id);");
+await client.query("CREATE INDEX IF NOT EXISTS idx_ticket_prints_wo ON ticket_prints(work_order_id, estilo, talla, color, customer_po);");
+console.log("✅ ticket_prints table ready in prod_db_schema");
+
+
+
 await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_status ON work_orders(status);");
 await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_wo_no ON work_orders(work_order_no);");
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_line ON line_assignments(line_no, assigned_date);");
@@ -1151,6 +1182,192 @@ app.post(
   }
 );
 
+
+// ✅ Confirm & save a batch of printed tickets.
+// Called from the line-leader ticket builder when the leader presses
+// "Confirmar y guardar" on the generated tickets. Persists what was printed so
+// the merchant size breakdown returned by /api/get-run-data is reduced by the
+// printed amount on subsequent loads (see the ticket_prints subtraction below).
+//
+// Body: { tickets: [{ talla, color?, customerPo?, qty, count? }, ...] }
+//   - qty:   pieces on that ticket/line
+//   - count: how many physical tickets it represents (optional, for the log)
+// Multiple entries for the same talla+color+PO are aggregated into one row.
+app.post("/api/lineleader/confirm-tickets/:runId", authenticateToken, async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { runId } = req.params;
+    const { tickets } = req.body;
+
+    if (!Array.isArray(tickets) || tickets.length === 0) {
+      return res.status(400).json({ success: false, error: "Missing tickets array" });
+    }
+
+    // Resolve the run so we can scope the print log to the work order + estilo.
+    const runResult = await client.query(
+      `SELECT id, work_order_id, style FROM line_runs WHERE id = $1`,
+      [runId]
+    );
+    if (runResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Run not found" });
+    }
+    const { work_order_id: workOrderId, style: estilo } = runResult.rows[0];
+
+    // Aggregate incoming tickets by talla+color+PO.
+    const norm = (v) => String(v == null ? "" : v).trim();
+    const agg = new Map(); // key -> { talla, color, customerPo, quantity, count }
+    for (const t of tickets) {
+      const talla = norm(t.talla);
+      if (!talla) continue;
+      const color = norm(t.color);
+      const customerPo = norm(t.customerPo ?? t.customer_po);
+      const qty = Math.max(0, Math.floor(Number(t.qty) || 0));
+      if (qty <= 0) continue;
+      const count = Math.max(0, Math.floor(Number(t.count) || 1));
+      const key = `${talla}||${color}||${customerPo}`;
+      const cur = agg.get(key) || { talla, color, customerPo, quantity: 0, count: 0 };
+      cur.quantity += qty;
+      cur.count += count;
+      agg.set(key, cur);
+    }
+
+    const rows = [...agg.values()];
+    if (rows.length === 0) {
+      return res.status(400).json({ success: false, error: "No valid ticket quantities to save" });
+    }
+
+    // Defensive guard: never let confirmed prints exceed the merchant quantity
+    // assigned to a size. We compare (already printed + this batch) against the
+    // work-order size breakdown, using the same COALESCE grouping as
+    // get-run-data so the keys line up.
+    if (workOrderId) {
+      const overflow = [];
+      for (const r of rows) {
+        let assignedRes = await client.query(
+          `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+             FROM work_order_lines
+            WHERE work_order_id = $1 AND estilo = $2
+              AND talla = $3 AND COALESCE(color,'') = $4 AND COALESCE(customer_po,'') = $5`,
+          [workOrderId, estilo, r.talla, r.color, r.customerPo]
+        );
+        let assigned = Number(assignedRes.rows[0]?.qty || 0);
+        if (assigned === 0) {
+          assignedRes = await client.query(
+            `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+               FROM work_order_lines
+              WHERE work_order_id = $1
+                AND talla = $2 AND COALESCE(color,'') = $3 AND COALESCE(customer_po,'') = $4`,
+            [workOrderId, r.talla, r.color, r.customerPo]
+          );
+          assigned = Number(assignedRes.rows[0]?.qty || 0);
+        }
+
+        const printedRes = await client.query(
+          `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+             FROM ticket_prints
+            WHERE work_order_id = $1 AND (estilo = $2 OR estilo IS NULL)
+              AND talla = $3 AND color = $4 AND customer_po = $5`,
+          [workOrderId, estilo, r.talla, r.color, r.customerPo]
+        );
+        const alreadyPrinted = Number(printedRes.rows[0]?.qty || 0);
+
+        // Only enforce when we actually have a merchant assignment to compare
+        // against; sizes without a breakdown (assigned = 0) are left unguarded.
+        if (assigned > 0 && alreadyPrinted + r.quantity > assigned) {
+          overflow.push({
+            talla: r.talla,
+            color: r.color,
+            customerPo: r.customerPo,
+            assigned,
+            alreadyPrinted,
+            requested: r.quantity,
+            remaining: Math.max(0, assigned - alreadyPrinted),
+          });
+        }
+      }
+      if (overflow.length > 0) {
+        return res.status(409).json({
+          success: false,
+          error: "La cantidad a imprimir excede lo asignado para una o más tallas.",
+          overflow,
+        });
+      }
+    }
+
+    // Persist one log row per aggregated size.
+    await client.query("BEGIN");
+    let savedQty = 0;
+    let savedTickets = 0;
+    for (const r of rows) {
+      await client.query(
+        `INSERT INTO ticket_prints
+           (run_id, work_order_id, estilo, talla, color, customer_po, quantity, ticket_count, printed_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [runId, workOrderId, estilo, r.talla, r.color, r.customerPo, r.quantity, r.count, req.user?.id || null]
+      );
+      savedQty += r.quantity;
+      savedTickets += r.count;
+    }
+    await client.query("COMMIT");
+
+    // Return the new remaining per size so the client can update immediately.
+    const remaining = [];
+    if (workOrderId) {
+      for (const r of rows) {
+        let assignedRes = await client.query(
+          `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+             FROM work_order_lines
+            WHERE work_order_id = $1 AND estilo = $2
+              AND talla = $3 AND COALESCE(color,'') = $4 AND COALESCE(customer_po,'') = $5`,
+          [workOrderId, estilo, r.talla, r.color, r.customerPo]
+        );
+        let assigned = Number(assignedRes.rows[0]?.qty || 0);
+        if (assigned === 0) {
+          assignedRes = await client.query(
+            `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+               FROM work_order_lines
+              WHERE work_order_id = $1
+                AND talla = $2 AND COALESCE(color,'') = $3 AND COALESCE(customer_po,'') = $4`,
+            [workOrderId, r.talla, r.color, r.customerPo]
+          );
+          assigned = Number(assignedRes.rows[0]?.qty || 0);
+        }
+        const printedRes = await client.query(
+          `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+             FROM ticket_prints
+            WHERE work_order_id = $1 AND (estilo = $2 OR estilo IS NULL)
+              AND talla = $3 AND color = $4 AND customer_po = $5`,
+          [workOrderId, estilo, r.talla, r.color, r.customerPo]
+        );
+        const printed = Number(printedRes.rows[0]?.qty || 0);
+        remaining.push({
+          talla: r.talla,
+          color: r.color,
+          customerPo: r.customerPo,
+          printed,
+          remaining: Math.max(0, assigned - printed),
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      savedQty,
+      savedTickets,
+      savedRows: rows.length,
+      remaining,
+    });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("❌ confirm-tickets error:", err.message);
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
 // ----------------------------------------------------------------------
 // 13. DATA RETRIEVAL ENDPOINTS
 // ----------------------------------------------------------------------
@@ -1230,6 +1447,50 @@ app.get("/api/get-run-data/:runId", authenticateToken, async (req, res, next) =>
     } catch (e) {
       console.warn("get-run-data: size breakdown unavailable:", e.message);
       sizes = [];
+    }
+
+    // ---- Subtract already-printed tickets from the size breakdown ----------
+    // The line-leader ticket builder seeds each size's editable quantity from
+    // `quantity` above, so returning the *remaining* (assigned − printed) makes
+    // the "Asignado" figure shrink as tickets get confirmed. Scoped to the work
+    // order + estilo so a new run/day for the same WO still reflects prior
+    // prints. Wrapped in try/catch so a missing ticket_prints table never breaks
+    // the run screen. `assignedQuantity`/`printedQuantity` are added for the UI.
+    try {
+      if (sizes.length) {
+        const woId = runResult.rows[0].work_order_id;
+        const styleName = runResult.rows[0].style;
+        if (woId) {
+          const printedResult = await client.query(
+            `SELECT talla,
+                    COALESCE(color, '')       AS color,
+                    COALESCE(customer_po, '') AS customer_po,
+                    SUM(quantity)::numeric    AS printed
+               FROM ticket_prints
+              WHERE work_order_id = $1 AND (estilo = $2 OR estilo IS NULL)
+              GROUP BY talla, color, customer_po`,
+            [woId, styleName]
+          );
+          const printedMap = new Map();
+          for (const p of printedResult.rows) {
+            const key = `${p.talla}||${p.color || ""}||${p.customer_po || ""}`;
+            printedMap.set(key, Number(p.printed) || 0);
+          }
+          sizes = sizes.map((s) => {
+            const key = `${s.talla}||${s.color || ""}||${s.customerPo || ""}`;
+            const printed = printedMap.get(key) || 0;
+            const assigned = Number(s.quantity) || 0;
+            return {
+              ...s,
+              assignedQuantity: assigned,                 // original merchant qty
+              printedQuantity: printed,                   // total already printed
+              quantity: Math.max(0, assigned - printed),  // remaining -> builder
+            };
+          });
+        }
+      }
+    } catch (e) {
+      console.warn("get-run-data: printed-ticket subtraction skipped:", e.message);
     }
 
     const operationsData = [];
