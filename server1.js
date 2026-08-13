@@ -5540,14 +5540,23 @@ app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => 
       ),
       filtered_runs AS (
         SELECT
-          lr.id         AS run_id,
-          lr.run_date   AS run_date,
-          lr.target_pcs AS target_pcs
+          lr.id          AS run_id,
+          lr.run_date    AS run_date,
+          lr.target_pcs  AS target_pcs,
+          lr.sam_minutes AS sam_minutes,
+          (lr.working_hours * lr.operators_count * 60) AS available_minutes
         FROM line_runs lr
         WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
       ),
+      -- Denominator: available minutes are summed over EVERY run on the day,
+      -- not only over runs that happen to contain a packing operation. This is
+      -- the same rule /api/skyrina/period-summary applies to the whole range.
       daily_target AS (
-        SELECT run_date, COALESCE(SUM(target_pcs), 0) AS target
+        SELECT
+          run_date,
+          COUNT(*)                                AS runs,
+          COALESCE(SUM(target_pcs), 0)            AS target,
+          COALESCE(SUM(available_minutes), 0)     AS available_minutes
         FROM filtered_runs
         GROUP BY run_date
       ),
@@ -5555,23 +5564,36 @@ app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => 
         SELECT
           fr.run_id,
           fr.run_date,
+          fr.sam_minutes,
           COALESCE(SUM(se.sewed_qty), 0) AS packing_total
         FROM filtered_runs fr
         JOIN run_operators ro          ON fr.run_id = ro.run_id
         JOIN operator_operations oo    ON ro.id = oo.run_operator_id
         LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
         WHERE (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
-        GROUP BY fr.run_id, fr.run_date
+        GROUP BY fr.run_id, fr.run_date, fr.sam_minutes
       ),
+      -- Numerator: SAM output = packed pieces * SAM of the run they came from.
       daily_produced AS (
-        SELECT run_date, COALESCE(SUM(packing_total), 0) AS produced
+        SELECT
+          run_date,
+          COALESCE(SUM(packing_total), 0)               AS produced,
+          COALESCE(SUM(packing_total * sam_minutes), 0) AS sam_output
         FROM run_packing_totals
         GROUP BY run_date
       )
       SELECT
         c.day                              AS date,
+        COALESCE(dt.runs, 0)               AS runs,
         COALESCE(dp.produced, 0)           AS produced,
-        COALESCE(dt.target, 0)             AS target
+        COALESCE(dt.target, 0)             AS target,
+        COALESCE(dt.available_minutes, 0)  AS available_minutes,
+        COALESCE(dp.sam_output, 0)         AS sam_output,
+        CASE
+          WHEN COALESCE(dt.available_minutes, 0) > 0
+          THEN (COALESCE(dp.sam_output, 0) / dt.available_minutes) * 100
+          ELSE 0
+        END                                AS efficiency
       FROM calendar c
       LEFT JOIN daily_produced dp ON dp.run_date = c.day
       LEFT JOIN daily_target   dt ON dt.run_date = c.day
@@ -5585,8 +5607,13 @@ app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => 
       date: row.date instanceof Date
         ? `${row.date.getFullYear()}-${String(row.date.getMonth() + 1).padStart(2, '0')}-${String(row.date.getDate()).padStart(2, '0')}`
         : String(row.date).slice(0, 10),
+      runs: parseInt(row.runs, 10) || 0,
       produced: parseFloat(row.produced) || 0,
       target: parseFloat(row.target) || 0,
+      // NO ROUNDING - keep the exact value, same as period-summary
+      availableMinutes: parseFloat(row.available_minutes) || 0,
+      samOutput: parseFloat(row.sam_output) || 0,
+      efficiency: parseFloat(row.efficiency) || 0,
     }));
 
     res.json({
@@ -5601,6 +5628,7 @@ app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => 
     client.release();
   }
 });
+
 
 
 /**
