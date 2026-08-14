@@ -6654,7 +6654,26 @@ app.post("/api/planner/update-sewed/:runId", authenticateToken, requirePlanner, 
     }
 
     await client.query("COMMIT");
-    res.json({ success: true, updatedCount });
+
+    // Mueve el estado de la ORDEN según lo producido (mismo criterio que el
+    // endpoint del líder de línea): producido>0 -> en proceso, producido>=asignado
+    // -> terminada. Solo empuja hacia adelante. Va fuera de la transacción, ya
+    // commiteada, para que lea las piezas recién guardadas.
+    let statusChange = null;
+    try {
+      const runInfo = await client.query(
+        `SELECT work_order_id FROM line_runs WHERE id = $1`,
+        [runId]
+      );
+      const woId = runInfo.rows[0]?.work_order_id;
+      if (woId) {
+        statusChange = await registerWorkOrders.refreshWorkOrderStatusFromProduction(client, woId);
+      }
+    } catch (e) {
+      console.warn("⚠️  recálculo de estado de la orden falló (el guardado sí se realizó):", e.message);
+    }
+
+    res.json({ success: true, updatedCount, statusChange });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ /api/planner/update-sewed error:", err.message);

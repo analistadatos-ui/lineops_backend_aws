@@ -346,12 +346,24 @@ let producedResolution = null;
 async function ensureProducedResolved(client) {
   if (RESOLVED_RUN_LINK) return;              // ya resuelto en este proceso
   if (!producedResolution) {
-    producedResolution = detectProducedSubquery(client).catch((err) => {
-      // Se limpia el memo para reintentar en la siguiente peticion en vez de
-      // quedarse en 0 para siempre por un error transitorio de conexion.
-      producedResolution = null;
-      console.warn("\u26a0\ufe0f  detectProducedSubquery fallo:", err.message);
-    });
+    producedResolution = detectProducedSubquery(client)
+      .catch((err) => {
+        // Error duro (p.ej. conexion): se loguea y se deja caer al finally, que
+        // limpia el memo para reintentar en la siguiente peticion.
+        console.warn("\u26a0\ufe0f  detectProducedSubquery fallo:", err.message);
+      })
+      .finally(() => {
+        // CLAVE EN LAMBDA: detectProducedSubquery NO lanza cuando faltan las
+        // tablas o no encuentra el enlace hacia la orden; solo hace warn y
+        // regresa, dejando RESOLVED_RUN_LINK en null. Si dejaramos el memo
+        // "resuelto" en ese estado, el contenedor entero se quedaria con
+        // PRODUCED_SUBQUERY = "0::numeric" de por vida (producido = 0 en la lista
+        // Y en el recalculo de estado). Eso pasa cuando la PRIMERA peticion que
+        // toca produccion en ese contenedor corre antes de que el search_path del
+        // tenant este puesto. Limpiando el memo cuando NO se resolvio, la
+        // siguiente peticion (ya con el schema correcto) vuelve a intentar.
+        if (!RESOLVED_RUN_LINK) producedResolution = null;
+      });
   }
   await producedResolution;
 }
@@ -1644,6 +1656,15 @@ async function refreshWorkOrderStatusFromProduction(client, workOrderId) {
   } else if (produced > 0) {
     desired = "in_progress";
   }
+
+  // Diagnóstico (visible en CloudWatch). Si en AWS ves aquí produced=0 pero la
+  // línea sí capturó, el problema es la resolución de PRODUCED_SUBQUERY en ese
+  // contenedor Lambda (RESOLVED_RUN_LINK), no este cálculo de estado.
+  console.log(
+    `[wo-status] id=${wo} produced=${produced} assigned=${assigned} ` +
+    `target=${target} current=${current} desired=${desired} ` +
+    `linkResolved=${Boolean(RESOLVED_RUN_LINK)}`
+  );
 
   // Solo hacia adelante: nunca degradar por una correccion a la baja.
   if ((WO_STATUS_RANK[desired] ?? 0) <= (WO_STATUS_RANK[current] ?? 0)) {
