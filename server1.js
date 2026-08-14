@@ -1172,7 +1172,26 @@ app.post(
         console.warn("⚠️  auto-cierre de celda falló (el guardado sí se realizó):", e.message);
       }
 
-      res.json({ success: true, updatedCount, autoCompleted });
+      // Mueve el estado de la ORDEN según lo producido: producido>0 -> en proceso,
+      // producido>=asignado -> terminada. Solo empuja hacia adelante y nunca
+      // degrada. Es aparte del auto-cierre de celda (autoCompleteDay), que solo
+      // toca line_assignments; esto actualiza wo.status, que es lo que ve el
+      // planeador en OrderStatus.jsx.
+      let statusChange = null;
+      try {
+        const runInfo2 = await client.query(
+          `SELECT work_order_id FROM line_runs WHERE id = $1`,
+          [runId]
+        );
+        const woId = runInfo2.rows[0]?.work_order_id;
+        if (woId) {
+          statusChange = await registerWorkOrders.refreshWorkOrderStatusFromProduction(client, woId);
+        }
+      } catch (e) {
+        console.warn("⚠️  recálculo de estado de la orden falló (el guardado sí se realizó):", e.message);
+      }
+
+      res.json({ success: true, updatedCount, autoCompleted, statusChange });
     } catch (err) {
       await client.query("ROLLBACK");
       next(err);

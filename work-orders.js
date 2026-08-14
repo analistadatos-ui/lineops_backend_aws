@@ -1585,6 +1585,78 @@ async function producedQuantityFor(client, workOrderId) {
   return Number(rows[0]?.produced_quantity) || 0;
 }
 
+// Recalcula el ESTADO de la ORDEN a partir de lo PRODUCIDO, con la misma
+// aritmetica que ve el planeador en OrderStatus.jsx:
+//   • producido > 0                          -> 'in_progress' (En proceso)
+//   • producido >= asignado  (y asignado>0)  -> 'completed'   (Terminada)
+//
+// La produccion SOLO empuja hacia adelante (pending/assigned -> in_progress ->
+// completed): nunca "descompleta" ni degrada una orden. Es el mismo criterio de
+// una sola direccion que autoCompleteDay, para no pelear con el flujo manual del
+// planeador si despues corrige una captura hacia abajo. No toca canceladas y es
+// idempotente.
+//
+// NOTA de diseno: "terminada" se decide contra lo ASIGNADO, no contra
+// total_to_produce. Es lo que se pidio (producido == asignado => cerrar), pero
+// implica que una orden puede quedar 'completed' aunque todavia le falte cantidad
+// por ASIGNAR a alguna linea. Si prefieres que solo cierre cuando ademas este
+// totalmente asignada, pon REQUIRE_FULL_ASSIGNMENT = true.
+const REQUIRE_FULL_ASSIGNMENT = false;
+
+// Orden de avance para garantizar que la produccion solo suba el estado.
+const WO_STATUS_RANK = { pending: 0, assigned: 1, in_progress: 2, completed: 3 };
+
+// Devuelve { changed:true, from, to } si movio el estado, o { changed:false }.
+async function refreshWorkOrderStatusFromProduction(client, workOrderId) {
+  const wo = Number(workOrderId);
+  if (!Number.isFinite(wo)) return { changed: false };
+
+  await ensureProducedResolved(client);
+
+  // Estado actual, meta y total asignado (mismo filtro que la lista de ordenes).
+  const { rows } = await client.query(
+    `SELECT wo.status,
+            COALESCE(wo.total_to_produce, wo.quantity, 0) AS target,
+            COALESCE(SUM(la.assigned_quantity)
+              FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) AS assigned
+       FROM work_orders wo
+       LEFT JOIN line_assignments la ON la.work_order_id = wo.id
+      WHERE wo.id = $1
+      GROUP BY wo.id`,
+    [wo]
+  );
+  const row = rows[0];
+  if (!row) return { changed: false };
+
+  const current = row.status;
+  // La produccion no manda sobre ordenes canceladas.
+  if (current === "cancelled") return { changed: false };
+
+  const assigned = Number(row.assigned) || 0;
+  const target = Number(row.target) || 0;
+  const produced = await producedQuantityFor(client, wo);
+
+  const fullyAssigned = !REQUIRE_FULL_ASSIGNMENT || (target > 0 && assigned >= target);
+
+  let desired = current;
+  if (assigned > 0 && produced >= assigned && fullyAssigned) {
+    desired = "completed";
+  } else if (produced > 0) {
+    desired = "in_progress";
+  }
+
+  // Solo hacia adelante: nunca degradar por una correccion a la baja.
+  if ((WO_STATUS_RANK[desired] ?? 0) <= (WO_STATUS_RANK[current] ?? 0)) {
+    return { changed: false, from: current, to: current };
+  }
+
+  await client.query(
+    `UPDATE work_orders SET status = $1, updated_at = now() WHERE id = $2`,
+    [desired, wo]
+  );
+  return { changed: true, from: current, to: desired };
+}
+
 // Produccion terminada por LINEA para VARIAS ordenes en una sola consulta (evita
 // N+1 en el dashboard). Regresa Map<work_order_id, [{ line_no, finished,
 // last_reported_at }]>. Mismo enlace y mismas operaciones de empaque/terminado
@@ -1786,6 +1858,7 @@ async function autoCompleteDay(client, { workOrderId, lineNo, day }) {
 registerWorkOrders.initSchema = initSchema;
 registerWorkOrders.autoCompleteDay = autoCompleteDay;
 registerWorkOrders.producedQuantityFor = producedQuantityFor;
+registerWorkOrders.refreshWorkOrderStatusFromProduction = refreshWorkOrderStatusFromProduction;
 registerWorkOrders.producedByLineFor = producedByLineFor;
 registerWorkOrders.producedByLineForMany = producedByLineForMany;
 registerWorkOrders.producedByLineDayForMany = producedByLineDayForMany;
