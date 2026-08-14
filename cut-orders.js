@@ -58,6 +58,20 @@ async function initSchema({ pool, setSchema }) {
     // fabric/fabric_code/yield_per_piece/total_length quedan como representativos
     // (primera tela) para las vistas antiguas.
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS fabrics JSONB NOT NULL DEFAULT '[]'::jsonb;`);
+    // Prioridad fijada por el planner: 'urgent' (rojo), 'intermediate' (amarillo),
+    // 'normal' (verde). El dashboard de corte ordena por prioridad y luego por fecha.
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS priority VARCHAR(20) NOT NULL DEFAULT 'normal';`);
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'chk_cut_priority'
+        ) THEN
+          ALTER TABLE cut_orders
+            ADD CONSTRAINT chk_cut_priority
+            CHECK (priority IN ('urgent','intermediate','normal'));
+        END IF;
+      END $$;
+    `);
     console.log("✅ cut_orders table ready in prod_db_schema");
   } finally {
     client.release();
@@ -96,6 +110,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                co.markers,
                co.notes,
                co.status,
+               COALESCE(co.priority, 'normal') AS priority,
                co.created_at,
                wo.work_order_no,
                wo.customer_name,
@@ -143,7 +158,10 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { workOrderId, fabric, fabricCode, cutDate, quantity, notes, yieldPerPiece, color, sizes, styleNo, season, fabrics } = req.body;
+      const { workOrderId, fabric, fabricCode, cutDate, quantity, notes, yieldPerPiece, color, sizes, styleNo, season, fabrics, priority } = req.body;
+
+      const VALID_PRIORITIES = ["urgent", "intermediate", "normal"];
+      const priorityFinal = VALID_PRIORITIES.includes(priority) ? priority : "normal";
 
       if (!workOrderId || !cutDate || !quantity || parseFloat(quantity) <= 0) {
         return res.status(400).json({
@@ -190,12 +208,12 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       const seasonFinal = season || wo.rows[0].season || null;
 
       const result = await client.query(
-        `INSERT INTO cut_orders (work_order_id, fabric, fabric_code, cut_date, quantity, notes, yield_per_piece, total_length, color, sizes, style_no, season, fabrics)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13::jsonb)
+        `INSERT INTO cut_orders (work_order_id, fabric, fabric_code, cut_date, quantity, notes, yield_per_piece, total_length, color, sizes, style_no, season, fabrics, priority)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13::jsonb, $14)
          RETURNING *`,
         [parseInt(workOrderId), repName, repCode, cutDate, qty, notes || null, repYield, totalLength, color || null,
          Array.isArray(sizes) && sizes.length ? JSON.stringify(sizes) : null, styleNoFinal, seasonFinal,
-         JSON.stringify(fabricsArr)]
+         JSON.stringify(fabricsArr), priorityFinal]
       );
       res.json({ success: true, cutOrder: result.rows[0] });
     } catch (err) {
@@ -296,6 +314,31 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       res.json({ success: true, cutOrder: result.rows[0] });
     } catch (err) {
       console.error("❌ Error updating cut order:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Update a cut order's priority (urgent / intermediate / normal).
+  app.patch("/api/cut-orders/:id/priority", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { priority } = req.body;
+      if (!["urgent", "intermediate", "normal"].includes(priority)) {
+        return res.status(400).json({ success: false, error: "Prioridad inválida" });
+      }
+      const result = await client.query(
+        "UPDATE cut_orders SET priority = $1, updated_at = now() WHERE id = $2 RETURNING *",
+        [priority, parseInt(req.params.id)]
+      );
+      if (result.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "Cut order not found" });
+      }
+      res.json({ success: true, cutOrder: result.rows[0] });
+    } catch (err) {
+      console.error("❌ Error updating cut order priority:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
       client.release();
