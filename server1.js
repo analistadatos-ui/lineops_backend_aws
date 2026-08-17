@@ -1565,7 +1565,6 @@ app.get("/api/line-runs", authenticateToken, async (req, res, next) => {
   }
 });
 
-// ---------------------------------------------------------------------------
 // PATCH /api/line-runs/operators  —  add to server.js (near the other
 // /api/line-runs routes). Changing the number of sewers (operators) on a line
 // recomputes its daily capacity:
@@ -1575,44 +1574,62 @@ app.get("/api/line-runs", authenticateToken, async (req, res, next) => {
 //   target_per_hour       = target_pcs ÷ working_hours
 //
 // By default it applies to ALL runs of the line (each recomputed with its own
-// working_hours / efficiency / SAM). Pass an optional `date` to scope it to a
-// single run_date.
+// working_hours / efficiency / SAM). Pass an optional `style` to scope it to a
+// single style (e.g. "DP-441") on that line, `from` (YYYY-MM-DD, inclusive) to
+// only touch runs on/after that date so historical months stay intact, and/or
+// `date` to scope it to a single run_date.
+//
+// If a `style` + effective date (`date` or `from`) is given but no run exists on
+// that day for that style, a run is CREATED for that day — cloning the line's
+// most recent run parameters (hours/efficiency/SAM) — so per-style operator
+// changes take effect even on planned days that had no run yet. Earlier runs are
+// never modified.
 // ---------------------------------------------------------------------------
 app.patch("/api/line-runs/operators", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
-    const { lineNo, operators, date } = req.body;
+    const { lineNo, operators, date, style, from } = req.body;
     const ops = parseInt(operators);
- 
+
     if (lineNo === undefined || lineNo === null || String(lineNo).trim() === "" || isNaN(ops) || ops < 0) {
       return res.status(400).json({ success: false, error: "lineNo y operators (>= 0) son obligatorios" });
     }
- 
+
+    const styleStr = (style !== undefined && style !== null && String(style).trim() !== "") ? String(style).trim() : null;
+    const anchor = date || from || null; // the day the change should take effect
+
+    // Recompute a run's daily capacity for the new operator count.
+    const calc = (wh, eff, sam) => {
+      const availableMin = ops * wh * 60 * eff;
+      const targetPcs = sam > 0 ? availableMin / sam : 0;
+      const targetPerHour = wh > 0 ? targetPcs / wh : 0;
+      return { targetPcs, targetPerHour };
+    };
+
+    // 1) Existing runs in scope (line [+ style] [+ from/date]).
     const params = [String(lineNo)];
     let where = "WHERE line_no = $1";
-    if (date) {
-      params.push(date);
-      where += " AND run_date = $2";
-    }
- 
+    if (styleStr) { params.push(styleStr); where += ` AND style = $${params.length}`; }
+    // `from` (inclusive) keeps historical months intact: only runs on/after this
+    // date are recomputed, so past capacity/efficiency figures never change.
+    if (from) { params.push(from); where += ` AND run_date >= $${params.length}`; }
+    if (date) { params.push(date); where += ` AND run_date = $${params.length}`; }
+
     const runs = await client.query(
-      `SELECT id, working_hours, efficiency, sam_minutes FROM line_runs ${where}`,
+      `SELECT id, to_char(run_date, 'YYYY-MM-DD') AS run_date, working_hours, efficiency, sam_minutes
+         FROM line_runs ${where}`,
       params
     );
-    if (runs.rows.length === 0) {
-      return res.status(404).json({ success: false, error: "No hay corridas para esa línea" });
-    }
- 
+
     await client.query("BEGIN");
+
     let updated = 0;
     for (const r of runs.rows) {
       const wh = parseFloat(r.working_hours) || 0;
       const eff = parseFloat(r.efficiency) || 0;
       const sam = parseFloat(r.sam_minutes) || 0;
-      const availableMin = ops * wh * 60 * eff;
-      const targetPcs = sam > 0 ? availableMin / sam : 0;
-      const targetPerHour = wh > 0 ? targetPcs / wh : 0;
+      const { targetPcs, targetPerHour } = calc(wh, eff, sam);
       await client.query(
         `UPDATE line_runs
             SET operators_count = $1, target_pcs = $2, target_per_hour = $3, updated_at = now()
@@ -1621,9 +1638,53 @@ app.patch("/api/line-runs/operators", authenticateToken, async (req, res) => {
       );
       updated++;
     }
+
+    // 2) If a style + effective date were given but no run exists on that exact
+    //    day for that style, create one so the change actually takes effect.
+    //    We clone the line's most recent run parameters (hours / efficiency /
+    //    SAM) — history is never touched, we only ADD a new dated run.
+    let created = 0;
+    const hasAnchorRun = anchor ? runs.rows.some((r) => r.run_date === anchor) : true;
+
+    if (styleStr && anchor && !hasAnchorRun) {
+      const tmpl = await client.query(
+        `SELECT working_hours, efficiency, sam_minutes
+           FROM line_runs
+          WHERE line_no = $1
+          ORDER BY (style = $2) DESC, (run_date <= $3) DESC, run_date DESC
+          LIMIT 1`,
+        [String(lineNo), styleStr, anchor]
+      );
+      if (tmpl.rows.length > 0) {
+        const wh = parseFloat(tmpl.rows[0].working_hours) || 0;
+        const eff = parseFloat(tmpl.rows[0].efficiency) || 0;
+        const sam = parseFloat(tmpl.rows[0].sam_minutes) || 0;
+        const { targetPcs, targetPerHour } = calc(wh, eff, sam);
+        await client.query(
+          `INSERT INTO line_runs
+             (line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
+           ON CONFLICT (line_no, run_date, style)
+           DO UPDATE SET operators_count = EXCLUDED.operators_count,
+                         target_pcs      = EXCLUDED.target_pcs,
+                         target_per_hour = EXCLUDED.target_per_hour,
+                         updated_at      = now()`,
+          [String(lineNo), anchor, styleStr, ops, wh, sam, eff, targetPcs, targetPerHour]
+        );
+        created++;
+      }
+    }
+
+    if (updated === 0 && created === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        error: "No hay corridas ni configuración base para esa línea; no se pudo aplicar el cambio.",
+      });
+    }
+
     await client.query("COMMIT");
- 
-    res.json({ success: true, updated, operators: ops });
+    res.json({ success: true, updated, created, operators: ops, style: styleStr, from: from ?? null, date: date ?? null });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("❌ Error updating line operators:", err.message);
