@@ -548,7 +548,7 @@ await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_work_order O
 await client.query(`ALTER TABLE line_runs ADD COLUMN IF NOT EXISTS work_order_id BIGINT REFERENCES work_orders(id) ON DELETE SET NULL;`);
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_runs_work_order ON line_runs(work_order_id);");
 // ────
-
+await registerFinishedWarehouseAnalytics.initSchema({ pool, setSchema });
 await registerMerchantAnalytics.initSchema({ pool, setSchema });
 await registerMerchantPlan.initSchema({ pool, setSchema });
 await registerCutOrders.initSchema({ pool, setSchema });
@@ -784,6 +784,10 @@ app.post(
 app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
+
+// with the other requires / registrations, near registerFinishedWarehouse:
+const registerFinishedWarehouseAnalytics = require("./finished-warehouse-analytics");
+registerFinishedWarehouseAnalytics(app, { authenticateToken, pool, setSchema });
 
 const registerCutOrderAnalytics = require("./cut-order-analytics");
 registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema });
