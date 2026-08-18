@@ -42,8 +42,8 @@ const colorCodeOf = (color, talla) => `${String(color ?? "").trim()}${String(tal
 // customer expects. PARTIAL LIST — extend as new size codes appear. Any code not
 // found here falls back to printing the code itself, so a size is never blank.
 const SIZE_LABELS = {
-  "130": "xxs",
-  "132": "xs",
+  "130": "xxxs",
+  "132": "xxs",
   "134": "xs",
   "136": "(S)",
   "138": "(M)",
@@ -64,6 +64,109 @@ const sizeLabelOf = (code) => {
 // Detection is by customer name containing "C&A" (case-insensitive).
 const boxRegistryFor = (customerName) =>
   String(customerName ?? "").toUpperCase().includes("C&A") ? "NCA" : null;
+
+// ---------------------------------------------------------------------------
+// Desglose de capturas (cuándo entró cada tanto de piezas)
+// ---------------------------------------------------------------------------
+// El acumulado por talla sale de sumar ticket_prints. Para que el operador vea
+// CÓMO se llegó a ese número (p. ej. 50 el lunes + 50 el viernes) necesitamos
+// las capturas sin agrupar por completo. Las columnas exactas de ticket_prints /
+// line_runs han ido cambiando, así que en vez de asumirlas las consultamos una
+// vez y armamos el SELECT con las que existan; si falta alguna, esa parte del
+// desglose simplemente sale vacía en lugar de tronar la consulta.
+const _colCache = new Map();
+async function columnsOf(client, table) {
+  if (_colCache.has(table)) return _colCache.get(table);
+  let cols = new Map();   // nombre -> data_type
+  try {
+    const { rows } = await client.query(
+      `SELECT column_name, data_type
+         FROM information_schema.columns
+        WHERE table_name = $1
+          AND table_schema = ANY (current_schemas(false))
+        ORDER BY ordinal_position`,
+      [table]
+    );
+    cols = new Map(rows.map((r) => [r.column_name, r.data_type]));
+  } catch (e) {
+    console.warn(`columnsOf(${table}): ${e.message}`);
+  }
+  _colCache.set(table, cols);
+  return cols;
+}
+
+// Primera columna de fecha/hora utilizable de una tabla: se prefieren los
+// nombres conocidos y, si ninguno está, CUALQUIER columna timestamp. Así el
+// desglose funciona aunque la columna se llame distinto de lo esperado.
+const TIME_NAME_PREFERENCE = [
+  "printed_at", "created_at", "printed_on", "registered_at", "inserted_at",
+  "fecha_hora", "fecha", "timestamp", "ts", "updated_at",
+];
+function timeColumnOf(cols) {
+  const isTime = (n) => /^timestamp/.test(String(cols.get(n) ?? ""));
+  for (const n of TIME_NAME_PREFERENCE) if (cols.has(n) && isTime(n)) return n;
+  for (const n of cols.keys()) if (isTime(n)) return n;
+  return null;
+}
+
+// Número de línea de producción, ya sea en la corrida o en el propio ticket.
+const LINE_NAME_PREFERENCE = ["line_no", "line_number", "linea", "line", "no_linea"];
+function lineColumnOf(cols) {
+  return LINE_NAME_PREFERENCE.find((n) => cols.has(n)) || null;
+}
+
+// Capturas individuales de tickets de una orden, hasta la fecha de corte.
+// Un renglón = un momento de captura (una impresión de tickets): su fecha, hora
+// exacta, línea y piezas. Sumar los renglones de una talla da su acumulado.
+//
+// Se agrupa por la HORA EXACTA, no por día ni por minuto: dos capturas del mismo
+// día (p. ej. 50 a las 21:50 y 50 a las 22:43) tienen que verse por separado,
+// que es justo lo que el operador necesita saber. Si la tabla no tuviera columna
+// de tiempo, se cae a un renglón por registro (tp.id) para no fusionar capturas.
+async function ticketEntriesFor(client, workOrderId, asOfDate) {
+  const tp = await columnsOf(client, "ticket_prints");
+  const lr = await columnsOf(client, "line_runs");
+
+  const tpTime = timeColumnOf(tp);
+  const lrTime = timeColumnOf(lr);
+  const tsExpr = tpTime ? `tp."${tpTime}"` : (lrTime ? `lr."${lrTime}"` : "NULL::timestamptz");
+
+  // Día de producción: el mismo eje que usa el resto del sistema (run_date).
+  const dayExpr = lr.has("run_date") ? "lr.run_date" : `(${tsExpr})::date`;
+
+  const lineCol = lineColumnOf(lr);
+  const tpLineCol = lineColumnOf(tp);
+  const lineExpr = lineCol ? `lr."${lineCol}"` : (tpLineCol ? `tp."${tpLineCol}"` : "NULL::int");
+
+  // Sin columna de tiempo, cada registro es su propia captura.
+  const grainExpr = (tpTime || lrTime) ? tsExpr : "tp.id";
+
+  const { rows } = await client.query(
+    `SELECT tp.talla                          AS size_code,
+            COALESCE(tp.color, '')            AS color,
+            COALESCE(tp.estilo, '')           AS estilo,
+            tp.customer_po,
+            to_char(${dayExpr}, 'YYYY-MM-DD') AS day,
+            ${lineExpr}                       AS line_no,
+            MIN(${tsExpr})                    AS at,
+            SUM(tp.quantity)::numeric         AS qty,
+            COUNT(*)::int                     AS tickets
+       FROM ticket_prints tp
+       JOIN line_runs lr ON lr.id = tp.run_id
+      WHERE tp.work_order_id = $1
+        AND ($2::date IS NULL OR ${dayExpr} <= $2::date)
+      GROUP BY tp.talla, COALESCE(tp.color, ''), COALESCE(tp.estilo, ''), tp.customer_po,
+               ${dayExpr}, ${lineExpr}, ${grainExpr}
+      ORDER BY 5 ASC, 7 ASC NULLS FIRST
+      LIMIT 2000`,
+    [workOrderId, asOfDate]
+  );
+
+  // Se devuelve también QUÉ columnas se usaron: si el desglose sale raro, la
+  // respuesta del endpoint dice de dónde salió la hora y la línea.
+  return { rows, meta: { timeColumn: tpTime ? `ticket_prints.${tpTime}` : (lrTime ? `line_runs.${lrTime}` : null),
+                         lineColumn: lineCol ? `line_runs.${lineCol}` : (tpLineCol ? `ticket_prints.${tpLineCol}` : null) } };
+}
 
 // Split an integer `total` across `weights` proportionally, returning whole
 // numbers that sum EXACTLY to `total` (largest-remainder / Hamilton method).
@@ -99,9 +202,22 @@ function allocateProportional(total, weights) {
 // is how one order is split into one list per PO cliente. If nothing matches
 // (e.g. a legacy list whose mo is a combined value), it falls back to all lines.
 //
+// `opts.asOfDate` (optional, 'YYYY-MM-DD'): cut-off production day. When given,
+// each box's pieces are the ACUMULADO por talla up to and including that day
+// (tickets whose run's run_date <= asOfDate). This is how the operator sees "lo
+// que llevan las líneas a esta fecha". When omitted, all tickets to date count
+// and (for orders without any tickets) we fall back to the proportional split.
+//
 // NOTE: caller runs inside its own transaction; this only issues queries.
-async function generateBoxesFromOrder(client, list, moFilter) {
+async function generateBoxesFromOrder(client, list, moFilter, opts = {}) {
   if (!list.work_order_id) return [];
+
+  // Cut-off day for the accumulated per-size production (null = all time).
+  const asOfDate = /^\d{4}-\d{2}-\d{2}$/.test(String(opts.asOfDate ?? "").trim())
+    ? String(opts.asOfDate).trim()
+    : (/^\d{4}-\d{2}-\d{2}/.test(String(list.as_of_date ?? "")) // fall back to the list's stored day
+        ? String(list.as_of_date).slice(0, 10)
+        : null);
 
   const woRes = await client.query(
     `SELECT work_order_no AS po, customer_po AS mo FROM work_orders WHERE id = $1`,
@@ -130,16 +246,84 @@ async function generateBoxesFromOrder(client, list, moFilter) {
   const headerMo = String(header.mo ?? "").trim();
   const effMo = (l) => { const m = String(l.mo ?? "").trim(); return m || headerMo; };
 
-  // Producido is an order-level total (production isn't captured per talla/color).
-  // Split it across ALL size×color lines by ordered quantity FIRST, so that when
-  // a list is scoped to one PO cliente it still gets only its own lines' share,
-  // and the shares across every PO cliente of the order still sum to producido.
-  const producedTotal = await workOrders.producedQuantityFor(client, list.work_order_id);
-  const allocation = allocateProportional(
-    producedTotal,
-    linesRes.rows.map((l) => Number(l.quantity) || 0)
-  );
-  let rows = linesRes.rows.map((l, i) => ({ ...l, _alloc: allocation[i] }));
+  // ── Piezas por talla: lo REALMENTE producido, desde el registro de tickets ──
+  // Cada vez que la línea imprime tickets de lo que terminó, queda un renglón en
+  // ticket_prints con su talla + color + PO cliente + estilo y las piezas de ese
+  // ticket (POST /api/lineleader/confirm-tickets/:runId). Esa es la producción
+  // real POR TALLA, así que la usamos directo en lugar de repartir un total de la
+  // orden según lo ordenado. Si una orden todavía no tiene tickets registrados
+  // (órdenes viejas), caemos al reparto proporcional de siempre para no romper
+  // nada.
+  const nz = (v) => String(v ?? "").trim();
+  const fullKey  = (t, c, po, e) => `${nz(t)}\u0000${nz(c)}\u0000${nz(po)}\u0000${nz(e)}`;
+  const looseKey = (t, c, po)    => `${nz(t)}\u0000${nz(c)}\u0000${nz(po)}`;
+
+  const ticketsFull  = new Map();  // talla|color|PO|estilo -> piezas
+  const ticketsLoose = new Map();  // talla|color|PO        -> piezas (todas las estilos)
+  let ticketsTotal = 0;
+  try {
+    // Acumulado por talla hasta el día seleccionado: se filtra por el run_date de
+    // la corrida (mismo eje "día" que usa el resto del sistema), no por la hora en
+    // que se imprimió, para que cuadre con lo que reporta el líder de línea.
+    const tRes = await client.query(
+      `SELECT tp.talla,
+              COALESCE(tp.color, '')       AS color,
+              COALESCE(tp.customer_po, '') AS customer_po,
+              COALESCE(tp.estilo, '')      AS estilo,
+              SUM(tp.quantity)::numeric    AS produced
+         FROM ticket_prints tp
+         JOIN line_runs lr ON lr.id = tp.run_id
+        WHERE tp.work_order_id = $1
+          AND ($2::date IS NULL OR lr.run_date <= $2::date)
+        GROUP BY tp.talla, COALESCE(tp.color,''), COALESCE(tp.customer_po,''), COALESCE(tp.estilo,'')`,
+      [list.work_order_id, asOfDate]
+    );
+    for (const r of tRes.rows) {
+      const q = Number(r.produced) || 0;
+      if (q <= 0) continue;
+      ticketsTotal += q;
+      ticketsFull.set(fullKey(r.talla, r.color, r.customer_po, r.estilo), q);
+      const lk = looseKey(r.talla, r.color, r.customer_po);
+      ticketsLoose.set(lk, (ticketsLoose.get(lk) || 0) + q);
+    }
+  } catch (e) {
+    // ticket_prints ausente/inaccesible → nos quedamos con el reparto proporcional.
+    console.warn("generateBoxesFromOrder: ticket_prints no disponible:", e.message);
+  }
+
+  // Piezas producidas para una línea (talla×color×estilo×PO cliente) desde tickets.
+  // Preferimos el match exacto con estilo; si el estilo no cuadra, caemos al match
+  // por talla+color+PO. El PO cliente de la línea puede venir en la propia línea o
+  // heredarse del encabezado, así que probamos ambos, y también el caso sin PO.
+  const producedFromTickets = (l) => {
+    const t = l.size_code, c = l.color_name, e = l.style;
+    const poRaw = nz(l.mo), poEff = effMo(l);
+    for (const k of [fullKey(t, c, poRaw, e), fullKey(t, c, poEff, e), fullKey(t, c, "", e)])
+      if (ticketsFull.has(k)) return ticketsFull.get(k);
+    for (const k of [looseKey(t, c, poRaw), looseKey(t, c, poEff), looseKey(t, c, "")])
+      if (ticketsLoose.has(k)) return ticketsLoose.get(k);
+    return 0;
+  };
+
+  let rows;
+  if (ticketsTotal > 0 || asOfDate) {
+    // Fuente de verdad por talla: los tickets impresos por la línea, acumulados a
+    // la fecha. Una talla sin ticket queda en 0 (aún no se ha producido esa talla
+    // a esa fecha), no en un estimado. Cuando se pidió una fecha NO caemos al
+    // reparto proporcional: ese total es de todo el tiempo y no conoce la fecha.
+    rows = linesRes.rows.map((l) => ({ ...l, _alloc: producedFromTickets(l) }));
+  } else {
+    // Sin fecha y sin tickets registrados (órdenes previas a la captura por
+    // ticket): reparto proporcional del producido de la orden por lo ordenado —
+    // comportamiento anterior. Se hace sobre TODAS las líneas primero para que, al
+    // acotar a un PO cliente, cada quien reciba solo su parte y el total cuadre.
+    const producedTotal = await workOrders.producedQuantityFor(client, list.work_order_id);
+    const allocation = allocateProportional(
+      producedTotal,
+      linesRes.rows.map((l) => Number(l.quantity) || 0)
+    );
+    rows = linesRes.rows.map((l, i) => ({ ...l, _alloc: allocation[i] }));
+  }
 
   // Scope to one PO cliente when asked (fall back to all lines if none match).
   if (moFilter != null && String(moFilter).trim() !== "") {
@@ -169,7 +353,7 @@ async function generateBoxesFromOrder(client, list, moFilter) {
         l.size_code || null,
         l.color_name || null,
         colorCodeOf(l.color_name, l.size_code) || null,
-        l._alloc,                               // producido split proportionally by size
+        l._alloc,                               // piezas reales por talla (tickets); reparto proporcional solo si no hay tickets
         DEFAULT_BOX_CODE,
         boxRegistry,
         0,
@@ -226,6 +410,9 @@ async function initSchema({ pool, setSchema }) {
     `);
     await client.query("CREATE INDEX IF NOT EXISTS idx_pp_lists_customer ON pre_packing_lists(customer_id);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_pp_lists_status ON pre_packing_lists(status);");
+    // Día de corte de la lista: las piezas por talla son el acumulado de la
+    // producción de las líneas hasta este día (null = todo el tiempo).
+    await client.query("ALTER TABLE pre_packing_lists ADD COLUMN IF NOT EXISTS as_of_date DATE;");
 
     // One row = one box.
     await client.query(`
@@ -537,6 +724,173 @@ function registerFinishedWarehouse(app, deps) {
     res.json({ success: true, list: listRes.rows[0], boxes: boxesRes.rows });
   }));
 
+  // Progreso POR TALLA para una lista, a una fecha de corte.
+  //   GET /api/pre-packing-lists/:id/size-progress?date=YYYY-MM-DD
+  // Para cada talla (× color × estilo) de la orden, scoped al PO cliente de la
+  // lista, regresa:
+  //   ordered   = total de esa talla en la orden ("cuánto hay que alcanzar")
+  //   produced  = ACUMULADO por talla hasta la fecha (tickets de la línea)
+  //   remaining = ordered - produced (lo que falta para llegar)
+  // Más `availableDays`: los días con producción por talla, para poblar el
+  // selector de fecha. Read-only; no toca cajas.
+  app.get("/api/pre-packing-lists/:id/size-progress", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    const listRes = await client.query(
+      `SELECT id, work_order_id, mo, as_of_date FROM pre_packing_lists WHERE id = $1`, [id]
+    );
+    if (listRes.rows.length === 0) return res.status(404).json({ success: false, error: "Lista no encontrada" });
+    const list = listRes.rows[0];
+    if (!list.work_order_id) {
+      return res.json({ success: true, date: null, mo: list.mo, availableDays: [], sizes: [], totals: { ordered: 0, produced: 0, remaining: 0 } });
+    }
+
+    // Fecha efectiva: query > la guardada en la lista > null (todo el tiempo).
+    const rawDate = String(req.query.date ?? "").trim();
+    const asOfDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
+      ? rawDate
+      : (list.as_of_date ? String(list.as_of_date).slice(0, 10) : null);
+
+    const woRes = await client.query(`SELECT customer_po AS mo FROM work_orders WHERE id = $1`, [list.work_order_id]);
+    const headerMo = String(woRes.rows[0]?.mo ?? "").trim();
+    const effMo = (po) => { const m = String(po ?? "").trim(); return m || headerMo; };
+    const nz = (v) => String(v ?? "").trim();
+    // OJO con "estilo": NO es el mismo campo en los dos lados.
+    //   work_order_lines.estilo = estilo CLIENTE (6 caracteres, p. ej. 030800)
+    //   ticket_prints.estilo    = viene de line_runs.style, que es el código de
+    //                             estilo tipo+modelo+correlativo (p. ej. DAMCHA01)
+    // Compararlos como texto nunca cuadra y partía cada talla en dos renglones
+    // (uno con la meta y otro con lo producido). El cruce real es por
+    // talla × color × PO cliente; cada código se conserva solo para mostrarse.
+    const key = (t, c, mo) => `${nz(t)}\u0000${nz(c)}\u0000${nz(mo)}`;
+
+    // Ordenado por talla×color×estilo×PO cliente.
+    const ordRes = await client.query(
+      `SELECT talla AS size_code, COALESCE(color,'') AS color, COALESCE(estilo,'') AS estilo,
+              customer_po, SUM(quantity)::numeric AS ordered
+         FROM work_order_lines
+        WHERE work_order_id = $1
+        GROUP BY talla, COALESCE(color,''), COALESCE(estilo,''), customer_po`,
+      [list.work_order_id]
+    );
+
+    // Producido acumulado a la fecha (por run_date de la corrida).
+    let prodRows = [];
+    try {
+      const prodRes = await client.query(
+        `SELECT tp.talla AS size_code, COALESCE(tp.color,'') AS color, COALESCE(tp.estilo,'') AS estilo,
+                tp.customer_po, SUM(tp.quantity)::numeric AS produced
+           FROM ticket_prints tp
+           JOIN line_runs lr ON lr.id = tp.run_id
+          WHERE tp.work_order_id = $1
+            AND ($2::date IS NULL OR lr.run_date <= $2::date)
+          GROUP BY tp.talla, COALESCE(tp.color,''), COALESCE(tp.estilo,''), tp.customer_po`,
+        [list.work_order_id, asOfDate]
+      );
+      prodRows = prodRes.rows;
+    } catch (e) {
+      console.warn("size-progress: ticket_prints no disponible:", e.message);
+    }
+
+    // Capturas individuales (día · línea · hora → piezas), para explicar el
+    // acumulado de cada talla. Mismo filtro de fecha que el agregado de arriba.
+    let entryRows = [];
+    let entriesMeta = null;
+    try {
+      const e = await ticketEntriesFor(client, list.work_order_id, asOfDate);
+      entryRows = e.rows;
+      entriesMeta = e.meta;
+    } catch (e) {
+      console.warn("size-progress: desglose de capturas no disponible:", e.message);
+    }
+    const entriesBy = new Map();
+    for (const r of entryRows) {
+      const k = key(r.size_code, r.color, effMo(r.customer_po));
+      const arr = entriesBy.get(k) || [];
+      arr.push({
+        day: r.day,
+        at: r.at,
+        // line_runs.line_no es TEXT en este esquema (puede ser "1" o "A1"), así
+        // que se pasa tal cual en vez de convertirlo a número.
+        line_no: r.line_no == null ? null : (String(r.line_no).trim() || null),
+        qty: Math.round(Number(r.qty) || 0),
+        tickets: Number(r.tickets) || 0,
+      });
+      entriesBy.set(k, arr);
+    }
+
+    // Merge ordenado + producido por talla×color×estilo×PO cliente efectivo.
+    const map = new Map();
+    const bump = (r, field, val) => {
+      const mo = effMo(r.customer_po);
+      const k = key(r.size_code, r.color, mo);
+      let row = map.get(k);
+      if (!row) { row = { size_code: r.size_code, color: r.color, estilo: "", style_code: "", mo, ordered: 0, produced: 0 }; map.set(k, row); }
+      // El estilo cliente lo pone la orden; el código tipo+modelo+correlativo, el ticket.
+      if (field === "ordered" && !row.estilo) row.estilo = nz(r.estilo);
+      if (field === "produced" && !row.style_code) row.style_code = nz(r.estilo);
+      row[field] += Number(val) || 0;
+    };
+    for (const r of ordRes.rows) bump(r, "ordered", r.ordered);
+    for (const r of prodRows)    bump(r, "produced", r.produced);
+
+    // Scope al PO cliente de la lista (si tiene uno).
+    const wantMo = nz(list.mo);
+    let sizes = [...map.values()];
+    if (wantMo) {
+      const scoped = sizes.filter((s) => nz(s.mo) === wantMo);
+      if (scoped.length > 0) sizes = scoped;
+    }
+
+    sizes = sizes
+      .map((s) => {
+        // Capturas de esta talla, en orden cronológico, con el acumulado que
+        // llevaba después de cada una: así se lee "50 el lunes → 100 el viernes".
+        const raw = (entriesBy.get(key(s.size_code, s.color, s.mo)) || [])
+          .slice()
+          .sort((a, b) =>
+            String(a.day).localeCompare(String(b.day)) ||
+            String(a.at ?? "").localeCompare(String(b.at ?? ""))
+          );
+        let running = 0;
+        const entries = raw.map((e) => { running += e.qty; return { ...e, running }; });
+
+        return {
+          size_code: s.size_code,
+          size_label: sizeLabelOf(s.size_code),
+          color: s.color,
+          estilo: s.estilo,           // estilo cliente (work_order_lines)
+          style_code: s.style_code,   // tipo+modelo+correlativo (line_runs.style)
+          mo: s.mo,
+          ordered: Math.round(s.ordered),
+          produced: Math.round(s.produced),
+          remaining: Math.max(0, Math.round(s.ordered) - Math.round(s.produced)),
+          entries,
+        };
+      })
+      .sort((a, b) => String(a.color).localeCompare(String(b.color)) || String(a.size_code).localeCompare(String(b.size_code)));
+
+    const totals = sizes.reduce(
+      (t, s) => { t.ordered += s.ordered; t.produced += s.produced; t.remaining += s.remaining; return t; },
+      { ordered: 0, produced: 0, remaining: 0 }
+    );
+
+    // Días con producción por talla (para el selector de fecha).
+    let availableDays = [];
+    try {
+      const daysRes = await client.query(
+        `SELECT DISTINCT to_char(lr.run_date, 'YYYY-MM-DD') AS day
+           FROM ticket_prints tp
+           JOIN line_runs lr ON lr.id = tp.run_id
+          WHERE tp.work_order_id = $1 AND lr.run_date IS NOT NULL
+          ORDER BY day DESC`,
+        [list.work_order_id]
+      );
+      availableDays = daysRes.rows.map((r) => r.day);
+    } catch { /* sin tickets todavía */ }
+
+    res.json({ success: true, date: asOfDate, mo: list.mo, availableDays, sizes, totals, entriesMeta });
+  }));
+
   // (Re)build a draft list's boxes from its work order. Clears existing boxes
   // and regenerates one per size×color line — used to seed older lists or to
   // refresh after the order's lines changed.
@@ -549,10 +903,21 @@ function registerFinishedWarehouse(app, deps) {
     if (list.status !== "draft") { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "La lista ya fue confirmada" }); }
     if (!list.work_order_id) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "La lista no tiene una orden asociada" }); }
 
+    // Optional cut-off day: when sent, remember it on the list and regenerate the
+    // accumulated per-size production up to that day. When absent, keep whatever
+    // day the list already had.
+    const rawDate = String(req.body?.asOfDate ?? req.body?.date ?? "").trim();
+    let asOfDate = list.as_of_date ? String(list.as_of_date).slice(0, 10) : null;
+    if (rawDate !== "") {
+      asOfDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : null; // "" clears back to all-time
+      await client.query(`UPDATE pre_packing_lists SET as_of_date = $2, updated_at = now() WHERE id = $1`, [id, asOfDate]);
+      list.as_of_date = asOfDate;
+    }
+
     await client.query(`DELETE FROM pre_packing_boxes WHERE list_id = $1`, [id]);
-    const boxes = await generateBoxesFromOrder(client, list, list.mo);
+    const boxes = await generateBoxesFromOrder(client, list, list.mo, { asOfDate });
     await client.query("COMMIT");
-    res.json({ success: true, boxes, boxesGenerated: boxes.length });
+    res.json({ success: true, boxes, boxesGenerated: boxes.length, asOfDate });
   }));
 
   // Export a list's boxes as CSV (opens in Excel). One row per box.
@@ -639,6 +1004,11 @@ function registerFinishedWarehouse(app, deps) {
     const { customerId, workOrderId, notes } = req.body;
     if (!customerId) return res.status(400).json({ success: false, error: "Seleccione un cliente" });
 
+    // Día de la lista (acumulado por talla hasta este día). Formato 'YYYY-MM-DD';
+    // cualquier otra cosa => null (todo el tiempo).
+    const rawDate = String(req.body.asOfDate ?? req.body.date ?? "").trim();
+    const asOfDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : null;
+
     await client.query("BEGIN");
 
     const cRes = await client.query(`SELECT id, code, name FROM customers WHERE id = $1`, [customerId]);
@@ -662,18 +1032,18 @@ function registerFinishedWarehouse(app, deps) {
     for (const mo of mos) {
       const insRes = await client.query(
         `INSERT INTO pre_packing_lists
-           (customer_id, customer_code, customer_name, work_order_id, po, mo, notes, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           (customer_id, customer_code, customer_name, work_order_id, po, mo, notes, as_of_date, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          RETURNING *`,
-        [cust.id, cust.code, cust.name, woId, po, mo, notes || null, req.user?.id ?? null]
+        [cust.id, cust.code, cust.name, woId, po, mo, notes || null, asOfDate, req.user?.id ?? null]
       );
       const listRow = insRes.rows[0];
       const upd = await client.query(
         `UPDATE pre_packing_lists SET list_no = $2 WHERE id = $1 RETURNING *`,
         [listRow.id, `PP-${String(listRow.id).padStart(6, "0")}`]
       );
-      // Auto-fill this list from the order, scoped to its PO cliente.
-      const boxes = await generateBoxesFromOrder(client, upd.rows[0], mo);
+      // Auto-fill this list from the order, scoped to its PO cliente, acumulado a la fecha.
+      const boxes = await generateBoxesFromOrder(client, upd.rows[0], mo, { asOfDate });
       created.push({ list: upd.rows[0], boxesGenerated: boxes.length });
     }
 
