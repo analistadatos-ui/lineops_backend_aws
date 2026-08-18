@@ -66,6 +66,150 @@ const boxRegistryFor = (customerName) =>
   String(customerName ?? "").toUpperCase().includes("C&A") ? "NCA" : null;
 
 // ---------------------------------------------------------------------------
+// Escaneo de tickets (intake por escáner)
+// ---------------------------------------------------------------------------
+// El líder de línea imprime tickets cuyo QR trae TODA la información de ese
+// tanto de piezas. En el almacén, el operador escanea cada ticket físico y el
+// sistema registra lo que trae + la hora de escaneo. `parseTicketScan` acepta el
+// texto crudo que suelta el escáner (o la cámara) y lo normaliza.
+//
+// Formato principal (QR JSON, generado en LineLeaderPage.generateTickets):
+//   {"tn":"T-55-AB-3","wo":"WO-1234","style":"DAMCHA01","talla":"138",
+//    "label":"M","color":"NEG","po":"po-1","qty":50,"runId":55,"seq":3,
+//    "date":"2026-08-18"}
+// Formato alterno (QR de la etiqueta ZPL):
+//   WO:WO-1234|RUN:55|T:138|CLR:NEG|PO:po-1|Q:50|S:3/12
+const _s = (v) => { const t = String(v ?? "").trim(); return t.length ? t : null; };
+const _dateOrNull = (v) => {
+  const t = String(v ?? "").trim();
+  return /^\d{4}-\d{2}-\d{2}/.test(t) ? t.slice(0, 10) : null;
+};
+
+// Base32 (RFC 4648, sin relleno). Los QR nuevos vienen como "FGW1"+base32(JSON):
+// solo letras A-Z y dígitos 2-7, idénticos en cualquier distribución de teclado,
+// para que un lector configurado en otro idioma no corrompa el contenido.
+const _B32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function base32Decode(s) {
+  const map = {};
+  for (let i = 0; i < _B32_ALPHABET.length; i++) map[_B32_ALPHABET[i]] = i;
+  let bits = 0, value = 0;
+  const out = [];
+  for (const ch of String(s).toUpperCase()) {
+    if (!(ch in map)) continue;              // ignora cualquier caracter fuera del alfabeto
+    value = (value << 5) | map[ch];
+    bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 0xff); bits -= 8; }
+  }
+  return Buffer.from(out).toString("utf8");
+}
+
+// Normaliza el objeto del ticket (venga de JSON directo o de Base32).
+function _normalizeTicketObj(o, rawText) {
+  const runId = o.runId ?? o.run ?? null;
+  const seq = o.seq ?? null;
+  const ticketNo = _s(o.tn ?? o.ticketNo ?? o.ticket_no) ||
+    (runId != null && seq != null ? `T-${runId}-${seq}` : null);
+  return {
+    ticket_no: ticketNo,
+    work_order_no: _s(o.wo ?? o.workOrderNo ?? o.work_order_no),
+    customer_po: _s(o.po ?? o.customerPo ?? o.customer_po),
+    style: _s(o.style),
+    size_code: _s(o.talla ?? o.size ?? o.size_code),
+    size_label: _s(o.label ?? o.size_label) || sizeLabelOf(o.talla ?? o.size),
+    color: _s(o.color),
+    pieces: Math.max(0, Math.round(Number(o.qty ?? o.pieces) || 0)),
+    production_date: _dateOrNull(o.date ?? o.production_date),
+    run_id: runId != null ? (Number(runId) || null) : null,
+    seq: seq != null ? (Number(seq) || null) : null,
+    raw: rawText,
+  };
+}
+
+// Intento de rescate: tickets viejos con QR JSON leídos por un escáner con
+// distribución de teclado distinta llegan con signos cambiados (: -> Ñ, " -> [).
+// Revertimos esos cambios comunes y reintentamos. Solo se usa como último recurso
+// y solo si el resultado se parece a un ticket (trae wo/qty/talla).
+function _repairMangledJson(text) {
+  let s = String(text)
+    .replace(/[Ññ]/g, ":")
+    .replace(/[\[\]]/g, '"');
+  if (!s.trim().startsWith("{")) s = "{" + s.replace(/^[^{]*\{?/, "");
+  if (!s.trim().endsWith("}")) s = s.replace(/\}?[^}]*$/, "") + "}";
+  try {
+    const o = JSON.parse(s);
+    if (o && (o.wo || o.qty != null || o.talla)) return o;
+  } catch { /* no se pudo rescatar */ }
+  return null;
+}
+
+function parseTicketScan(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return null;
+
+  // 0) QR nuevo compacto, a prueba de teclado: "FGW2" + Base32(posicional "|").
+  //    Orden fijo: tn, wo, talla, color, po, qty, date, runId, seq.
+  if (/^FGW2[A-Z2-7]/i.test(text)) {
+    try {
+      const dec = base32Decode(text.slice(4));
+      const a = dec.split("|");
+      const o = {
+        tn: a[0], wo: a[1], talla: a[2], color: a[3], po: a[4],
+        qty: a[5], date: a[6], runId: a[7], seq: a[8],
+      };
+      return _normalizeTicketObj(o, text);
+    } catch { /* sigue a los demás formatos */ }
+  }
+
+  // 0b) QR anterior a prueba de teclado: "FGW1" + Base32(JSON).
+  if (/^FGW1[A-Z2-7]/i.test(text)) {
+    try {
+      const json = base32Decode(text.slice(4));
+      const o = JSON.parse(json);
+      return _normalizeTicketObj(o, text);
+    } catch { /* sigue a los demás formatos */ }
+  }
+
+  // 1) QR JSON directo (lo que devuelve la cámara, o tickets previos).
+  if (text.startsWith("{")) {
+    try {
+      return _normalizeTicketObj(JSON.parse(text), text);
+    } catch { /* no era JSON válido, seguimos al formato de tubería */ }
+  }
+
+  // 2) Formato de tubería de la etiqueta ZPL antigua (no trae estilo/fecha/número).
+  if (/(^|\|)\s*(WO|RUN|T|Q)\s*:/i.test(text)) {
+    const map = {};
+    for (const part of text.split("|")) {
+      const i = part.indexOf(":");
+      if (i > 0) map[part.slice(0, i).trim().toUpperCase()] = part.slice(i + 1).trim();
+    }
+    const clean = (v) => (v && v !== "-" ? v : null);
+    const runId = map.RUN ? (Number(map.RUN) || null) : null;
+    const seq = map.S ? (Number(String(map.S).split("/")[0]) || null) : null;
+    return {
+      ticket_no: runId != null && seq != null ? `T-${runId}-${seq}` : null,
+      work_order_no: clean(map.WO),
+      customer_po: clean(map.PO),
+      style: null,
+      size_code: clean(map.T),
+      size_label: sizeLabelOf(map.T),
+      color: clean(map.CLR),
+      pieces: Math.max(0, Math.round(Number(map.Q) || 0)),
+      production_date: null,
+      run_id: runId,
+      seq,
+      raw: text,
+    };
+  }
+
+  // 3) Último recurso: JSON viejo corrompido por el teclado (: -> Ñ, " -> [).
+  const repaired = _repairMangledJson(text);
+  if (repaired) return _normalizeTicketObj(repaired, text);
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Desglose de capturas (cuándo entró cada tanto de piezas)
 // ---------------------------------------------------------------------------
 // El acumulado por talla sale de sumar ticket_prints. Para que el operador vea
@@ -107,6 +251,31 @@ function timeColumnOf(cols) {
   for (const n of TIME_NAME_PREFERENCE) if (cols.has(n) && isTime(n)) return n;
   for (const n of cols.keys()) if (isTime(n)) return n;
   return null;
+}
+
+// Siguiente folio consecutivo para un prefijo (p. ej. "SKM" -> "SKM0001",
+// "SKM0002"…). Incremento atómico en ticket_folio_counters, así dos escaneos a
+// la vez nunca reciben el mismo número. Se siembra el contador desde el mayor
+// folio ya existente la primera vez, para no chocar con datos previos.
+async function nextFolio(client, prefix) {
+  const p = String(prefix || "TKT").toUpperCase();
+  const seedRes = await client.query(
+    `SELECT COALESCE(MAX((substring(folio from '^' || $1 || '([0-9]+)'))::int), 0) AS maxseq
+       FROM scanned_tickets WHERE folio LIKE $2`,
+    [p, `${p}%`]
+  );
+  const seed = Number(seedRes.rows[0]?.maxseq) || 0;
+
+  const up = await client.query(
+    `INSERT INTO ticket_folio_counters (prefix, last_no)
+       VALUES ($1, GREATEST($2, 0) + 1)
+     ON CONFLICT (prefix) DO UPDATE
+       SET last_no = GREATEST(ticket_folio_counters.last_no, $2) + 1
+     RETURNING last_no`,
+    [p, seed]
+  );
+  const n = Number(up.rows[0].last_no) || 1;
+  return `${p}${String(n).padStart(4, "0")}`;
 }
 
 // Número de línea de producción, ya sea en la corrida o en el propio ticket.
@@ -483,6 +652,50 @@ async function initSchema({ pool, setSchema }) {
     `);
     await client.query("CREATE INDEX IF NOT EXISTS idx_fim_list ON finished_inventory_movements(list_id);");
 
+    // Tickets escaneados en el almacén de producto terminado. Un renglón = un
+    // ticket físico escaneado. ticket_no es único para poder ignorar re-escaneos
+    // del mismo ticket (idempotente). scanned_at es la HORA DE ESCANEO (servidor).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS scanned_tickets(
+        id BIGSERIAL PRIMARY KEY,
+        ticket_no VARCHAR(80) UNIQUE,
+        work_order_no VARCHAR(60),
+        customer_po VARCHAR(60),
+        style VARCHAR(60),
+        size_code VARCHAR(20),
+        size_label VARCHAR(30),
+        color VARCHAR(60),
+        pieces NUMERIC(12,2) NOT NULL DEFAULT 0,
+        production_date DATE,
+        run_id BIGINT,
+        seq INT,
+        raw TEXT,
+        scanned_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        scanned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT chk_scan_pieces CHECK (pieces >= 0)
+      );
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_scan_wo ON scanned_tickets(work_order_no);");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_scan_at ON scanned_tickets(scanned_at DESC);");
+
+    // Folio de recepción (consecutivo tipo SKM0001, SKM0002…) + cliente. El folio
+    // se asigna al escanear; el cliente se resuelve desde la orden de trabajo.
+    // ADD COLUMN IF NOT EXISTS para actualizar bases ya creadas sin perder datos.
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS folio VARCHAR(30);");
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS customer_id BIGINT;");
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS customer_code VARCHAR(20);");
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS customer_name VARCHAR(150);");
+    await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_folio ON scanned_tickets(folio) WHERE folio IS NOT NULL;");
+
+    // Contador de folios por prefijo (p. ej. 'SKM'), incremento atómico para que
+    // dos escaneos simultáneos nunca tomen el mismo número.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ticket_folio_counters(
+        prefix VARCHAR(20) PRIMARY KEY,
+        last_no INT NOT NULL DEFAULT 0
+      );
+    `);
+
     console.log("✅ finished-warehouse tables ready in prod_db_schema");
   } finally {
     client.release();
@@ -681,6 +894,127 @@ function registerFinishedWarehouse(app, deps) {
     });
 
     res.json({ success: true, orders: result });
+  }));
+
+  // ======================================================================
+  //  ESCANEO DE TICKETS (intake por escáner en el almacén)
+  // ======================================================================
+
+  // Un ticket escaneado -> un renglón. El body puede traer:
+  //   { raw: "<texto tal cual salió del escáner>" }   (recomendado)
+  // o los campos ya decodificados por el cliente. El servidor decodifica el QR
+  // (JSON o formato de tubería ZPL), y guarda el ticket con la HORA DE ESCANEO.
+  // Es idempotente por ticket_no: re-escanear el mismo ticket NO duplica; regresa
+  // { duplicate: true } con el registro original.
+  app.post("/api/finished-warehouse/scan", authenticateToken, withClient(async (req, res, client) => {
+    const body = req.body || {};
+
+    // Aceptamos el texto crudo (lo normal) o un objeto ya parseado por el front.
+    const parsed = body.raw != null
+      ? parseTicketScan(body.raw)
+      : parseTicketScan(JSON.stringify(body));
+
+    if (!parsed || (!parsed.work_order_no && !parsed.ticket_no)) {
+      return res.status(400).json({ success: false, error: "No se pudo leer el ticket. Verifique el código QR." });
+    }
+
+    // Número impreso en el QR (T-…): sirve como llave para NO duplicar re-escaneos.
+    // Si el código no lo trae (formatos viejos), derivamos uno estable del contenido.
+    if (!parsed.ticket_no) {
+      const basis = [parsed.work_order_no, parsed.size_code, parsed.color, parsed.customer_po, parsed.run_id, parsed.seq]
+        .map((x) => String(x ?? "")).join("|");
+      let h = 0;
+      for (let i = 0; i < basis.length; i++) h = (h * 31 + basis.charCodeAt(i)) >>> 0;
+      parsed.ticket_no = `SCAN-${h.toString(36).toUpperCase()}`;
+    }
+
+    // ── Re-escaneo: si el mismo ticket ya se escaneó, devolvemos el original
+    //    (con su folio y cliente) y NO consumimos un folio nuevo. ────────────
+    const existing = await client.query(`SELECT * FROM scanned_tickets WHERE ticket_no = $1`, [parsed.ticket_no]);
+    if (existing.rows.length > 0) {
+      return res.json({ success: true, duplicate: true, ticket: existing.rows[0] });
+    }
+
+    // ── Cliente: se resuelve desde la orden de trabajo (wo = work_order_no). ──
+    let customer = { id: null, code: null, name: null };
+    if (parsed.work_order_no) {
+      const cRes = await client.query(
+        `SELECT wo.customer_id, wo.customer_name, c.code AS customer_code
+           FROM work_orders wo
+           LEFT JOIN customers c ON c.id = wo.customer_id
+          WHERE wo.work_order_no = $1
+          LIMIT 1`,
+        [parsed.work_order_no]
+      );
+      if (cRes.rows.length) {
+        customer = { id: cRes.rows[0].customer_id, code: cRes.rows[0].customer_code, name: cRes.rows[0].customer_name };
+      }
+    }
+
+    // ── Folio consecutivo (SKM0001, SKM0002…). El prefijo sale de las letras
+    //    iniciales del No. de orden (SKM0001-… → "SKM"); si no hay, usamos "TKT".
+    const folioPrefix = (String(parsed.work_order_no ?? "").match(/^[A-Za-z]+/)?.[0] || "TKT").toUpperCase();
+    const folio = await nextFolio(client, folioPrefix);
+
+    const ins = await client.query(
+      `INSERT INTO scanned_tickets
+         (folio, ticket_no, work_order_no, customer_id, customer_code, customer_name,
+          customer_po, style, size_code, size_label, color, pieces, production_date,
+          run_id, seq, raw, scanned_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       ON CONFLICT (ticket_no) DO NOTHING
+       RETURNING *`,
+      [
+        folio, parsed.ticket_no, parsed.work_order_no, customer.id, customer.code, customer.name,
+        parsed.customer_po, parsed.style, parsed.size_code, parsed.size_label, parsed.color,
+        parsed.pieces, parsed.production_date, parsed.run_id, parsed.seq, parsed.raw, req.user?.id ?? null,
+      ]
+    );
+
+    if (ins.rows.length > 0) {
+      return res.json({ success: true, duplicate: false, ticket: ins.rows[0] });
+    }
+
+    // Carrera rarísima (dos escaneos idénticos a la vez): devolvemos el que ganó.
+    const prev = await client.query(`SELECT * FROM scanned_tickets WHERE ticket_no = $1`, [parsed.ticket_no]);
+    return res.json({ success: true, duplicate: true, ticket: prev.rows[0] || null });
+  }));
+
+  // Lista de tickets escaneados (más reciente primero) + totales. Filtros
+  // opcionales: q (texto), workOrder (No. de orden), po, date (YYYY-MM-DD).
+  app.get("/api/finished-warehouse/scanned-tickets", authenticateToken, withClient(async (req, res, client) => {
+    const { q, workOrder, po, date } = req.query;
+    const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit, 10) || 300));
+    const params = [];
+    let where = "WHERE 1=1";
+    if (workOrder) { params.push(workOrder); where += ` AND work_order_no = $${params.length}`; }
+    if (po)        { params.push(po);        where += ` AND customer_po = $${params.length}`; }
+    if (date && /^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+      params.push(date); where += ` AND scanned_at::date = $${params.length}::date`;
+    }
+    if (q) {
+      params.push(`%${q}%`);
+      where += ` AND (ticket_no ILIKE $${params.length} OR work_order_no ILIKE $${params.length}
+                   OR customer_po ILIKE $${params.length} OR color ILIKE $${params.length}
+                   OR style ILIKE $${params.length})`;
+    }
+    params.push(limit);
+    const { rows } = await client.query(
+      `SELECT * FROM scanned_tickets ${where} ORDER BY scanned_at DESC LIMIT $${params.length}`, params
+    );
+    const totals = rows.reduce(
+      (t, r) => { t.tickets += 1; t.pieces += Number(r.pieces) || 0; return t; },
+      { tickets: 0, pieces: 0 }
+    );
+    res.json({ success: true, tickets: rows, totals });
+  }));
+
+  // Deshacer un escaneo (p. ej. un ticket escaneado por error).
+  app.delete("/api/finished-warehouse/scanned-tickets/:id", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    const del = await client.query(`DELETE FROM scanned_tickets WHERE id = $1 RETURNING id`, [id]);
+    if (del.rows.length === 0) return res.status(404).json({ success: false, error: "Ticket no encontrado" });
+    res.json({ success: true });
   }));
 
   // ======================================================================
