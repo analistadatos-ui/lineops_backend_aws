@@ -540,7 +540,57 @@ await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_status ON work_or
 await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_wo_no ON work_orders(work_order_no);");
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_line ON line_assignments(line_no, assigned_date);");
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_work_order ON line_assignments(work_order_id);");
-
+// ---- One work-order+color = one cell per line-day ---------------------------
+// A single (work_order, line, day, color) must live in ONE planned row. Before
+// this rule existed, repeated packing could leave several slivers of the same
+// order+color stacked in one cell (e.g. 386 + 21 + 11). Collapse any such
+// leftovers into a single row (summing the pieces), then add a partial unique
+// index so fragments can never reappear. Only 'planned' rows are touched;
+// completed/cancelled history is left exactly as it is.
+// NOTE: runMigrations() already wraps this whole block in one transaction, so
+// these run atomically — no local BEGIN/COMMIT (that would close the outer tx).
+//
+// Sum every duplicate group into its oldest row...
+await client.query(`
+  WITH dups AS (
+    SELECT MIN(id) AS keep_id,
+           SUM(assigned_quantity) AS total_qty,
+           MIN(planned_start_date) AS start_d,
+           MAX(planned_end_date)   AS end_d
+      FROM line_assignments
+     WHERE status = 'planned'
+     GROUP BY work_order_id, line_no, assigned_date, COALESCE(color, '')
+    HAVING COUNT(*) > 1
+  )
+  UPDATE line_assignments la
+     SET assigned_quantity  = d.total_qty,
+         planned_start_date = COALESCE(d.start_d, la.planned_start_date),
+         planned_end_date   = COALESCE(d.end_d,   la.planned_end_date),
+         updated_at = now()
+    FROM dups d
+   WHERE la.id = d.keep_id;
+`);
+// ...then drop the now-redundant slivers (everything but the oldest per group).
+await client.query(`
+  DELETE FROM line_assignments la
+   USING (
+     SELECT id,
+            ROW_NUMBER() OVER (
+              PARTITION BY work_order_id, line_no, assigned_date, COALESCE(color, '')
+              ORDER BY id
+            ) AS rn
+       FROM line_assignments
+      WHERE status = 'planned'
+   ) r
+   WHERE la.id = r.id AND r.rn > 1;
+`);
+// Backstop: at most one planned row per work-order+line+day+color from now on.
+await client.query(
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_line_assign_planned_cell
+     ON line_assignments (work_order_id, line_no, assigned_date, (COALESCE(color, '')))
+   WHERE status = 'planned';`
+);
+console.log("✅ line_assignments consolidated to one planned row per cell (wo+line+day+color)");
 // ── INSERTAR AQUÍ ─────────────────────────────────────────────────────────
 // line_runs.work_order_id se INSERTA en /api/save-production pero nunca se creo
 // en el CREATE TABLE de arriba. Sin esta columna resolveProducedSubquery no
@@ -5129,118 +5179,6 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
 });
 
 
-
-
-/**
- * POST /api/line-assignments
- * Assigns a quantity of a work order to a production line on a given date.
- * Uses the work order's own SAM (set from its master code, if one was
- * selected) rather than the line's generic SAM, so the day/rate math
- * reflects the actual style being produced.
- */
-app.post("/api/line-assignments", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await setSchema(client);
-    await client.query("BEGIN");
-
-    const { workOrderId, lineNo, assignedDate, quantity, plannedStartDate,color  } = req.body;
-
-    if (!workOrderId || !lineNo || !assignedDate || !quantity || parseFloat(quantity) <= 0) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ success: false, error: "workOrderId, lineNo, assignedDate and a positive quantity are required" });
-    }
-
-    const woResult = await client.query(
-      "SELECT id, total_to_produce, sam_minutes FROM work_orders WHERE id = $1",
-      [parseInt(workOrderId)]
-    );
-    if (woResult.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ success: false, error: "Work order not found" });
-    }
-    const workOrder = woResult.rows[0];
-
-    const { lines } = await getLineCapacityForDate(client, assignedDate);
-    const lineData = lines.find((l) => l.line_no === lineNo);
-    if (!lineData) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ success: false, error: `No capacity configuration found for line ${lineNo}` });
-    }
-
-    // Prefer the work order's own SAM (from its master code) over the line's generic SAM
-    const samMinutes = parseFloat(workOrder.sam_minutes) || parseFloat(lineData.sam_minutes) || 3.5;
-    const operators = parseInt(lineData.operators_count) || 20;
-    const workingHours = parseFloat(lineData.working_hours) || 8;
-    const efficiency = parseFloat(lineData.efficiency) || 0.85;
-
-    const dailyAvailableMinutes = operators * workingHours * 60;
-    const effectiveDailyMinutes = dailyAvailableMinutes * efficiency;
-    const piecesPerDay = effectiveDailyMinutes / samMinutes;
-
-    const qty = parseFloat(quantity);
-    const totalMinutesNeeded = qty * samMinutes;
-    const daysNeeded = Math.ceil(totalMinutesNeeded / effectiveDailyMinutes);
-
-    const startDate = plannedStartDate || assignedDate;
-    const endDateObj = new Date(startDate);
-    endDateObj.setDate(endDateObj.getDate() + daysNeeded);
-    const plannedEndDate = endDateObj.toISOString().slice(0, 10);
-
-    // Guard against double-booking beyond the line's daily target for that date
-    const alreadyAssignedResult = await client.query(
-      `SELECT COALESCE(SUM(assigned_quantity), 0) as total FROM line_assignments
-       WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
-      [lineNo, assignedDate]
-    );
-    const alreadyAssigned = parseFloat(alreadyAssignedResult.rows[0].total) || 0;
-    const availableCapacity = Math.max(0, parseFloat(lineData.target_pcs) - alreadyAssigned);
-    if (qty > availableCapacity) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({
-        success: false,
-        error: `Line ${lineNo} only has capacity for ${Math.floor(availableCapacity)} pieces on ${assignedDate}`,
-      });
-    }
-
-    const result = await client.query(
-      `INSERT INTO line_assignments (
-        work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
-        available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'planned', $10)
-      RETURNING *`,
-      [
-        parseInt(workOrderId),
-        lineData.id || null,
-        lineNo,
-        assignedDate,
-        qty,
-        effectiveDailyMinutes,
-        piecesPerDay,
-        startDate,
-        plannedEndDate,
-        color || null
-      ]
-    );
-
-    // Move the work order out of 'pending' now that it has at least one assignment
-    await client.query(
-      "UPDATE work_orders SET status = CASE WHEN status = 'pending' THEN 'assigned' ELSE status END, updated_at = NOW() WHERE id = $1",
-      [parseInt(workOrderId)]
-    );
-
-    await client.query("COMMIT");
-
-    res.json({ success: true, message: "Line assignment created", assignment: result.rows[0] });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("❌ Error creating line assignment:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    client.release();
-  }
-});
 
 app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
   const client = await pool.connect();
