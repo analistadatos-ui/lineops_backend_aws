@@ -5077,6 +5077,53 @@ app.get("/api/planning/dashboard", authenticateToken, async (req, res) => {
 /**
  * GET /api/line-assignments?workOrderId=123
  */
+
+/**
+ * GET /api/line-assignments?workOrderId=123
+ */
+app.get("/api/line-assignments", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { workOrderId, lineNo, date } = req.query;
+
+    let query = `
+      SELECT la.*,
+             wo.work_order_no,
+             wo.style_description,
+             wo.customer_name
+        FROM line_assignments la
+        JOIN work_orders wo ON wo.id = la.work_order_id
+       WHERE 1=1`;
+    const params = [];
+    let paramIndex = 1;
+ 
+    if (workOrderId) {
+      query += ` AND la.work_order_id = $${paramIndex++}`;
+      params.push(parseInt(workOrderId));
+    }
+    if (lineNo) {
+      query += ` AND la.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+    if (date) {
+      query += ` AND la.assigned_date = $${paramIndex++}`;
+      params.push(date);
+    }
+    query += " ORDER BY la.created_at DESC";
+
+    const result = await client.query(query, params);
+    res.json({ success: true, assignments: result.rows });
+  } catch (err) {
+    console.error("❌ Error fetching line assignments:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+
 app.post("/api/line-assignments", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
