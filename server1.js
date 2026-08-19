@@ -1819,16 +1819,20 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
       const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
 
-      const ins = await client.query(
-        `INSERT INTO line_assignments
-           (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
-            available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $4, $4, $9, $8)
-         RETURNING *`,
-        [workOrderId, lineData.id || null, String(lineNo), dayStr, chunk,
-         effectiveDailyMinutes, piecesPerDay, color, status]
-      );
-      createdRows.push(ins.rows[0]);
+      const row = await mergeOrInsertAssignment(client, {
+        workOrderId,
+        lineRunId: lineData.id || null,
+        lineNo: String(lineNo),
+        assignedDate: dayStr,
+        quantity: chunk,
+        availableMinutes: effectiveDailyMinutes,
+        requiredRate: piecesPerDay,
+        startDate: dayStr,
+        endDate: dayStr,
+        status,
+        color,
+      });
+      createdRows.push(row);
       remaining -= chunk;
       dayStr = addDaysStr(dayStr, 1);
     }
@@ -1856,7 +1860,6 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     client.release();
   }
 });
-
 
 // ---------------------------------------------------------------------------
 // POST /api/line-assignments/move-batch
@@ -1960,16 +1963,20 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
         const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
         const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
 
-        const ins = await client.query(
-          `INSERT INTO line_assignments
-             (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
-              available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $4, $4, $9, $8)
-           RETURNING *`,
-          [workOrderId, lineData.id || null, String(lineNo), dayStr, chunk,
-           effectiveDailyMinutes, piecesPerDay, color, status]
-        );
-        createdRows.push(ins.rows[0]);
+        const row = await mergeOrInsertAssignment(client, {
+          workOrderId,
+          lineRunId: lineData.id || null,
+          lineNo: String(lineNo),
+          assignedDate: dayStr,
+          quantity: chunk,
+          availableMinutes: effectiveDailyMinutes,
+          requiredRate: piecesPerDay,
+          startDate: dayStr,
+          endDate: dayStr,
+          status,
+          color,
+        });
+        createdRows.push(row);
         remaining -= chunk;
         dayStr = addDaysStr(dayStr, 1);
       }
@@ -4948,57 +4955,101 @@ app.get("/api/planning/dashboard", authenticateToken, async (req, res) => {
 /**
  * GET /api/line-assignments?workOrderId=123
  */
-app.get("/api/line-assignments", authenticateToken, async (req, res) => {
+app.post("/api/line-assignments", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
-    const { workOrderId, lineNo, date } = req.query;
+    await client.query("BEGIN");
 
-    let query = `
-      SELECT la.id,
-             la.work_order_id,
-             la.line_run_id,
-             la.line_no,
-             to_char(la.assigned_date, 'YYYY-MM-DD')       AS assigned_date,
-             la.assigned_quantity,
-             la.available_minutes,
-             la.required_production_rate,
-             to_char(la.planned_start_date, 'YYYY-MM-DD')  AS planned_start_date,
-             to_char(la.planned_end_date, 'YYYY-MM-DD')    AS planned_end_date,
-             la.priority,
-             la.status,
-             la.color,
-             la.produced_quantity,
-             la.completed_at,
-             la.created_at,
-             la.updated_at,
-             wo.work_order_no,
-             wo.style_description,
-             wo.customer_name
-        FROM line_assignments la
-        JOIN work_orders wo ON wo.id = la.work_order_id
-       WHERE 1=1`;
-    const params = [];
-    let paramIndex = 1;
- 
-    if (workOrderId) {
-      query += ` AND la.work_order_id = $${paramIndex++}`;
-      params.push(parseInt(workOrderId));
-    }
-    if (lineNo) {
-      query += ` AND la.line_no = $${paramIndex++}`;
-      params.push(lineNo);
-    }
-    if (date) {
-      query += ` AND la.assigned_date = $${paramIndex++}`;
-      params.push(date);
-    }
-    query += " ORDER BY la.created_at DESC";
+    const { workOrderId, lineNo, assignedDate, quantity, plannedStartDate,color  } = req.body;
 
-    const result = await client.query(query, params);
-    res.json({ success: true, assignments: result.rows });
+    if (!workOrderId || !lineNo || !assignedDate || !quantity || parseFloat(quantity) <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: "workOrderId, lineNo, assignedDate and a positive quantity are required" });
+    }
+
+    const woResult = await client.query(
+      "SELECT id, total_to_produce, sam_minutes FROM work_orders WHERE id = $1",
+      [parseInt(workOrderId)]
+    );
+    if (woResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Work order not found" });
+    }
+    const workOrder = woResult.rows[0];
+
+    const { lines } = await getLineCapacityForDate(client, assignedDate);
+    const lineData = lines.find((l) => l.line_no === lineNo);
+    if (!lineData) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: `No capacity configuration found for line ${lineNo}` });
+    }
+
+    // Prefer the work order's own SAM (from its master code) over the line's generic SAM
+    const samMinutes = parseFloat(workOrder.sam_minutes) || parseFloat(lineData.sam_minutes) || 3.5;
+    const operators = parseInt(lineData.operators_count) || 20;
+    const workingHours = parseFloat(lineData.working_hours) || 8;
+    const efficiency = parseFloat(lineData.efficiency) || 0.85;
+
+    const dailyAvailableMinutes = operators * workingHours * 60;
+    const effectiveDailyMinutes = dailyAvailableMinutes * efficiency;
+    const piecesPerDay = effectiveDailyMinutes / samMinutes;
+
+    const qty = parseFloat(quantity);
+    const totalMinutesNeeded = qty * samMinutes;
+    const daysNeeded = Math.ceil(totalMinutesNeeded / effectiveDailyMinutes);
+
+    const startDate = plannedStartDate || assignedDate;
+    const endDateObj = new Date(startDate);
+    endDateObj.setDate(endDateObj.getDate() + daysNeeded);
+    const plannedEndDate = endDateObj.toISOString().slice(0, 10);
+
+    // Guard against double-booking beyond the line's daily target for that date
+    const alreadyAssignedResult = await client.query(
+      `SELECT COALESCE(SUM(assigned_quantity), 0) as total FROM line_assignments
+       WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
+      [lineNo, assignedDate]
+    );
+    const alreadyAssigned = parseFloat(alreadyAssignedResult.rows[0].total) || 0;
+    const availableCapacity = Math.max(0, parseFloat(lineData.target_pcs) - alreadyAssigned);
+    if (qty > availableCapacity) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        error: `Line ${lineNo} only has capacity for ${Math.floor(availableCapacity)} pieces on ${assignedDate}`,
+      });
+    }
+
+    // One planned row per (work_order, line, day, color): if this cell already
+    // holds pieces of the same order+color, add to that row instead of stacking
+    // a second sliver. Spilling to the next day still happens upstream, since
+    // the caller only sends what fits in this day's remaining capacity.
+    const assignment = await mergeOrInsertAssignment(client, {
+      workOrderId: parseInt(workOrderId),
+      lineRunId: lineData.id || null,
+      lineNo,
+      assignedDate,
+      quantity: qty,
+      availableMinutes: effectiveDailyMinutes,
+      requiredRate: piecesPerDay,
+      startDate,
+      endDate: plannedEndDate,
+      status: "planned",
+      color: color || null,
+    });
+
+    // Move the work order out of 'pending' now that it has at least one assignment
+    await client.query(
+      "UPDATE work_orders SET status = CASE WHEN status = 'pending' THEN 'assigned' ELSE status END, updated_at = NOW() WHERE id = $1",
+      [parseInt(workOrderId)]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({ success: true, message: "Line assignment created", assignment });
   } catch (err) {
-    console.error("❌ Error fetching line assignments:", err.message);
+    await client.query("ROLLBACK");
+    console.error("❌ Error creating line assignment:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
