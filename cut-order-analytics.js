@@ -4,13 +4,31 @@
 // merchant-analytics.js, feeding CutOrderAnalytics.jsx from /api/cut-orders/analytics.
 //
 // It answers, on one screen, the questions the cutting floor cares about:
-//   • status of every corte (pendiente / en proceso / terminada / cancelada)
+//   • the ETAPA of every corte (planeación / corte / verificación / terminada)
 //   • how many órdenes de corte were created and how many piezas they carry
 //   • which tallas are actually being cut, and how many piezas per talla
 //   • how many marcadas (trazos) each corte carries, and how many are cerradas
 //
-// The heavy lifting (marcadas, size_progress, tallas) lives in JSONB columns,
-// so the date-range fetch is done in SQL and the per-order roll-ups in JS.
+// ETAPAS (derived here, never stored) ---------------------------------------
+//   planning      sin marcadas todavía — el planner aún no arma los trazos
+//   ready         marcadas listas, nada cortado — el corte no ha empezado
+//   cutting       hay piezas cortadas y todavía falta
+//   verification  ya se cortó todo pero NADIE lo ha verificado
+//   verified      verificación exitosa → esta es la única etapa "terminada"
+//   cancelled     corte cancelado
+//
+// A corte NO cuenta como terminado sólo porque el cortador capturó todas las
+// piezas: cuenta cuando `verified_at` tiene fecha. Mientras esa columna no
+// exista (o esté vacía), los cortes con status 'completed' caen en
+// `verification` — que es exactamente la verdad: cortados, sin verificar.
+//
+// La columna se detecta en caliente, así que este módulo NO truena si todavía
+// no corres la migración; simplemente todo lo cortado se queda en "Por
+// verificar" hasta que exista `verified_at` y alguien firme.
+//
+// MIGRACIÓN (en cut-orders.js → initSchema):
+//   ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
+//   ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS verified_by VARCHAR(100);
 //
 // WIRING in server.js — mirror the cut-orders lines already there:
 //
@@ -26,9 +44,13 @@
 
 // Roles allowed to see the executive cut board. Matches the broad exec set used
 // elsewhere in the app; trim it if the cutting board should be narrower.
-const ALLOWED_ROLES = ['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'admin', 'planner','corte'];
+// 'corte' is here so the cutting floor's own Dashboard tab can read it.
+const ALLOWED_ROLES = ['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'admin', 'planner', 'corte'];
 
 const STATUSES = ['pending', 'in_progress', 'completed', 'cancelled'];
+
+// Order matters: this is the order the board draws them in, left to right.
+const STAGES = ['planning', 'ready', 'cutting', 'verification', 'verified', 'cancelled'];
 
 // Garment tallas don't sort alphabetically (XL > L, 2 < 10). Give the common
 // alpha sizes a fixed rank; anything numeric sorts by its number after them;
@@ -78,17 +100,69 @@ function remainingOf(row, sp, cut, planned) {
   return Math.max(planned - cut, 0);
 }
 
-// A marcada is "cerrada" when the corte is completed, or (when the cutter tracks
-// per-talla progress) when every talla the marcada touches has nothing left to cut.
-function markerDone(marker, spByTalla, status) {
-  if (status === 'completed') return true;
-  if (status === 'cancelled') return false;
+// A marcada is "cerrada" when the supervisor ticked it in CutVerification
+// (marker.done), when the corte is verified, or — para marcadas viejas sin el
+// flag — when every talla que toca ya no tiene nada por cortar.
+function markerDone(marker, spByTalla, stage) {
+  if (stage === 'cancelled') return false;
+  // Si la marcada trae el flag, ESE es el dato: lo escribe el supervisor en
+  // CutVerification y nada más. Inferir "cerrada" desde size_progress cuando el
+  // flag dice false es lo que hacía ver 2/2 marcadas en cortes que nadie firmó
+  // (el size_progress venía inflado por el bug viejo de CutPlanning).
+  if (marker && typeof marker.done === 'boolean') return marker.done;
+  if (stage === 'verified') return true;
+  // Sólo para marcadas legacy sin el campo `done`.
   const lines = asArray(marker.lines);
   if (!lines.length || !spByTalla) return false;
   return lines.every((l) => {
     const rec = spByTalla[String(l.talla || '').trim().toUpperCase()];
     return rec && num(rec.remaining) <= 0 && num(rec.amountCut) > 0;
   });
+}
+
+// Where in the flow this corte actually sits. Cutting being finished is NOT the
+// same as the corte being done — that needs the verification sign-off.
+//
+// La firma se reconoce de dos formas, y cualquiera basta:
+//   • verified_at   — el supervisor cerró el corte con PATCH /verify (trae quién
+//                     y cuándo), o
+//   • todas las marcadas con done: true — el supervisor las verificó una por una
+//                     en CutVerification. Este flag SÓLO lo escribe esa pantalla:
+//                     CutPlanning crea las marcadas en done: false y muestra las
+//                     verificadas bloqueadas, así que es una firma legítima.
+// Sin la segunda regla, todo corte verificado antes de que existiera
+// verified_at se quedaba atorado en "Por verificar".
+function stageOf({ row, markers, planned, cut, remaining, status }) {
+  if (status === 'cancelled') return 'cancelled';
+  if (row.verified_at) return 'verified';
+  if (markers.length > 0 && markers.every((m) => m && m.done === true)) return 'verified';
+
+  const cutFinished = planned > 0 ? cut >= planned : (cut > 0 && remaining <= 0);
+  // Legacy rows: the old /cutting PATCH stamped 'completed' with no verification,
+  // so they belong in "por verificar", not in "terminada".
+  if (cutFinished || status === 'completed') return 'verification';
+
+  // 'En corte' se gana con piezas, no con el status: una orden marcada
+  // in_progress sin nada cortado sigue siendo trabajo del planner.
+  if (cut > 0) return 'cutting';
+  return markers.length ? 'ready' : 'planning';
+}
+
+// Does cut_orders actually have the verification columns yet? Cached per process
+// so we ask the catalog once, not on every request.
+let VERIFY_COLS = null;
+async function hasVerifyCols(client) {
+  if (VERIFY_COLS !== null) return VERIFY_COLS;
+  const { rows } = await client.query(`
+    SELECT 1
+      FROM information_schema.columns
+     WHERE table_name = 'cut_orders'
+       AND column_name = 'verified_at'
+       AND table_schema = ANY (current_schemas(false))
+     LIMIT 1
+  `);
+  VERIFY_COLS = rows.length > 0;
+  return VERIFY_COLS;
 }
 
 function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) {
@@ -105,12 +179,20 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       const startDate = req.query.startDate || today;
       const endDate = req.query.endDate || startDate;
       const statusFilter = req.query.status && req.query.status !== 'all' ? req.query.status : null;
+      // Etapa is derived in JS, so it filters the rows after the fetch.
+      const stageFilter = STAGES.includes(req.query.stage) ? req.query.stage : null;
+      const slim = req.query.slim === '1';
 
       const params = [startDate, endDate];
       let where = 'co.cut_date BETWEEN $1 AND $2';
       if (statusFilter) { params.push(statusFilter); where += ` AND co.status = $${params.length}`; }
 
-      const { rows } = await client.query(`
+      const verified = await hasVerifyCols(client);
+      const verifiedSelect = verified
+        ? `co.verified_at, co.verified_by,`
+        : `NULL::timestamptz AS verified_at, NULL::text AS verified_by,`;
+
+      const { rows: allRows } = await client.query(`
         SELECT co.id,
                co.work_order_id,
                to_char(co.cut_date, 'YYYY-MM-DD') AS cut_date,
@@ -120,6 +202,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
                co.panels,
                co.total_length,
                co.status,
+               ${verifiedSelect}
                co.fabric,
                co.fabric_code,
                COALESCE(co.color, wo.color)      AS color,
@@ -137,24 +220,51 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
          ORDER BY co.cut_date DESC, co.created_at DESC
       `, params);
 
+      // Etapa filter: work out the stage first, then drop what wasn't asked for,
+      // so every roll-up below describes exactly the same set of cortes.
+      const prepared = allRows.map((row) => {
+        const sp = asArray(row.size_progress);
+        const markers = asArray(row.markers);
+        const planned = num(row.quantity);
+        const cut = cutOf(row, sp);
+        const remaining = remainingOf(row, sp, cut, planned);
+        const status = row.status || 'pending';
+        const stage = stageOf({ row, markers, planned, cut, remaining, status });
+        return { row, sp, markers, planned, cut, remaining, status, stage };
+      });
+      const rows = stageFilter ? prepared.filter((r) => r.stage === stageFilter) : prepared;
+
       // ---- Roll-ups --------------------------------------------------------
       const summary = {
         total_orders: rows.length,
         total_quantity: 0,
         total_cut: 0,
         total_remaining: 0,
+        // Piezas cortadas de MÁS contra el plan (sobrantes de marcada).
+        total_over: 0,
         total_length: 0,
+        // raw status counters (kept for anything still reading them)
         pending_orders: 0,
         in_progress_orders: 0,
         completed_orders: 0,
         cancelled_orders: 0,
+        // stage counters — these are the ones the board shows
+        planning_orders: 0,
+        ready_orders: 0,
+        cutting_orders: 0,
+        verification_orders: 0,
+        verified_orders: 0,
+        // piezas waiting on a verification sign-off
+        verification_quantity: 0,
         total_marcadas: 0,
         completed_marcadas: 0,
         tallas: 0,
         fabrics_count: 0,
+        verification_enabled: verified,
       };
 
       const byStatus = Object.fromEntries(STATUSES.map((s) => [s, { status: s, orders: 0, quantity: 0, cut: 0 }]));
+      const byStage = Object.fromEntries(STAGES.map((s) => [s, { stage: s, orders: 0, quantity: 0, cut: 0, remaining: 0, over: 0 }]));
       const byTalla = new Map();   // talla -> { talla, planned, cut, remaining, orders }
       const byFabric = new Map();  // name|code -> { fabric, fabric_code, orders, quantity, length }
       const byDay = new Map();     // day -> { day, orders, quantity, cut }
@@ -162,25 +272,31 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       const fabricSet = new Set();
       const detail = [];
 
-      for (const row of rows) {
-        const sp = asArray(row.size_progress);
-        const markers = asArray(row.markers);
-        const planned = num(row.quantity);
-        const cut = cutOf(row, sp);
-        const remaining = remainingOf(row, sp, cut, planned);
-        const status = row.status || 'pending';
-
+      for (const { row, sp, markers, planned, cut, remaining, status, stage } of rows) {
         summary.total_quantity += planned;
         summary.total_cut += cut;
         summary.total_remaining += remaining;
+        const over = Math.max(cut - planned, 0);
+        summary.total_over += over;
         summary.total_length += num(row.total_length);
         summary[`${status}_orders`] != null && (summary[`${status}_orders`] += 1);
+        summary[`${stage}_orders`] != null && (summary[`${stage}_orders`] += 1);
+        if (stage === 'verification') summary.verification_quantity += cut;
 
         // Status roll-up
         if (byStatus[status]) {
           byStatus[status].orders += 1;
           byStatus[status].quantity += planned;
           byStatus[status].cut += cut;
+        }
+
+        // Stage roll-up
+        if (byStage[stage]) {
+          byStage[stage].orders += 1;
+          byStage[stage].quantity += planned;
+          byStage[stage].cut += cut;
+          byStage[stage].remaining += remaining;
+          byStage[stage].over += over;
         }
 
         // Per-talla plan/cut. size_progress is the source of truth when present;
@@ -198,8 +314,8 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
             if (!t) continue;
             const q = num(r.quantity), c = num(r.amountCut);
             const rem = r.remaining != null && r.remaining !== '' ? Math.max(num(r.remaining), 0) : Math.max(q - c, 0);
-            const cur = tallaPlan.get(t) || { planned: 0, cut: 0, remaining: 0 };
-            cur.planned += q; cur.cut += c; cur.remaining += rem;
+            const cur = tallaPlan.get(t) || { planned: 0, cut: 0, remaining: 0, over: 0 };
+            cur.planned += q; cur.cut += c; cur.remaining += rem; cur.over += Math.max(c - q, 0);
             tallaPlan.set(t, cur);
           }
         } else {
@@ -207,7 +323,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
             for (const l of asArray(m.lines)) {
               const t = String(l.talla || '').trim().toUpperCase();
               if (!t) continue;
-              const cur = tallaPlan.get(t) || { planned: 0, cut: 0, remaining: 0 };
+              const cur = tallaPlan.get(t) || { planned: 0, cut: 0, remaining: 0, over: 0 };
               cur.planned += num(l.pieces);
               tallaPlan.set(t, cur);
             }
@@ -216,13 +332,14 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         const orderTallas = [...tallaPlan.keys()].sort(cmpTalla);
         for (const [t, v] of tallaPlan) {
           tallaSet.add(t);
-          const cur = byTalla.get(t) || { talla: t, planned: 0, cut: 0, remaining: 0, orders: 0 };
-          cur.planned += v.planned; cur.cut += v.cut; cur.remaining += v.remaining; cur.orders += 1;
+          const cur = byTalla.get(t) || { talla: t, planned: 0, cut: 0, remaining: 0, over: 0, orders: 0 };
+          cur.planned += v.planned; cur.cut += v.cut; cur.remaining += v.remaining;
+          cur.over += v.over || 0; cur.orders += 1;
           byTalla.set(t, cur);
         }
 
         // Marcadas
-        const marcadasDone = markers.reduce((s, m) => s + (markerDone(m, spByTalla, status) ? 1 : 0), 0);
+        const marcadasDone = markers.reduce((s, m) => s + (markerDone(m, spByTalla, stage) ? 1 : 0), 0);
         summary.total_marcadas += markers.length;
         summary.completed_marcadas += marcadasDone;
 
@@ -237,36 +354,47 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         byFabric.set(fabricKey, f);
 
         // Per-day
-        const d = byDay.get(row.cut_date) || { day: row.cut_date, orders: 0, quantity: 0, cut: 0 };
-        d.orders += 1; d.quantity += planned; d.cut += cut;
+        const d = byDay.get(row.cut_date) || { day: row.cut_date, orders: 0, quantity: 0, cut: 0, remaining: 0, over: 0 };
+        d.orders += 1; d.quantity += planned; d.cut += cut; d.remaining += remaining; d.over += over;
         byDay.set(row.cut_date, d);
 
-        detail.push({
-          id: row.id,
-          work_order_no: row.work_order_no,
-          customer_name: row.customer_name,
-          customer_po: row.customer_po,
-          style: row.style_no || row.style_description || null,
-          cut_date: row.cut_date,
-          fabric: fabricName,
-          fabric_code: fabricCode || null,
-          color: row.color || null,
-          quantity: planned,
-          amount_cut: cut,
-          remaining,
-          status,
-          panels: row.panels != null ? num(row.panels) : null,
-          marcadas: markers.length,
-          marcadas_done: marcadasDone,
-          tallas: orderTallas,
-          progress: planned > 0 ? Math.min(Math.round((cut / planned) * 100), 100) : (cut > 0 ? 100 : 0),
-        });
+        if (!slim) {
+          detail.push({
+            id: row.id,
+            work_order_no: row.work_order_no,
+            customer_name: row.customer_name,
+            customer_po: row.customer_po,
+            style: row.style_no || row.style_description || null,
+            cut_date: row.cut_date,
+            fabric: fabricName,
+            fabric_code: fabricCode || null,
+            color: row.color || null,
+            quantity: planned,
+            amount_cut: cut,
+            remaining,
+            over,
+            status,
+            stage,
+            verified_at: row.verified_at || null,
+            verified_by: row.verified_by || null,
+            panels: row.panels != null ? num(row.panels) : null,
+            marcadas: markers.length,
+            marcadas_done: marcadasDone,
+            tallas: orderTallas,
+            progress: planned > 0 ? Math.min(Math.round((cut / planned) * 100), 100) : (cut > 0 ? 100 : 0),
+          });
+        }
       }
 
       summary.tallas = tallaSet.size;
       summary.fabrics_count = fabricSet.size;
+      // Piezas cortadas contra lo planeado (avance del corte).
       summary.progress = summary.total_quantity > 0
         ? Math.min(Math.round((summary.total_cut / summary.total_quantity) * 100), 100)
+        : 0;
+      // Órdenes realmente cerradas: sólo las verificadas.
+      summary.verified_progress = summary.total_orders > 0
+        ? Math.round((summary.verified_orders / summary.total_orders) * 100)
         : 0;
 
       res.json({
@@ -274,6 +402,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         range: { startDate, endDate },
         summary,
         byStatus: STATUSES.map((s) => byStatus[s]).filter((r) => r.orders > 0),
+        byStage: STAGES.map((s) => byStage[s]).filter((r) => r.orders > 0),
         byTalla: [...byTalla.values()].sort((a, b) => cmpTalla(a.talla, b.talla)),
         byFabric: [...byFabric.values()].sort((a, b) => b.quantity - a.quantity),
         byDay: [...byDay.values()].sort((a, b) => (a.day < b.day ? -1 : 1)),

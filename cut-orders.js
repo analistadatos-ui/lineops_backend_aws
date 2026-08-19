@@ -61,6 +61,26 @@ async function initSchema({ pool, setSchema }) {
     // Prioridad fijada por el planner: 'urgent' (rojo), 'intermediate' (amarillo),
     // 'normal' (verde). El dashboard de corte ordena por prioridad y luego por fecha.
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS priority VARCHAR(20) NOT NULL DEFAULT 'normal';`);
+    // Verificación del corte (supervisor). Mientras verified_at esté vacío el
+    // corte NO está terminado, por más que el cortador haya capturado todas las
+    // piezas: sólo /verify pone status = 'completed'.
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS verified_by VARCHAR(100);`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS verification_notes TEXT;`);
+    // 'awaiting_verification' son 21 caracteres y la columna nació VARCHAR(20):
+    // sin este ALTER, guardar el estado nuevo truena con "value too long for
+    // type character varying(20)" (500 en PATCH /:id/cutting).
+    await client.query(`ALTER TABLE cut_orders ALTER COLUMN status TYPE VARCHAR(30);`);
+    // El CHECK original no conocía 'awaiting_verification'; se reemplaza para
+    // dejar pasar el nuevo estado intermedio.
+    await client.query(`
+      ALTER TABLE cut_orders DROP CONSTRAINT IF EXISTS chk_cut_status;
+    `);
+    await client.query(`
+      ALTER TABLE cut_orders
+        ADD CONSTRAINT chk_cut_status
+        CHECK (status IN ('pending','in_progress','awaiting_verification','completed','cancelled'));
+    `);
     await client.query(`
       DO $$ BEGIN
         IF NOT EXISTS (
@@ -76,6 +96,16 @@ async function initSchema({ pool, setSchema }) {
   } finally {
     client.release();
   }
+}
+
+// Quién puede firmar la verificación del corte. Ajusta a los roles reales de
+// tu tabla de usuarios si el nombre difiere.
+const VERIFIER_ROLES = ["supervisor", "master", "admin", "skyrina", "soporte_it"];
+
+// Nombre que queda sellado en verified_by; el payload del token varía según el
+// login, así que tomamos el primero que exista.
+function verifierName(user) {
+  return user?.username || user?.name || user?.email || (user?.id != null ? String(user.id) : null);
 }
 
 /**
@@ -110,6 +140,9 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                co.markers,
                co.notes,
                co.status,
+               co.verified_at,
+               co.verified_by,
+               co.verification_notes,
                COALESCE(co.priority, 'normal') AS priority,
                co.created_at,
                wo.work_order_no,
@@ -225,7 +258,8 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
   });
 
   // Record cutting progress: panels, amount cut, and remaining to cut.
-  // Sets status to 'completed' when nothing remains, else 'in_progress'.
+  // Terminar de cortar NO cierra la orden: la manda a 'awaiting_verification'.
+  // Sólo PATCH /:id/verify la deja en 'completed'.
   app.patch("/api/cut-orders/:id/cutting", authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -267,8 +301,13 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
         return res.status(400).json({ success: false, error: "N° de paneles inválido" });
       }
 
-      // Status: completed if remaining is 0 (and some cutting recorded), else in_progress.
-      const newStatus = rem !== null && rem <= 0 ? "completed" : "in_progress";
+      // Status: cortado todo -> a verificación; si falta algo, sigue en proceso.
+      // Si la llamada sólo trae marcadas (el planner armando trazos, sin cifras
+      // de corte), NO se toca el status: planear no es empezar a cortar.
+      const touchedCutting = (sp && sp.length > 0) || cut !== null || rem !== null;
+      const newStatus = !touchedCutting
+        ? null
+        : rem !== null && rem <= 0 ? "awaiting_verification" : "in_progress";
 
       const result = await client.query(
         `UPDATE cut_orders
@@ -277,7 +316,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                 remaining_to_cut = COALESCE($3, remaining_to_cut),
                 size_progress = COALESCE($4::jsonb, size_progress),
                 markers = COALESCE($5::jsonb, markers),
-                status = $6,
+                status = COALESCE($6::varchar, status),
                 updated_at = now()
           WHERE id = $7
           RETURNING *`,
@@ -301,11 +340,27 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     try {
       await setSchema(client);
       const { status } = req.body;
-      if (!["pending", "in_progress", "completed", "cancelled"].includes(status)) {
+      if (!["pending", "in_progress", "awaiting_verification", "completed", "cancelled"].includes(status)) {
         return res.status(400).json({ success: false, error: "Estado inválido" });
       }
+      // 'completed' es la salida de la verificación, no un estado que se pueda
+      // fijar a mano — si no, cualquier pantalla podría saltarse al supervisor.
+      if (status === "completed") {
+        return res.status(400).json({
+          success: false,
+          error: "Una orden sólo se termina al verificarla: usa PATCH /api/cut-orders/:id/verify",
+        });
+      }
+      // Regresar la orden a corte anula la verificación anterior.
       const result = await client.query(
-        "UPDATE cut_orders SET status = $1, updated_at = now() WHERE id = $2 RETURNING *",
+        `UPDATE cut_orders
+            SET status             = $1,
+                verified_at        = NULL,
+                verified_by        = NULL,
+                verification_notes = NULL,
+                updated_at         = now()
+          WHERE id = $2
+          RETURNING *`,
         [status, parseInt(req.params.id)]
       );
       if (result.rows.length === 0) {
@@ -314,6 +369,72 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       res.json({ success: true, cutOrder: result.rows[0] });
     } catch (err) {
       console.error("❌ Error updating cut order:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Verificación del corte. Único camino a 'completed'.
+  //   { approved: true }                 -> terminada, con sello de quién y cuándo
+  //   { approved: false, notes: "..." }  -> regresa a corte con el motivo
+  app.patch("/api/cut-orders/:id/verify", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+
+      if (!VERIFIER_ROLES.includes(req.user?.role)) {
+        return res.status(403).json({ success: false, error: "Sólo el supervisor puede verificar el corte" });
+      }
+
+      const approved = req.body.approved !== false;
+      const notes = (req.body.notes || "").toString().trim() || null;
+
+      if (!approved && !notes) {
+        return res.status(400).json({ success: false, error: "Indica por qué se rechaza el corte" });
+      }
+
+      const current = await client.query(
+        "SELECT status, amount_cut, remaining_to_cut FROM cut_orders WHERE id = $1",
+        [parseInt(req.params.id)]
+      );
+      if (current.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "Cut order not found" });
+      }
+      if (current.rows[0].status === "cancelled") {
+        return res.status(400).json({ success: false, error: "No se puede verificar un corte cancelado" });
+      }
+      // No se firma un corte donde nadie ha cortado nada. Que falten piezas
+      // contra el pedido NO bloquea: el supervisor puede cerrar un corte corto
+      // (marcadas que no cubren todo el pedido) a conciencia.
+      const already = parseFloat(current.rows[0].amount_cut);
+      if (approved && (isNaN(already) || already <= 0)) {
+        return res.status(400).json({
+          success: false,
+          error: "No hay piezas cortadas registradas: verifica las marcadas antes de cerrar el corte",
+        });
+      }
+
+      const result = await client.query(
+        `UPDATE cut_orders
+            SET status             = $1,
+                verified_at        = $2,
+                verified_by        = $3,
+                verification_notes = $4,
+                updated_at         = now()
+          WHERE id = $5
+          RETURNING *`,
+        [
+          approved ? "completed" : "in_progress",
+          approved ? new Date() : null,
+          approved ? verifierName(req.user) : null,
+          notes,
+          parseInt(req.params.id),
+        ]
+      );
+      res.json({ success: true, cutOrder: result.rows[0] });
+    } catch (err) {
+      console.error("❌ Error verifying cut order:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
       client.release();
