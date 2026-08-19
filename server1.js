@@ -1720,6 +1720,78 @@ app.get("/api/line-runs/:lineNo", authenticateToken, async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// mergeOrInsertAssignment — keep one planned row per (work_order, line, day,
+// color). If a matching planned/released row already exists for that cell, add
+// the pieces to it instead of creating a second sliver; otherwise insert a new
+// row. Completed/cancelled rows are never merged into (their produced history
+// must stay intact), so those always insert a fresh row.
+//
+//   a = { workOrderId, lineRunId, lineNo, assignedDate, quantity,
+//         availableMinutes, requiredRate, startDate, endDate, status, color }
+// Must be called inside an open transaction on `client`.
+// ---------------------------------------------------------------------------
+async function mergeOrInsertAssignment(client, a) {
+  const mergeable = a.status === "planned" || a.status === "released";
+
+  const findExisting = () => client.query(
+    `SELECT id FROM line_assignments
+      WHERE work_order_id = $1
+        AND line_no = $2
+        AND assigned_date = $3
+        AND COALESCE(color, '') = COALESCE($4, '')
+        AND status = $5
+      ORDER BY id ASC
+      LIMIT 1
+      FOR UPDATE`,
+    [a.workOrderId, String(a.lineNo), a.assignedDate, a.color ?? null, a.status]
+  );
+
+  const applyMerge = async (id) => (await client.query(
+    `UPDATE line_assignments
+        SET assigned_quantity        = assigned_quantity + $2,
+            available_minutes        = $3,
+            required_production_rate  = $4,
+            planned_start_date        = LEAST(COALESCE(planned_start_date, $5::date), $5::date),
+            planned_end_date          = GREATEST(COALESCE(planned_end_date, $6::date), $6::date),
+            line_run_id               = COALESCE($7, line_run_id),
+            updated_at                = now()
+      WHERE id = $1
+    RETURNING *`,
+    [id, a.quantity, a.availableMinutes, a.requiredRate, a.startDate, a.endDate, a.lineRunId ?? null]
+  )).rows[0];
+
+  if (mergeable) {
+    const found = await findExisting();
+    if (found.rows.length) return applyMerge(found.rows[0].id);
+  }
+
+  // No mergeable row yet → insert. A rare concurrent insert can trip the
+  // partial unique index; if so, roll back just this statement and merge into
+  // whatever landed first.
+  await client.query("SAVEPOINT ins_assign");
+  try {
+    const ins = await client.query(
+      `INSERT INTO line_assignments
+         (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+          available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING *`,
+      [a.workOrderId, a.lineRunId ?? null, String(a.lineNo), a.assignedDate, a.quantity,
+       a.availableMinutes, a.requiredRate, a.startDate, a.endDate, a.status, a.color ?? null]
+    );
+    await client.query("RELEASE SAVEPOINT ins_assign");
+    return ins.rows[0];
+  } catch (e) {
+    if (e.code === "23505" && mergeable) {
+      await client.query("ROLLBACK TO SAVEPOINT ins_assign");
+      const found = await findExisting();
+      if (found.rows.length) return applyMerge(found.rows[0].id);
+    }
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // PATCH /api/line-assignments/:id/move  —  add to server.js near the other
 // line-assignments routes.
 //
