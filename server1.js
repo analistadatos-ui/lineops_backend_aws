@@ -338,7 +338,26 @@ await client.query(`
   );
 `);
 console.log("✅ quality_defect_types table ready");
-
+    // Planner-defined lines (engineering hasn't configured them yet) + draft flag.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS planner_lines(
+        line_no TEXT PRIMARY KEY,
+        operators_count INT NOT NULL DEFAULT 20,
+        working_hours NUMERIC(6,2) NOT NULL DEFAULT 8,
+        sam_minutes NUMERIC(10,2) NOT NULL DEFAULT 3.5,
+        efficiency NUMERIC(4,3) NOT NULL DEFAULT 0.85,
+        target_pcs NUMERIC(12,2) NOT NULL DEFAULT 0,
+        target_per_hour NUMERIC(12,2) NOT NULL DEFAULT 0,
+        created_by TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT chk_planner_eff CHECK (efficiency > 0 AND efficiency <= 1),
+        CONSTRAINT chk_planner_hours CHECK (working_hours > 0),
+        CONSTRAINT chk_planner_sam CHECK (sam_minutes > 0)
+      );
+    `);
+    await client.query("ALTER TABLE line_runs ADD COLUMN IF NOT EXISTS is_draft BOOLEAN NOT NULL DEFAULT false;");
+    console.log("✅ planner_lines + line_runs.is_draft ready in prod_db_schema");
 // 10. Create quality_defect_reasons table (master data)
 await client.query(`
   CREATE TABLE IF NOT EXISTS quality_defect_reasons(
@@ -1607,7 +1626,7 @@ app.get("/api/line-runs", authenticateToken, async (req, res, next) => {
     await setSchema(client);
     const result = await client.query(
       `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes,
-              efficiency, target_pcs, target_per_hour, created_at
+              efficiency, target_pcs, target_per_hour, is_draft, created_at
        FROM line_runs
        ORDER BY run_date DESC, line_no`
     );
@@ -1955,6 +1974,9 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
         color,
       });
       createdRows.push(row);
+      if (status === "planned" || status === "released") {
+        await ensureDraftRunForAssignment(client, { lineNo, runDate: dayStr, workOrderId });
+      }
       remaining -= chunk;
       dayStr = addDaysStr(dayStr, 1);
     }
@@ -2099,6 +2121,9 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
           color,
         });
         createdRows.push(row);
+        if (status === "planned" || status === "released") {
+          await ensureDraftRunForAssignment(client, { lineNo, runDate: dayStr, workOrderId });
+        }
         remaining -= chunk;
         dayStr = addDaysStr(dayStr, 1);
       }
@@ -4845,44 +4870,177 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
  * nobody has entered a line_run for yet.
  */
 async function getLineCapacityForDate(client, date) {
-  const exact = await client.query(
-    `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour
-     FROM line_runs WHERE run_date = $1 ORDER BY line_no::int`,
+  // Each line resolves to its OWN most-recent config on/before `date` (else its
+  // closest future one), so a line never disappears just because another line
+  // ran more recently — that was the cause of "faltan" on future dates.
+  const perLine = await client.query(
+    `SELECT DISTINCT ON (line_no)
+            id, line_no, run_date, style, operators_count, working_hours,
+            sam_minutes, efficiency, target_pcs, target_per_hour
+       FROM line_runs
+      ORDER BY line_no,
+               (run_date <= $1) DESC,
+               ABS(run_date - $1::date) ASC`,
     [date]
   );
+  const lines = perLine.rows;
 
-  if (exact.rows.length > 0) {
-    return { lines: exact.rows, capacitySource: "exact", capacityDate: date };
-  }
-
-  // Fall back to the most recent run_date on or before the requested date
-  const fallbackDateResult = await client.query(
-    `SELECT MAX(run_date) as fallback_date FROM line_runs WHERE run_date <= $1`,
-    [date]
+  // Merge in planner-defined lines (engineering hasn't configured yet) for any
+  // line_no not already present. Inlined so this function has no dependency.
+  const present = new Set(lines.map((l) => String(l.line_no)));
+  const seeds = await client.query(
+    `SELECT line_no, operators_count, working_hours, sam_minutes,
+            efficiency, target_pcs, target_per_hour
+       FROM planner_lines`
   );
-  let fallbackDate = fallbackDateResult.rows[0]?.fallback_date;
+  const extra = seeds.rows
+    .filter((r) => !present.has(String(r.line_no)))
+    .map((r) => ({
+      id: null,
+      line_no: r.line_no,
+      run_date: date,
+      style: null,
+      operators_count: r.operators_count,
+      working_hours: r.working_hours,
+      sam_minutes: r.sam_minutes,
+      efficiency: r.efficiency,
+      target_pcs: r.target_pcs,
+      target_per_hour: r.target_per_hour,
+    }));
 
-  if (!fallbackDate) {
-    // Nothing before the date either — just use the latest configuration that exists at all
-    const anyDateResult = await client.query(`SELECT MAX(run_date) as any_date FROM line_runs`);
-    fallbackDate = anyDateResult.rows[0]?.any_date;
-  }
-
-  if (!fallbackDate) {
-    return { lines: [], capacitySource: "none", capacityDate: null };
-  }
-
-  const fallback = await client.query(
-    `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour
-     FROM line_runs WHERE run_date = $1 ORDER BY line_no::int`,
-    [fallbackDate]
-  );
-
-  const dateStr = fallbackDate instanceof Date ? fallbackDate.toISOString().slice(0, 10) : fallbackDate;
-  return { lines: fallback.rows, capacitySource: "fallback", capacityDate: dateStr };
+  const allLines = extra.length ? [...lines, ...extra] : lines;
+  return {
+    lines: allLines,
+    capacitySource: lines.length ? "per-line" : (allLines.length ? "planner" : "none"),
+    capacityDate: date,
+  };
 }
 
+// GET /api/planning/lines — planner-defined lines (engineering hasn't
+// configured them yet). The board shows these as empty lines so orders can be
+// dropped before any run exists.
+app.get("/api/planning/lines", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const result = await client.query(
+      `SELECT line_no, operators_count, working_hours, sam_minutes,
+              efficiency, target_pcs, target_per_hour, created_at
+         FROM planner_lines ORDER BY line_no::int`
+    );
+    res.json({ success: true, lines: result.rows });
+  } catch (err) {
+    console.error("❌ Error listing planner lines:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+// POST /api/planning/lines — create a planner line (not configured by
+// engineering). Stored in planner_lines, NOT line_runs. Assigning an order to
+// it later auto-creates a draft run. efficiency accepts 0.85 or 85.
+app.post(
+  "/api/planning/lines",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { lineNo, operatorsCount, workingHours, efficiency, samMinutes } = req.body;
+      const line = String(lineNo ?? "").trim();
+      if (!line) return res.status(400).json({ success: false, error: "lineNo is required" });
 
+      const existingRun = await client.query("SELECT 1 FROM line_runs WHERE line_no = $1 LIMIT 1", [line]);
+      if (existingRun.rowCount > 0) {
+        return res.status(409).json({ success: false, error: `La línea ${line} ya está configurada por ingeniería.` });
+      }
+
+      const operators = Number.isFinite(+operatorsCount) && +operatorsCount > 0 ? Math.floor(+operatorsCount) : 20;
+      const hours = Number.isFinite(+workingHours) && +workingHours > 0 ? +workingHours : 8;
+      let eff = Number.isFinite(+efficiency) && +efficiency > 0 ? +efficiency : 0.85;
+      if (eff > 1) eff = eff / 100;
+      if (eff > 1) eff = 1;
+      const sam = Number.isFinite(+samMinutes) && +samMinutes > 0 ? +samMinutes : 3.5;
+      const targetPcs = Math.round((operators * hours * 60 * eff) / sam);
+      const targetPerHour = hours > 0 ? Math.round(targetPcs / hours) : 0;
+
+      const result = await client.query(
+        `INSERT INTO planner_lines
+           (line_no, operators_count, working_hours, sam_minutes, efficiency,
+            target_pcs, target_per_hour, created_by, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+         ON CONFLICT (line_no) DO UPDATE
+           SET operators_count = EXCLUDED.operators_count,
+               working_hours   = EXCLUDED.working_hours,
+               sam_minutes     = EXCLUDED.sam_minutes,
+               efficiency      = EXCLUDED.efficiency,
+               target_pcs      = EXCLUDED.target_pcs,
+               target_per_hour = EXCLUDED.target_per_hour,
+               updated_at      = NOW()
+         RETURNING *`,
+        [line, operators, hours, sam, eff, targetPcs, targetPerHour, req.user?.username || null]
+      );
+      res.json({ success: true, line: result.rows[0] });
+    } catch (err) {
+      console.error("❌ Error creating planner line:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  }
+);
+// DELETE /api/planning/lines/:lineNo — remove a planner line (blocked if it
+// still has assignments).
+app.delete(
+  "/api/planning/lines/:lineNo",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const line = String(req.params.lineNo ?? "").trim();
+      const used = await client.query(
+        `SELECT COUNT(*)::int AS n FROM line_assignments
+          WHERE line_no = $1 AND status NOT IN ('cancelled', 'rejected')`,
+        [line]
+      );
+      if ((used.rows[0]?.n || 0) > 0) {
+        return res.status(409).json({ success: false, error: `La línea ${line} tiene asignaciones. Quítelas primero.` });
+      }
+      await client.query("DELETE FROM planner_lines WHERE line_no = $1", [line]);
+      res.json({ success: true, lineNo: line });
+    } catch (err) {
+      console.error("❌ Error deleting planner line:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// POST /api/run/:runId/confirm — clear the draft flag on an auto-created run.
+app.post(
+  "/api/run/:runId/confirm",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const runId = parseInt(req.params.runId);
+      const r = await client.query(
+        "UPDATE line_runs SET is_draft = false, updated_at = NOW() WHERE id = $1 RETURNING id, line_no, run_date, style, is_draft",
+        [runId]
+      );
+      if (r.rowCount === 0) return res.status(404).json({ success: false, error: "Run not found" });
+      res.json({ success: true, run: r.rows[0] });
+    } catch (err) {
+      console.error("❌ Error confirming run:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  }
+);
 /**
  * GET /api/planning/available-lines?date=YYYY-MM-DD
  * Per-line capacity for a date, minus whatever is already assigned that date.
@@ -5122,7 +5280,95 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
   }
 });
 
+async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderId, style }) {
+  const line = String(lineNo);
 
+  const existing = await client.query(
+    "SELECT 1 FROM line_runs WHERE line_no = $1 AND run_date = $2 LIMIT 1",
+    [line, runDate]
+  );
+  if (existing.rowCount > 0) return null; // day already has a run
+
+  // Style from the assigned order (used for the run and to prefer a same-style template).
+  let runStyle = style;
+  if (!runStyle && workOrderId != null) {
+    const wo = await client.query(
+      "SELECT style_code, estilo FROM work_orders WHERE id = $1",
+      [workOrderId]
+    );
+    runStyle = wo.rows[0]?.style_code || wo.rows[0]?.estilo || null;
+  }
+  runStyle = runStyle || "SIN ESTILO";
+
+  // Template = the line's most recent run, preferring the SAME style. It gives
+  // both the capacity numbers and the operator roster to inherit. For a
+  // planner-defined line (no runs yet) fall back to its planner_lines row, then
+  // to defaults.
+  const tpl = await client.query(
+    `SELECT id, operators_count, working_hours, sam_minutes, efficiency
+       FROM line_runs
+      WHERE line_no = $1
+      ORDER BY (style = $2) DESC, run_date DESC, created_at DESC
+      LIMIT 1`,
+    [line, runStyle]
+  );
+  let src = tpl.rows[0];
+  const templateRunId = src?.id ?? null;
+  if (!src) {
+    const pl = await client.query(
+      `SELECT operators_count, working_hours, sam_minutes, efficiency
+         FROM planner_lines WHERE line_no = $1`,
+      [line]
+    );
+    src = pl.rows[0];
+  }
+  const operators = parseInt(src?.operators_count) || 20;
+  const hours = parseFloat(src?.working_hours) || 8;
+  let eff = parseFloat(src?.efficiency) || 0.85;
+  if (eff > 1) eff = eff / 100;
+  if (eff > 1) eff = 1;
+  const sam = parseFloat(src?.sam_minutes) || 3.5;
+  const targetPcs = Math.round((operators * hours * 60 * eff) / sam);
+  const targetPerHour = hours > 0 ? Math.round(targetPcs / hours) : 0;
+
+  const ins = await client.query(
+    `INSERT INTO line_runs
+       (line_no, run_date, style, operators_count, working_hours, sam_minutes,
+        efficiency, target_pcs, target_per_hour, work_order_id, is_draft, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, NOW(), NOW())
+     ON CONFLICT (line_no, run_date, style) DO NOTHING
+     RETURNING id`,
+    [line, runDate, runStyle, operators, hours, sam, eff, targetPcs, targetPerHour, workOrderId ?? null]
+  );
+  if (ins.rowCount === 0) return null;
+  const runId = ins.rows[0].id;
+
+  await client.query(
+    `INSERT INTO shift_slots (run_id, slot_order, slot_label, slot_start, slot_end, planned_hours)
+     VALUES ($1, 1, $2, NULL, NULL, $3)`,
+    [runId, "Turno", hours]
+  );
+
+  // Inherit the operator roster from the template run so the draft shows the
+  // operators assigned to this line/style (operations themselves aren't copied).
+  if (templateRunId) {
+    await client.query(
+      `INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
+       SELECT $1, operator_no, operator_name, NOW()
+         FROM run_operators WHERE run_id = $2
+       ON CONFLICT (run_id, operator_no) DO NOTHING`,
+      [runId, templateRunId]
+    );
+  }
+
+  await client.query(
+    `UPDATE line_assignments SET line_run_id = $1
+      WHERE line_no = $2 AND assigned_date = $3 AND line_run_id IS NULL`,
+    [runId, line, runDate]
+  );
+
+  return runId;
+}
 
 app.post("/api/line-assignments", authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -5189,6 +5435,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       });
     }
 
+    
     // One planned row per (work_order, line, day, color): if this cell already
     // holds pieces of the same order+color, add to that row instead of stacking
     // a second sliver. Spilling to the next day still happens upstream, since
@@ -5212,6 +5459,15 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       "UPDATE work_orders SET status = CASE WHEN status = 'pending' THEN 'assigned' ELSE status END, updated_at = NOW() WHERE id = $1",
       [parseInt(workOrderId)]
     );
+
+    if (!lineData.id) {
+      await ensureDraftRunForAssignment(client, {
+      lineNo,
+      runDate: assignedDate,
+      workOrderId: parseInt(workOrderId),
+      style: null,
+    });
+}
 
     await client.query("COMMIT");
 
