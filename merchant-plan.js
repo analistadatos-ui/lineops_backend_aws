@@ -38,7 +38,7 @@
 //     workOrderNo, customerName, customerPo,
 //     styleCode, estilo, styleDescription,
 //     cantidad, samMinutes, equivalence, eqPerPiece, eqPieces,
-//     sizes:[{talla,quantity}] }
+//     sizes:[{talla,quantity}], isPreOrder }        // isPreOrder = flagged pre-order
 // ==========================================================================
 
 async function initSchema({ pool, setSchema }) {
@@ -63,6 +63,7 @@ async function initSchema({ pool, setSchema }) {
         eq_per_piece      NUMERIC(12,4) NOT NULL DEFAULT 0,
         eq_pieces         NUMERIC(14,4) NOT NULL DEFAULT 0,
         sizes             JSONB         NOT NULL DEFAULT '[]'::jsonb,
+        is_pre_order      BOOLEAN       NOT NULL DEFAULT false,   -- flagged as a pre-order on the board
         created_by        BIGINT,
         updated_by        BIGINT,
         created_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
@@ -71,6 +72,9 @@ async function initSchema({ pool, setSchema }) {
         CONSTRAINT uq_merchant_week_plan UNIQUE (work_order_id, color)
       );
     `);
+    // Migration: CREATE TABLE IF NOT EXISTS won't add columns to a table that
+    // already exists in prod, so add is_pre_order explicitly (no-op if present).
+    await client.query("ALTER TABLE merchant_week_plan ADD COLUMN IF NOT EXISTS is_pre_order BOOLEAN NOT NULL DEFAULT false;");
     await client.query("CREATE INDEX IF NOT EXISTS idx_merchant_week_plan_week ON merchant_week_plan(week_start);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_merchant_week_plan_wo ON merchant_week_plan(work_order_id);");
     console.log("\u2705 merchant_week_plan table ready in prod_db_schema");
@@ -97,9 +101,9 @@ const UPSERT_SQL = `
   INSERT INTO merchant_week_plan
     (work_order_id, color, week_start, work_order_no, customer_name, customer_po,
      style_code, estilo, style_description, cantidad, sam_minutes, equivalence,
-     eq_per_piece, eq_pieces, sizes, created_by, updated_by, created_at, updated_at)
+     eq_per_piece, eq_pieces, sizes, is_pre_order, created_by, updated_by, created_at, updated_at)
   VALUES
-    ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,$16,NOW(),NOW())
+    ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$17,$16,$16,NOW(),NOW())
   ON CONFLICT (work_order_id, color) DO UPDATE SET
     week_start        = EXCLUDED.week_start,
     work_order_no     = EXCLUDED.work_order_no,
@@ -114,6 +118,7 @@ const UPSERT_SQL = `
     eq_per_piece      = EXCLUDED.eq_per_piece,
     eq_pieces         = EXCLUDED.eq_pieces,
     sizes             = EXCLUDED.sizes,
+    is_pre_order      = EXCLUDED.is_pre_order,
     updated_by        = EXCLUDED.updated_by,
     updated_at        = NOW()
   RETURNING id
@@ -141,6 +146,7 @@ function upsertParams(item, userId) {
     numOr(item.eqPieces),              // $14
     sizesJson(item.sizes),             // $15
     userId ?? null,                    // $16 (created_by / updated_by)
+    item.isPreOrder === true || item.is_pre_order === true, // $17
   ];
 }
 
@@ -157,7 +163,7 @@ function registerMerchantPlan(app, deps) {
                 to_char(week_start, 'YYYY-MM-DD') AS week_start,
                 work_order_no, customer_name, customer_po, style_code, estilo,
                 style_description, cantidad, sam_minutes, equivalence,
-                eq_per_piece, eq_pieces, sizes, updated_at
+                eq_per_piece, eq_pieces, sizes, is_pre_order, updated_at
            FROM merchant_week_plan
           ORDER BY week_start, work_order_no, color`
       );
