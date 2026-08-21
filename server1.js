@@ -2165,7 +2165,10 @@ app.get("/api/lineleader/latest-run", authenticateToken, allowRoles("line_leader
     }
 
     const runQ = await client.query(
-      `SELECT * FROM line_runs WHERE line_no = $1 ORDER BY created_at DESC LIMIT 1`,
+      `SELECT * FROM line_runs
+         WHERE line_no = $1 AND is_draft = false AND run_date <= CURRENT_DATE
+         ORDER BY run_date DESC, created_at DESC
+         LIMIT 1`,
       [line]
     );
     if (runQ.rowCount === 0) {
@@ -2402,7 +2405,7 @@ app.get("/api/multi-style/latest-group", authenticateToken, async (req, res) => 
     // Get the latest run date for this line
     const latestDate = await client.query(
       `SELECT DISTINCT run_date FROM line_runs
-       WHERE line_no = $1
+       WHERE line_no = $1 AND is_draft = false AND run_date <= CURRENT_DATE
        ORDER BY run_date DESC
        LIMIT 1`,
       [line]
@@ -2420,7 +2423,7 @@ app.get("/api/multi-style/latest-group", authenticateToken, async (req, res) => 
     // Now get all runs for that date
     const runs = await client.query(
       `SELECT * FROM line_runs
-       WHERE line_no = $1 AND run_date = $2
+       WHERE line_no = $1 AND run_date = $2 AND is_draft = false
        ORDER BY style_group_id NULLS FIRST, id`,
       [line, date]
     );
