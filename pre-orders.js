@@ -473,6 +473,14 @@ function registerPreOrders(app, deps) {
         planned = await carryPlanToWorkOrders(client, id, mergedIds, cur.rows[0].planned_week);
         // Ya se heredó: la pre-orden deja de reservar semana.
         await client.query("UPDATE pre_orders SET planned_week = NULL WHERE id = $1", [id]);
+        // Los "holds" del Plan Board (línea+día) ya no aplican: la PO real se
+        // asigna a los días normalmente. Se sueltan para liberar su capacidad.
+        // Protegido por si el módulo pre-order-holds aún no está desplegado.
+        try {
+          await client.query("DELETE FROM pre_order_day_holds WHERE pre_order_id = $1", [id]);
+        } catch (e) {
+          console.warn("\u26a0\ufe0f  no se pudieron soltar los holds de la pre-orden", id, e.message);
+        }
       } catch (e) {
         console.warn("\u26a0\ufe0f  plan carry-over falló para pre-orden", id, e.message);
       }
@@ -536,9 +544,11 @@ function registerPreOrders(app, deps) {
       if (rows.length === 0) {
         return res.status(400).json({ success: false, error: "No existe o ya se convirtió en PO" });
       }
-      // Cancelada = fuera del tablero de planeación.
+      // Cancelada = fuera del tablero de planeación (semana del merchant + holds del planner).
       await client.query("DELETE FROM merchant_week_plan WHERE pre_order_id = $1", [id])
         .catch((e) => console.warn("no se pudo limpiar el tablero:", e.message));
+      await client.query("DELETE FROM pre_order_day_holds WHERE pre_order_id = $1", [id])
+        .catch((e) => console.warn("no se pudieron limpiar los holds:", e.message));
       res.json({ success: true, preOrder: rows[0] });
     } catch (err) {
       console.error("\u274c POST /api/pre-orders/:id/cancel:", err.message);

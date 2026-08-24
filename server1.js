@@ -622,6 +622,7 @@ await registerFinishedWarehouseAnalytics.initSchema({ pool, setSchema });
 await registerPreOrders.initSchema({ pool, setSchema });
 await registerMerchantAnalytics.initSchema({ pool, setSchema });
 await registerMerchantPlan.initSchema({ pool, setSchema });
+await registerPreOrderHolds.initSchema({ pool, setSchema });   // ← add
 await registerCutOrders.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
 await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
@@ -862,6 +863,9 @@ registerPreOrders(app, { authenticateToken, pool, setSchema });
 // with the other requires / registrations, near registerFinishedWarehouse:
 const registerFinishedWarehouseAnalytics = require("./finished-warehouse-analytics");
 registerFinishedWarehouseAnalytics(app, { authenticateToken, pool, setSchema });
+
+const registerPreOrderHolds = require("./pre-order-holds");
+registerPreOrderHolds(app, { authenticateToken, pool, setSchema });
 
 const registerCutOrderAnalytics = require("./cut-order-analytics");
 registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema });
@@ -5074,6 +5078,22 @@ app.get("/api/planning/available-lines", authenticateToken, async (req, res) => 
     const assignedByLine = {};
     assignedResult.rows.forEach((r) => { assignedByLine[r.line_no] = parseFloat(r.assigned) || 0; });
 
+    // ── add: pre-order holds occupy capacity too ──
+    try {
+      const heldResult = await client.query(
+        `SELECT line_no, COALESCE(SUM(quantity), 0) AS held
+           FROM pre_order_day_holds
+          WHERE assigned_date = $1
+          GROUP BY line_no`,
+        [date]
+      );
+      heldResult.rows.forEach((r) => {
+        assignedByLine[r.line_no] = (assignedByLine[r.line_no] || 0) + (parseFloat(r.held) || 0);
+      });
+    } catch (e) {
+      console.warn("⚠️  pre_order_day_holds not available for capacity:", e.message);
+    }
+
     // Which work orders make up each line's load that day (for the dashboard bar)
     const workOrdersResult = await client.query(
       `SELECT la.line_no,
@@ -5434,7 +5454,23 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       [lineNo, assignedDate]
     );
     const alreadyAssigned = parseFloat(alreadyAssignedResult.rows[0].total) || 0;
-    const availableCapacity = Math.max(0, parseFloat(lineData.target_pcs) - alreadyAssigned);
+
+    // ── add: holds on this line/day also occupy capacity ──
+    let heldOnCell = 0;
+    try {
+      const heldRes = await client.query(
+        `SELECT COALESCE(SUM(quantity), 0) AS total FROM pre_order_day_holds
+          WHERE line_no = $1 AND assigned_date = $2`,
+        [lineNo, assignedDate]
+      );
+      heldOnCell = parseFloat(heldRes.rows[0].total) || 0;
+    } catch (e) {
+      heldOnCell = 0;
+    }
+
+    // change this line to also subtract heldOnCell:
+    const availableCapacity = Math.max(0, parseFloat(lineData.target_pcs) - alreadyAssigned - heldOnCell);
+    
     if (qty > availableCapacity) {
       await client.query("ROLLBACK");
       return res.status(400).json({
