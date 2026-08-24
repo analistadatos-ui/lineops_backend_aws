@@ -34,11 +34,20 @@
 //   PUT    /api/merchant-plan            -> replace the WHOLE board (bulk)
 //
 // POST / PUT item shape (camelCase from the React board):
-//   { workOrderId, color, weekStart,               // weekStart = "YYYY-MM-DD" (Mon)
+//   { workOrderId | preOrderId, color, weekStart,  // weekStart = "YYYY-MM-DD" (Mon)
 //     workOrderNo, customerName, customerPo,
 //     styleCode, estilo, styleDescription,
 //     cantidad, samMinutes, equivalence, eqPerPiece, eqPieces,
 //     sizes:[{talla,quantity}], isPreOrder }        // isPreOrder = flagged pre-order
+//
+// FILAS DE PRE-ORDEN
+//   El tablero acepta dos tipos de fila:
+//     • work_order_id  -> una PO real (con color)
+//     • pre_order_id   -> una PRE#### que todavía no se convierte en PO
+//   Una fila tiene UNO de los dos (el otro va en NULL). Las de pre-orden nacen
+//   con is_pre_order = true, así el merchant no tiene que marcarlas a mano.
+//   Al convertir la pre-orden, pre-orders.js mueve la semana a las POs nuevas
+//   y borra la fila de pre-orden.
 // ==========================================================================
 
 async function initSchema({ pool, setSchema }) {
@@ -48,7 +57,8 @@ async function initSchema({ pool, setSchema }) {
     await client.query(`
       CREATE TABLE IF NOT EXISTS merchant_week_plan(
         id                BIGSERIAL PRIMARY KEY,
-        work_order_id     BIGINT       NOT NULL,
+        work_order_id     BIGINT,                             -- NULL en filas de pre-orden
+        pre_order_id      BIGINT,                             -- NULL en filas de PO real
         color             VARCHAR(50)  NOT NULL DEFAULT '',
         week_start        DATE         NOT NULL,           -- the Monday of the week
         work_order_no     VARCHAR(80),
@@ -68,13 +78,25 @@ async function initSchema({ pool, setSchema }) {
         updated_by        BIGINT,
         created_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
         updated_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
-        -- one week per work-order + color (assigning again just moves the week)
-        CONSTRAINT uq_merchant_week_plan UNIQUE (work_order_id, color)
+        CONSTRAINT chk_merchant_week_plan_owner
+          CHECK (work_order_id IS NOT NULL OR pre_order_id IS NOT NULL)
       );
     `);
     // Migration: CREATE TABLE IF NOT EXISTS won't add columns to a table that
     // already exists in prod, so add is_pre_order explicitly (no-op if present).
     await client.query("ALTER TABLE merchant_week_plan ADD COLUMN IF NOT EXISTS is_pre_order BOOLEAN NOT NULL DEFAULT false;");
+    // Filas de pre-orden: work_order_id pasa a ser opcional y aparece pre_order_id.
+    // La unicidad ya no puede ser una constraint simple porque una de las dos
+    // columnas siempre va en NULL (y NULL nunca choca con NULL en Postgres):
+    // se reemplaza por un índice único sobre COALESCE de ambas + color.
+    await client.query("ALTER TABLE merchant_week_plan ADD COLUMN IF NOT EXISTS pre_order_id BIGINT;");
+    await client.query("ALTER TABLE merchant_week_plan ALTER COLUMN work_order_id DROP NOT NULL;");
+    await client.query("ALTER TABLE merchant_week_plan DROP CONSTRAINT IF EXISTS uq_merchant_week_plan;");
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_merchant_week_plan_row
+        ON merchant_week_plan (COALESCE(work_order_id, 0), COALESCE(pre_order_id, 0), color);
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_merchant_week_plan_pre ON merchant_week_plan(pre_order_id);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_merchant_week_plan_week ON merchant_week_plan(week_start);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_merchant_week_plan_wo ON merchant_week_plan(work_order_id);");
     console.log("\u2705 merchant_week_plan table ready in prod_db_schema");
@@ -99,12 +121,13 @@ const sizesJson = (v) => {
 // One shared column list for INSERT ... ON CONFLICT.
 const UPSERT_SQL = `
   INSERT INTO merchant_week_plan
-    (work_order_id, color, week_start, work_order_no, customer_name, customer_po,
-     style_code, estilo, style_description, cantidad, sam_minutes, equivalence,
-     eq_per_piece, eq_pieces, sizes, is_pre_order, created_by, updated_by, created_at, updated_at)
+    (work_order_id, pre_order_id, color, week_start, work_order_no, customer_name,
+     customer_po, style_code, estilo, style_description, cantidad, sam_minutes,
+     equivalence, eq_per_piece, eq_pieces, sizes, is_pre_order,
+     created_by, updated_by, created_at, updated_at)
   VALUES
-    ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$17,$16,$16,NOW(),NOW())
-  ON CONFLICT (work_order_id, color) DO UPDATE SET
+    ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$18,NOW(),NOW())
+  ON CONFLICT (COALESCE(work_order_id, 0), COALESCE(pre_order_id, 0), color) DO UPDATE SET
     week_start        = EXCLUDED.week_start,
     work_order_no     = EXCLUDED.work_order_no,
     customer_name     = EXCLUDED.customer_name,
@@ -126,27 +149,33 @@ const UPSERT_SQL = `
 
 // Build the positional params for one item. Returns null if the item is invalid.
 function upsertParams(item, userId) {
-  const workOrderId = item?.workOrderId ?? item?.work_order_id;
+  const workOrderId = item?.workOrderId ?? item?.work_order_id ?? null;
+  const preOrderId = item?.preOrderId ?? item?.pre_order_id ?? null;
   const weekStart = item?.weekStart ?? item?.week_start;
-  if (workOrderId == null || !isYmd(weekStart)) return null;
+  // Una fila es de PO o de pre-orden, nunca de las dos ni de ninguna.
+  if ((workOrderId == null && preOrderId == null) || !isYmd(weekStart)) return null;
+  // Las filas de pre-orden siempre viajan marcadas: es justo el punto de que el
+  // merchant no tenga que taggearlas en el tablero.
+  const isPre = preOrderId != null || item.isPreOrder === true || item.is_pre_order === true;
   return [
-    workOrderId,                       // $1
-    col(item.color),                   // $2
-    weekStart,                         // $3
-    txt(item.workOrderNo, 80),         // $4
-    txt(item.customerName, 150),       // $5
-    txt(item.customerPo, 60),          // $6
-    txt(item.styleCode, 20),           // $7
-    txt(item.estilo, 120),             // $8
-    txt(item.styleDescription, 2000),  // $9
-    numOr(item.cantidad),              // $10
-    numOr(item.samMinutes),            // $11
-    numOr(item.equivalence, 10),       // $12
-    numOr(item.eqPerPiece),            // $13
-    numOr(item.eqPieces),              // $14
-    sizesJson(item.sizes),             // $15
-    userId ?? null,                    // $16 (created_by / updated_by)
-    item.isPreOrder === true || item.is_pre_order === true, // $17
+    preOrderId != null ? null : workOrderId, // $1
+    preOrderId,                        // $2
+    col(item.color),                   // $3
+    weekStart,                         // $4
+    txt(item.workOrderNo, 80),         // $5
+    txt(item.customerName, 150),       // $6
+    txt(item.customerPo, 60),          // $7
+    txt(item.styleCode, 20),           // $8
+    txt(item.estilo, 120),             // $9
+    txt(item.styleDescription, 2000),  // $10
+    numOr(item.cantidad),              // $11
+    numOr(item.samMinutes),            // $12
+    numOr(item.equivalence, 10),       // $13
+    numOr(item.eqPerPiece),            // $14
+    numOr(item.eqPieces),              // $15
+    sizesJson(item.sizes),             // $16
+    isPre,                             // $17
+    userId ?? null,                    // $18 (created_by / updated_by)
   ];
 }
 
@@ -159,7 +188,7 @@ function registerMerchantPlan(app, deps) {
     try {
       await setSchema(client);
       const { rows } = await client.query(
-        `SELECT id, work_order_id, color,
+        `SELECT id, work_order_id, pre_order_id, color,
                 to_char(week_start, 'YYYY-MM-DD') AS week_start,
                 work_order_no, customer_name, customer_po, style_code, estilo,
                 style_description, cantidad, sam_minutes, equivalence,
@@ -197,17 +226,26 @@ function registerMerchantPlan(app, deps) {
   });
 
   // ---- DELETE: remove one color ------------------------------------------
+  // Acepta ?workOrderId= (PO real) o ?preOrderId= (fila de pre-orden).
   app.delete("/api/merchant-plan", authenticateToken, async (req, res) => {
-    const workOrderId = req.query.workOrderId ?? req.body?.workOrderId;
-    if (workOrderId == null) return res.status(400).json({ success: false, error: "workOrderId es obligatorio" });
+    const workOrderId = req.query.workOrderId ?? req.body?.workOrderId ?? null;
+    const preOrderId = req.query.preOrderId ?? req.body?.preOrderId ?? null;
+    if (workOrderId == null && preOrderId == null) {
+      return res.status(400).json({ success: false, error: "workOrderId o preOrderId es obligatorio" });
+    }
     const color = col(req.query.color ?? req.body?.color);
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { rowCount } = await client.query(
-        "DELETE FROM merchant_week_plan WHERE work_order_id = $1 AND color = $2",
-        [workOrderId, color]
-      );
+      const { rowCount } = preOrderId != null
+        ? await client.query(
+            "DELETE FROM merchant_week_plan WHERE pre_order_id = $1 AND color = $2",
+            [preOrderId, color]
+          )
+        : await client.query(
+            "DELETE FROM merchant_week_plan WHERE work_order_id = $1 AND color = $2",
+            [workOrderId, color]
+          );
       res.json({ success: true, deleted: rowCount });
     } catch (err) {
       console.error("\u274c DELETE /api/merchant-plan:", err.message);
