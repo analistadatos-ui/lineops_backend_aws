@@ -1904,7 +1904,7 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     await client.query("BEGIN");
 
     const cur = await client.query(
-      "SELECT id, work_order_id, assigned_quantity, color, status FROM line_assignments WHERE id = $1",
+      "SELECT id, work_order_id, assigned_quantity, color, status, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str FROM line_assignments WHERE id = $1",
       [id]
     );
     if (cur.rows.length === 0) {
@@ -1912,6 +1912,11 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       return res.status(404).json({ success: false, error: "Assignment not found" });
     }
     const original = cur.rows[0];
+    // Remember where this block sat so we can drop its (now stale) draft run if
+    // the day ends up empty after the move.
+    const sourceLineNo = String(original.line_no);
+    const sourceDate = original.assigned_date_str;
+
     const totalQty = parseFloat(original.assigned_quantity) || 0;
     const workOrderId = original.work_order_id;
     const color = original.color || null;
@@ -1969,23 +1974,18 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
       const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
 
-      const row = await mergeOrInsertAssignment(client, {
-        workOrderId,
-        lineRunId: lineData.id || null,
-        lineNo: String(lineNo),
-        assignedDate: dayStr,
-        quantity: chunk,
-        availableMinutes: effectiveDailyMinutes,
-        requiredRate: piecesPerDay,
-        startDate: dayStr,
-        endDate: dayStr,
-        status,
-        color,
-      });
-      createdRows.push(row);
-      if (status === "planned" || status === "released") {
-        await ensureDraftRunForAssignment(client, { lineNo, runDate: dayStr, workOrderId });
-      }
+      const ins = await client.query(
+        `INSERT INTO line_assignments
+           (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+            available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $4, $4, $9, $8)
+         RETURNING *`,
+        [workOrderId, lineData.id || null, String(lineNo), dayStr, chunk,
+         effectiveDailyMinutes, piecesPerDay, color, status]
+      );
+      createdRows.push(ins.rows[0]);
+      // NOTE: drafts are no longer auto-created on move. The planner pushes work
+      // to the line leaders explicitly via POST /api/line-assignments/confirm.
       remaining -= chunk;
       dayStr = addDaysStr(dayStr, 1);
     }
@@ -1997,6 +1997,11 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
         error: `La línea ${lineNo} no tiene capacidad suficiente para mover ${Math.round(totalQty)} pzas desde el ${assignedDate} (faltan ${Math.round(remaining)}).`,
       });
     }
+
+    // The source day may now be empty. If it only had an unconfirmed draft run
+    // (created before the planner confirmed), drop it so line leaders don't keep
+    // seeing a draft for a day the order was moved away from.
+    await cleanupOrphanDraftRuns(client, sourceLineNo, sourceDate);
 
     await client.query("COMMIT");
     res.json({
@@ -2034,7 +2039,6 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
     dt.setUTCDate(dt.getUTCDate() + n);
     return dt.toISOString().slice(0, 10);
   };
-  // True for Saturday/Sunday (no timezone drift). No production on weekends.
   const isWeekend = (ymdStr) => {
     const [y, m, d] = ymdStr.split("-").map(Number);
     const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sun, 6 = Sat
@@ -2059,7 +2063,8 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
     // Load the selected assignments. Order them by their current position so the
     // re-pack is deterministic (earliest day first, then id).
     const cur = await client.query(
-      `SELECT id, work_order_id, assigned_quantity, color, status
+      `SELECT id, work_order_id, assigned_quantity, color, status,
+              line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str
          FROM line_assignments
         WHERE id = ANY($1::int[])
         ORDER BY assigned_date ASC, id ASC`,
@@ -2069,6 +2074,14 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, error: "No se encontraron las asignaciones" });
     }
+
+    // Remember every (line, day) these blocks came from so we can drop their
+    // stale draft runs afterwards if the source day ends up empty.
+    const sourceCells = [
+      ...new Map(
+        cur.rows.map((r) => [`${r.line_no}|${r.assigned_date_str}`, { lineNo: String(r.line_no), date: r.assigned_date_str }])
+      ).values(),
+    ];
 
     // Free every selected block first so their old slots can be reused.
     await client.query("DELETE FROM line_assignments WHERE id = ANY($1::int[])", [idList]);
@@ -2098,7 +2111,7 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
 
       while (remaining > 0 && scanned < MAX_DAYS) {
         scanned++;
-        if (isWeekend(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend work
+        if (isWeekend(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; } 
         const { lines } = await getLineCapacityForDate(client, dayStr);
         const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
         if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no run -> skip
@@ -2137,9 +2150,8 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
           color,
         });
         createdRows.push(row);
-        if (status === "planned" || status === "released") {
-          await ensureDraftRunForAssignment(client, { lineNo, runDate: dayStr, workOrderId });
-        }
+        // NOTE: drafts are no longer auto-created on move. Line leaders receive
+        // work only when the planner confirms (POST /api/line-assignments/confirm).
         remaining -= chunk;
         dayStr = addDaysStr(dayStr, 1);
       }
@@ -2151,6 +2163,12 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
           error: `La línea ${lineNo} no tiene capacidad suficiente para reacomodar todas las casillas seleccionadas desde el ${assignedDate}.`,
         });
       }
+    }
+
+    // Drop any now-empty source day's unconfirmed draft run so line leaders stop
+    // seeing drafts for days these blocks were moved away from.
+    for (const cell of sourceCells) {
+      await cleanupOrphanDraftRuns(client, cell.lineNo, cell.date);
     }
 
     await client.query("COMMIT");
@@ -5317,14 +5335,9 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
 
 async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderId, style }) {
   const line = String(lineNo);
-
-  const existing = await client.query(
-    "SELECT 1 FROM line_runs WHERE line_no = $1 AND run_date = $2 LIMIT 1",
-    [line, runDate]
-  );
-  if (existing.rowCount > 0) return null; // day already has a run
-
-  // Style from the assigned order (used for the run and to prefer a same-style template).
+  if (!runDate) return { runId: null, created: false };
+ 
+  // Style must be resolved BEFORE the existence check — it is part of the key.
   let runStyle = style;
   if (!runStyle && workOrderId != null) {
     const wo = await client.query(
@@ -5334,11 +5347,38 @@ async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderI
     runStyle = wo.rows[0]?.style_code || wo.rows[0]?.estilo || null;
   }
   runStyle = runStyle || "SIN ESTILO";
-
-  // Template = the line's most recent run, preferring the SAME style. It gives
-  // both the capacity numbers and the operator roster to inherit. For a
-  // planner-defined line (no runs yet) fall back to its planner_lines row, then
-  // to defaults.
+ 
+  // Point this order's cells on this line-day at `runId`, whatever they held
+  // before. Re-pointing a stale link is the entire purpose of this step.
+  const linkAssignments = async (runId) => {
+    const upd = await client.query(
+      `UPDATE line_assignments
+          SET line_run_id = $1, updated_at = NOW()
+        WHERE line_no = $2
+          AND assigned_date = $3::date
+          AND status NOT IN ('cancelled', 'rejected')
+          AND ($4::bigint IS NULL OR work_order_id = $4::bigint)
+          AND line_run_id IS DISTINCT FROM $1`,
+      [runId, line, runDate, workOrderId ?? null]
+    );
+    console.log(`   ↳ linked ${upd.rowCount} assignment(s) to run ${runId}`);
+    return upd.rowCount;
+  };
+ 
+  const existing = await client.query(
+    "SELECT id FROM line_runs WHERE line_no = $1 AND run_date = $2::date AND style = $3 LIMIT 1",
+    [line, runDate, runStyle]
+  );
+  if (existing.rowCount > 0) {
+    const runId = existing.rows[0].id;
+    console.log(`   ↳ run ${runId} already exists for L${line} ${runDate} "${runStyle}"`);
+    await linkAssignments(runId);
+    return { runId, created: false };
+  }
+ 
+  // Template = the line's most recent run, preferring the SAME style. Supplies
+  // the capacity numbers and the operator roster. Falls back to planner_lines,
+  // then to hardcoded defaults, for a planner-defined line with no runs yet.
   const tpl = await client.query(
     `SELECT id, operators_count, working_hours, sam_minutes, efficiency
        FROM line_runs
@@ -5357,35 +5397,55 @@ async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderI
     );
     src = pl.rows[0];
   }
+ 
   const operators = parseInt(src?.operators_count) || 20;
   const hours = parseFloat(src?.working_hours) || 8;
   let eff = parseFloat(src?.efficiency) || 0.85;
-  if (eff > 1) eff = eff / 100;
-  if (eff > 1) eff = 1;
+  if (eff > 1) eff = eff / 100;   // tolerate 85 meaning 0.85
+  if (eff > 1) eff = 1;           // chk_efficiency_range: 0 < eff <= 1
   const sam = parseFloat(src?.sam_minutes) || 3.5;
   const targetPcs = Math.round((operators * hours * 60 * eff) / sam);
   const targetPerHour = hours > 0 ? Math.round(targetPcs / hours) : 0;
-
+ 
+  console.log(
+    `   ↳ inserting draft L${line} ${runDate} "${runStyle}" ` +
+    `(ops=${operators} h=${hours} sam=${sam} eff=${eff} target=${targetPcs}) tpl=${templateRunId}`
+  );
+ 
   const ins = await client.query(
     `INSERT INTO line_runs
        (line_no, run_date, style, operators_count, working_hours, sam_minutes,
         efficiency, target_pcs, target_per_hour, work_order_id, is_draft, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, NOW(), NOW())
-     ON CONFLICT (line_no, run_date, style) DO NOTHING
+     VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9, $10, true, NOW(), NOW())
+     ON CONFLICT ON CONSTRAINT uq_line_run DO NOTHING
      RETURNING id`,
     [line, runDate, runStyle, operators, hours, sam, eff, targetPcs, targetPerHour, workOrderId ?? null]
   );
-  if (ins.rowCount === 0) return null;
+ 
+  // Lost a race with a concurrent confirm: adopt the winner instead of bailing.
+  if (ins.rowCount === 0) {
+    const again = await client.query(
+      "SELECT id FROM line_runs WHERE line_no = $1 AND run_date = $2::date AND style = $3 LIMIT 1",
+      [line, runDate, runStyle]
+    );
+    if (!again.rows[0]) {
+      console.warn(`   ↳ INSERT did nothing and no row found for L${line} ${runDate} "${runStyle}"`);
+      return { runId: null, created: false };
+    }
+    await linkAssignments(again.rows[0].id);
+    return { runId: again.rows[0].id, created: false };
+  }
+ 
   const runId = ins.rows[0].id;
-
+  console.log(`   ↳ created run ${runId}`);
+ 
   await client.query(
     `INSERT INTO shift_slots (run_id, slot_order, slot_label, slot_start, slot_end, planned_hours)
      VALUES ($1, 1, $2, NULL, NULL, $3)`,
     [runId, "Turno", hours]
   );
-
-  // Inherit the operator roster from the template run so the draft shows the
-  // operators assigned to this line/style (operations themselves aren't copied).
+ 
+  // Inherit the operator roster from the template (operations aren't copied).
   if (templateRunId) {
     await client.query(
       `INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
@@ -5395,15 +5455,138 @@ async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderI
       [runId, templateRunId]
     );
   }
-
-  await client.query(
-    `UPDATE line_assignments SET line_run_id = $1
-      WHERE line_no = $2 AND assigned_date = $3 AND line_run_id IS NULL`,
-    [runId, line, runDate]
-  );
-
-  return runId;
+ 
+  await linkAssignments(runId);
+  return { runId, created: true };
 }
+
+// Remove an auto-created DRAFT run for a (line, day) once that cell no longer
+// has any active planner assignment. Confirmed runs (is_draft = false) — ones a
+// line leader already accepted, or that engineering configured directly — are
+// never touched, and days that still hold an assignment are left alone. Child
+// rows (shift_slots, run_operators, …) cascade on delete; line_assignments.
+// line_run_id is ON DELETE SET NULL, so any stray link just clears.
+async function cleanupOrphanDraftRuns(client, lineNo, runDate) {
+  if (!lineNo || !runDate) return 0;
+  const del = await client.query(
+    `DELETE FROM line_runs lr
+      WHERE lr.line_no = $1
+        AND lr.run_date = $2
+        AND lr.is_draft = true
+        AND NOT EXISTS (
+          SELECT 1 FROM line_assignments la
+           WHERE la.line_no = lr.line_no
+             AND la.assigned_date = lr.run_date
+             AND la.status NOT IN ('cancelled', 'rejected')
+        )
+      RETURNING lr.id`,
+    [String(lineNo), runDate]
+  );
+  return del.rowCount;
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/line-assignments/confirm
+//
+// The planner's explicit "send to line leaders" step. Given a set of assignment
+// ids (the cells the planner selected), create a DRAFT run for every distinct
+// (line, day) among them that doesn't already have a run. This replaces the old
+// behaviour where a draft was auto-created on every assign/move — which left a
+// stale draft behind each time an order was dragged to a new day.
+//
+// Body: { ids: number[] }   (assignment ids)
+// Returns: { success, created, alreadyPresent, cells, message }
+// ---------------------------------------------------------------------------
+app.post("/api/line-assignments/confirm", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  console.log("🔵 CONFIRM hit:", JSON.stringify(req.body), "user:", req.user?.id ?? req.user?.username);
+  try {
+    await setSchema(client);
+ 
+    const idList = Array.isArray(req.body?.ids)
+      ? [...new Set(req.body.ids.map((n) => parseInt(n)).filter((n) => Number.isInteger(n)))]
+      : [];
+    console.log("🔵 idList:", idList);
+ 
+    if (idList.length === 0) {
+      return res.status(400).json({ success: false, error: "ids (no vacío) es obligatorio" });
+    }
+ 
+    await client.query("BEGIN");
+ 
+    // Resolve the selected assignments to their distinct (line, day, order)
+    // cells. COALESCE guards a NULL status, which would otherwise make
+    // `status NOT IN (...)` evaluate to NULL and silently drop the row.
+    const rows = await client.query(
+      `SELECT DISTINCT line_no,
+              to_char(assigned_date, 'YYYY-MM-DD') AS run_date,
+              work_order_id
+         FROM line_assignments
+        WHERE id = ANY($1::bigint[])
+          AND assigned_date IS NOT NULL
+          AND COALESCE(status, 'planned') NOT IN ('cancelled', 'rejected')`,
+      [idList]
+    );
+    console.log("🔵 cells resolved:", rows.rows);
+ 
+    if (rows.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "No se encontraron asignaciones para confirmar" });
+    }
+ 
+    let created = 0;
+    let alreadyPresent = 0;
+    let failed = 0;
+    const confirmedCells = [];
+    const runIds = [];
+ 
+    for (const cell of rows.rows) {
+      const lineNo = String(cell.line_no);
+      const runDate = cell.run_date;
+ 
+      const { runId, created: isNew } = await ensureDraftRunForAssignment(client, {
+        lineNo,
+        runDate,
+        workOrderId: cell.work_order_id,
+        style: null,
+      });
+ 
+      if (!runId) {
+        failed++;
+        console.warn(`🟠 no run produced for L${lineNo} ${runDate} wo=${cell.work_order_id}`);
+        continue;
+      }
+ 
+      if (isNew) created++;
+      else alreadyPresent++;
+      runIds.push(runId);
+      confirmedCells.push({ lineNo, runDate, runId, isNew });
+    }
+ 
+    await client.query("COMMIT");
+    console.log(`🟢 CONFIRM done: created=${created} already=${alreadyPresent} failed=${failed} runIds=${runIds}`);
+ 
+    res.json({
+      success: true,
+      created,
+      alreadyPresent,
+      failed,
+      runIds,
+      cells: confirmedCells.length,
+      message:
+        `Se enviaron ${confirmedCells.length} casilla(s) a los líderes de línea ` +
+        `(${created} nueva(s), ${alreadyPresent} ya existente(s)` +
+        (failed > 0 ? `, ${failed} con error` : "") + `).`,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ CONFIRM failed:", err.code, err.constraint, err.message);
+    console.error(err.stack);
+    res.status(500).json({ success: false, error: err.message, code: err.code });
+  } finally {
+    client.release();
+  }
+});
 
 app.post("/api/line-assignments", authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -5522,14 +5705,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       [parseInt(workOrderId)]
     );
 
-    if (!lineData.id) {
-      await ensureDraftRunForAssignment(client, {
-      lineNo,
-      runDate: assignedDate,
-      workOrderId: parseInt(workOrderId),
-      style: null,
-    });
-}
+    
 
     await client.query("COMMIT");
 
@@ -5554,13 +5730,15 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
     const { id } = req.params;
 
     const existing = await client.query(
-      "SELECT work_order_id, assigned_date, (assigned_date < CURRENT_DATE) AS is_past FROM line_assignments WHERE id = $1",
+      "SELECT work_order_id, assigned_date, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str, (assigned_date < CURRENT_DATE) AS is_past FROM line_assignments WHERE id = $1",
       [parseInt(id)]
     );
     if (existing.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, error: "Assignment not found" });
     }
+    const delLineNo = String(existing.rows[0].line_no);
+    const delDate = existing.rows[0].assigned_date_str;
     // Safety net: never delete a cell dated before today (old assigned quantity).
     if (existing.rows[0].is_past) {
       await client.query("ROLLBACK");
@@ -5570,8 +5748,54 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
       });
     }
     const workOrderId = existing.rows[0].work_order_id;
+    const row = existing.rows[0];
 
-    await client.query("DELETE FROM line_assignments WHERE id = $1", [parseInt(id)]);
+    // A cell that already has production behind it must never be hard-deleted:
+    // SUM(assigned_quantity) would silently lose pieces that were really sewn,
+    // and the board would re-assign work the floor already did.
+    const cellProduced =
+      Number(row.produced_quantity) > 0
+        ? Number(row.produced_quantity)
+        : (
+            await client.query(
+              `SELECT COALESCE(SUM(se.sewed_qty), 0) AS produced
+                 FROM line_runs lr
+                 JOIN operation_sewed_entries se ON se.run_id = lr.id
+                WHERE lr.line_no = $1 AND lr.run_date = $2::date`,
+              [String(row.line_no), row.assigned_date]
+            )
+          ).rows[0].produced;
+
+    if (Number(cellProduced) > 0 && !req.query.force) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error:
+          `Esa celda ya tiene ${Number(cellProduced)} piezas reportadas. ` +
+          `Liquidala con /api/line-assignments/settle-day, o repite con ?force=true ` +
+          `para cancelarla (no se borra: se conserva el historial).`,
+        produced: Number(cellProduced),
+        assigned: Number(row.assigned_quantity) || 0,
+      });
+    }
+
+    if (Number(cellProduced) > 0) {
+      // Forced: cancel, never delete. Cancelled rows are excluded from every
+      // assigned SUM, so the pool frees up exactly as a delete would, but the
+      // produced history survives.
+      await client.query(
+        `UPDATE line_assignments SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
+        [parseInt(id)]
+      );
+    } else {
+      await client.query("DELETE FROM line_assignments WHERE id = $1", [parseInt(id)]);
+    }
+
+    // Whether the cell was hard-deleted or soft-cancelled, the day may now have
+    // no active assignment. Drop its unconfirmed draft run so line leaders don't
+    // keep seeing a draft for an emptied cell. (Cancelled rows count as inactive,
+    // and a cell with real production has a confirmed run, which is never touched.)
+    await cleanupOrphanDraftRuns(client, delLineNo, delDate);
 
     // If no active assignments remain, return the work order to 'pending'
     // (mirror of the POST, which moves 'pending' -> 'assigned').
