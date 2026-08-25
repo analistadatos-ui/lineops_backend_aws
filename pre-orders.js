@@ -41,7 +41,7 @@
 //
 // Body de POST / PUT (camelCase, como lo manda PreOrdenWizard):
 //   { tipo, modelo, correlativo, estilo?, styleDescription?,
-//     customerId, clienteCode, customerPo?, pieces, targetDate?, notes? }
+//     customerId, clienteCode, customerPo?, pieces, samMinutes?, targetDate?, notes? }
 // ==========================================================================
 
 async function initSchema({ pool, setSchema }) {
@@ -62,7 +62,8 @@ async function initSchema({ pool, setSchema }) {
         customer_name     VARCHAR(150),
         cliente_code      VARCHAR(3),
         customer_po       VARCHAR(60),
-        pieces            NUMERIC(12,2) NOT NULL DEFAULT 0, -- lo único cuantitativo
+        pieces            NUMERIC(12,2) NOT NULL DEFAULT 0, -- lo cuantitativo
+        sam_minutes       NUMERIC(10,2) NOT NULL DEFAULT 0,  -- SAM del estilo (opcional al capturar)
         target_date       DATE,
         notes             TEXT,
         status            VARCHAR(20)  NOT NULL DEFAULT 'pending', -- pending|converted|cancelled
@@ -81,6 +82,9 @@ async function initSchema({ pool, setSchema }) {
     // no agrega columnas a una tabla que ya vive en prod.
     await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS customer_po VARCHAR(60);");
     await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS target_date DATE;");
+    // SAM guardado desde la captura: alimenta la carga equivalente de la ficha
+    // de pre-orden en el tablero (eq/pza = SAM ÷ equivalencia) sin esperar a la PO.
+    await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS sam_minutes NUMERIC(10,2) NOT NULL DEFAULT 0;");
     await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS notes TEXT;");
     await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS work_order_ids BIGINT[] NOT NULL DEFAULT '{}';");
     await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS work_order_nos TEXT;");
@@ -109,7 +113,7 @@ const dateOr = (v) => (isYmd(v) ? v : null);
 const SELECT_COLS = `
   id, pre_order_no, tipo, modelo, correlativo, style_code, estilo,
   style_description, customer_id, customer_name, cliente_code, customer_po,
-  pieces, to_char(target_date, 'YYYY-MM-DD') AS target_date,
+  pieces, sam_minutes, to_char(target_date, 'YYYY-MM-DD') AS target_date,
   to_char(planned_week, 'YYYY-MM-DD') AS planned_week, notes, status,
   work_order_ids, work_order_nos,
   converted_at, converted_by, created_by, updated_by, created_at, updated_at
@@ -122,6 +126,8 @@ function parseBody(body) {
   const correlativo = up(body?.correlativo, 2);
   const customerId = body?.customerId == null || body.customerId === "" ? null : parseInt(body.customerId, 10);
   const pieces = numOr(body?.pieces, 0);
+  // SAM es opcional al capturar (se confirma en la PO); 0 = todavía sin dato.
+  const samMinutes = Math.max(0, numOr(body?.samMinutes ?? body?.sam_minutes ?? body?.sam, 0));
 
   const errors = [];
   if (!tipo) errors.push("tipo");
@@ -141,6 +147,7 @@ function parseBody(body) {
       clienteCode: up(body?.clienteCode, 3) || null,
       customerPo: txt(body?.customerPo, 60),
       pieces,
+      samMinutes,
       targetDate: dateOr(body?.targetDate),
       notes: txt(body?.notes, 2000),
     },
@@ -365,14 +372,14 @@ function registerPreOrders(app, deps) {
             `INSERT INTO pre_orders
                (pre_order_no, tipo, modelo, correlativo, style_code, estilo,
                 style_description, customer_id, customer_name, cliente_code,
-                customer_po, pieces, target_date, notes, status,
+                customer_po, pieces, sam_minutes, target_date, notes, status,
                 created_by, updated_by, created_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',$15,$15,NOW(),NOW())
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pending',$16,$16,NOW(),NOW())
              RETURNING ${SELECT_COLS}`,
             [preOrderNo, data.tipo, data.modelo, data.correlativo, data.styleCode,
              data.estilo, data.styleDescription, data.customerId, customerName,
-             clienteCode, data.customerPo, data.pieces, data.targetDate, data.notes,
-             req.user?.id ?? null]
+             clienteCode, data.customerPo, data.pieces, data.samMinutes, data.targetDate,
+             data.notes, req.user?.id ?? null]
           );
           row = rows[0];
         } catch (e) {
@@ -411,13 +418,14 @@ function registerPreOrders(app, deps) {
         `UPDATE pre_orders SET
             tipo = $2, modelo = $3, correlativo = $4, style_code = $5, estilo = $6,
             style_description = $7, customer_id = $8, customer_name = $9,
-            cliente_code = $10, customer_po = $11, pieces = $12, target_date = $13,
-            notes = $14, updated_by = $15, updated_at = NOW()
+            cliente_code = $10, customer_po = $11, pieces = $12, sam_minutes = $13,
+            target_date = $14, notes = $15, updated_by = $16, updated_at = NOW()
           WHERE id = $1
           RETURNING ${SELECT_COLS}`,
         [id, data.tipo, data.modelo, data.correlativo, data.styleCode, data.estilo,
          data.styleDescription, data.customerId, cust.rows[0].name, data.clienteCode,
-         data.customerPo, data.pieces, data.targetDate, data.notes, req.user?.id ?? null]
+         data.customerPo, data.pieces, data.samMinutes, data.targetDate, data.notes,
+         req.user?.id ?? null]
       );
       res.json({ success: true, preOrder: rows[0] });
     } catch (err) {
