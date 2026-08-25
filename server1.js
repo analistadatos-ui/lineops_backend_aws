@@ -2034,6 +2034,12 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
     dt.setUTCDate(dt.getUTCDate() + n);
     return dt.toISOString().slice(0, 10);
   };
+  // True for Saturday/Sunday (no timezone drift). No production on weekends.
+  const isWeekend = (ymdStr) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sun, 6 = Sat
+    return dow === 0 || dow === 6;
+  };
   try {
     await setSchema(client);
     const { ids, lineNo, assignedDate } = req.body;
@@ -2092,6 +2098,7 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
 
       while (remaining > 0 && scanned < MAX_DAYS) {
         scanned++;
+        if (isWeekend(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend work
         const { lines } = await getLineCapacityForDate(client, dayStr);
         const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
         if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no run -> skip
@@ -5411,6 +5418,17 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, error: "workOrderId, lineNo, assignedDate and a positive quantity are required" });
     }
 
+    // No production on weekends: reject Sat/Sun assignment dates outright.
+    const isWeekendYmd = (ymdStr) => {
+      const [y, m, d] = String(ymdStr).split("-").map(Number);
+      const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sun, 6 = Sat
+      return dow === 0 || dow === 6;
+    };
+    if (isWeekendYmd(assignedDate)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: "No se puede asignar en fin de semana (sábado o domingo)." });
+    }
+
     const woResult = await client.query(
       "SELECT id, total_to_produce, sam_minutes FROM work_orders WHERE id = $1",
       [parseInt(workOrderId)]
@@ -5470,7 +5488,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
 
     // change this line to also subtract heldOnCell:
     const availableCapacity = Math.max(0, parseFloat(lineData.target_pcs) - alreadyAssigned - heldOnCell);
-    
+
     if (qty > availableCapacity) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -5536,12 +5554,20 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
     const { id } = req.params;
 
     const existing = await client.query(
-      "SELECT work_order_id FROM line_assignments WHERE id = $1",
+      "SELECT work_order_id, assigned_date, (assigned_date < CURRENT_DATE) AS is_past FROM line_assignments WHERE id = $1",
       [parseInt(id)]
     );
     if (existing.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, error: "Assignment not found" });
+    }
+    // Safety net: never delete a cell dated before today (old assigned quantity).
+    if (existing.rows[0].is_past) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: "No se puede eliminar una asignación de un día anterior a hoy (cantidad ya asignada).",
+      });
     }
     const workOrderId = existing.rows[0].work_order_id;
 
