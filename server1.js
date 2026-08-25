@@ -7428,36 +7428,40 @@ app.get("/api/master-codes/next-correlativo", authenticateToken, requireMerchant
   const client = await pool.connect();
   try {
     await setSchema(client);
-    
+
     const { type, modelo } = req.query;
-    
+
     if (!type || !modelo) {
-      return res.status(400).json({ 
-        success: false, 
-        error: "type and modelo parameters are required" 
+      return res.status(400).json({
+        success: false,
+        error: "type and modelo parameters are required"
       });
     }
-    
-    // Find the highest correlativo for this type+modelo combination
+
+    // Highest correlativo across BOTH real master codes and pending pre-orders.
     const result = await client.query(
-      `SELECT correlativo 
-       FROM master_codes 
-       WHERE type = $1 AND modelo = $2 
-       ORDER BY correlativo::int DESC 
-       LIMIT 1`,
+      `SELECT COALESCE(MAX(c), 0) AS maxseq
+         FROM (
+           SELECT correlativo::int AS c
+             FROM master_codes
+            WHERE type = $1 AND modelo = $2
+              AND correlativo ~ '^[0-9]+$'
+           UNION ALL
+           SELECT correlativo::int AS c
+             FROM pre_orders
+            WHERE tipo = $1 AND modelo = $2
+              AND status = 'pending'
+              AND correlativo ~ '^[0-9]+$'
+         ) t`,
       [type, modelo]
     );
-    
+
     let nextCorrelativo = "01";
-    
-    if (result.rows.length > 0) {
-      const lastCorrelativo = parseInt(result.rows[0].correlativo, 10);
-      if (!isNaN(lastCorrelativo)) {
-        const next = lastCorrelativo + 1;
-        nextCorrelativo = String(next).padStart(2, '0');
-      }
+    const maxseq = parseInt(result.rows[0]?.maxseq, 10);
+    if (!isNaN(maxseq) && maxseq > 0) {
+      nextCorrelativo = String(maxseq + 1).padStart(2, "0");
     }
-    
+
     res.json({
       success: true,
       nextCorrelativo,
