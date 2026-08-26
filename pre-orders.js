@@ -75,7 +75,7 @@ async function initSchema({ pool, setSchema }) {
         updated_by        BIGINT,
         created_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
         updated_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
-        CONSTRAINT chk_pre_order_status CHECK (status IN ('pending','converted','cancelled'))
+        CONSTRAINT chk_pre_order_status CHECK (status IN ('pending','partially_converted','converted','cancelled'))
       );
     `);
     // Migraciones aditivas (no-op si ya existen): CREATE TABLE IF NOT EXISTS
@@ -94,6 +94,14 @@ async function initSchema({ pool, setSchema }) {
     // offline, POST fallido, tabla vieja), esta columna la salva y la PO nueva
     // aterriza donde estaba la pre-orden en vez de caer en "por asignar".
     await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS planned_week DATE;");
+    // Conversión incremental: una pre-orden con varias POs de cliente puede
+    // convertirse por partes (cuando llega la tela de cada PO). converted_pieces
+    // es el contador de lo ya convertido; mientras quede pieza por convertir la
+    // pre-orden vive como 'partially_converted'. La constraint de status se
+    // recrea para admitir el nuevo valor (no-op si ya lo admite).
+    await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS converted_pieces NUMERIC(12,2) NOT NULL DEFAULT 0;");
+    await client.query("ALTER TABLE pre_orders DROP CONSTRAINT IF EXISTS chk_pre_order_status;");
+    await client.query("ALTER TABLE pre_orders ADD CONSTRAINT chk_pre_order_status CHECK (status IN ('pending','partially_converted','converted','cancelled'));");
     await client.query("CREATE INDEX IF NOT EXISTS idx_pre_orders_status ON pre_orders(status);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_pre_orders_customer ON pre_orders(customer_id);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_pre_orders_created_at ON pre_orders(created_at);");
@@ -113,7 +121,10 @@ const dateOr = (v) => (isYmd(v) ? v : null);
 const SELECT_COLS = `
   id, pre_order_no, tipo, modelo, correlativo, style_code, estilo,
   style_description, customer_id, customer_name, cliente_code, customer_po,
-  pieces, sam_minutes, to_char(target_date, 'YYYY-MM-DD') AS target_date,
+  pieces, sam_minutes,
+  converted_pieces,
+  GREATEST(pieces - converted_pieces, 0) AS remaining_pieces,
+  to_char(target_date, 'YYYY-MM-DD') AS target_date,
   to_char(planned_week, 'YYYY-MM-DD') AS planned_week, notes, status,
   work_order_ids, work_order_nos,
   converted_at, converted_by, created_by, updated_by, created_at, updated_at
@@ -173,7 +184,14 @@ async function nextPreOrderNo(client) {
 //
 // Es best-effort: si algo falla aquí, la conversión ya ocurrió y no se toca.
 // Lo peor que pasa es que el merchant reacomode las nuevas POs a mano.
-async function carryPlanToWorkOrders(client, preOrderId, workOrderIds, fallbackWeek = null) {
+async function carryPlanToWorkOrders(client, preOrderId, workOrderIds, fallbackWeek = null, opts = {}) {
+  // finalize=true (default) = comportamiento de siempre: al heredar la semana a
+  // las POs, la ficha PRE del tablero se borra. finalize=false (conversión
+  // parcial) mete las POs nuevas al tablero pero CONSERVA la ficha PRE, solo la
+  // encoge por convertedPieces (lo que ya salió como PO real).
+  const finalize = opts.finalize !== false;
+  const convertedPieces = Math.max(0, Number(opts.convertedPieces) || 0);
+
   const { rows: planRows } = await client.query(
     `SELECT to_char(week_start,'YYYY-MM-DD') AS week_start, equivalence, created_by
        FROM merchant_week_plan WHERE pre_order_id = $1 LIMIT 1`,
@@ -183,7 +201,7 @@ async function carryPlanToWorkOrders(client, preOrderId, workOrderIds, fallbackW
   // La semana sale de la fila del tablero; si no existe, de pre_orders.planned_week.
   const week = plan?.week_start || fallbackWeek || null;
   if (!week || !workOrderIds.length) {
-    await client.query("DELETE FROM merchant_week_plan WHERE pre_order_id = $1", [preOrderId]);
+    if (finalize) await client.query("DELETE FROM merchant_week_plan WHERE pre_order_id = $1", [preOrderId]);
     return 0;
   }
 
@@ -249,8 +267,52 @@ async function carryPlanToWorkOrders(client, preOrderId, workOrderIds, fallbackW
       inserted++;
     }
   }
-  await client.query("DELETE FROM merchant_week_plan WHERE pre_order_id = $1", [preOrderId]);
+  // Cierre de la ficha PRE en el tablero.
+  if (finalize) {
+    // Todo convertido: la ficha PRE ya no tiene sentido.
+    await client.query("DELETE FROM merchant_week_plan WHERE pre_order_id = $1", [preOrderId]);
+  } else if (convertedPieces > 0) {
+    // Parcial: la ficha PRE SE QUEDA en su semana (para que el planner no la
+    // pierda) pero encoge por lo que ya salió como PO real, manteniendo honesto
+    // el snapshot del tablero. No se borra aunque llegue a 0.
+    await client.query(
+      `UPDATE merchant_week_plan
+          SET cantidad  = GREATEST(cantidad - $2, 0),
+              eq_pieces = GREATEST(cantidad - $2, 0) * eq_per_piece,
+              updated_at = NOW()
+        WHERE pre_order_id = $1`,
+      [preOrderId, convertedPieces]
+    );
+  }
   return inserted;
+}
+
+// Suelta capacidad de los "holds" del Plan Board proporcional a lo convertido:
+// camina los holds de la pre-orden (más antiguos primero) restando piezas hasta
+// agotar convertedPieces. Los que llegan a 0 se borran; el resto baja su cantidad
+// (siempre > 0, respetando el CHECK de la tabla).
+async function shrinkPreOrderHolds(client, preOrderId, byPieces) {
+  let remaining = Math.max(0, Number(byPieces) || 0);
+  if (remaining <= 0) return;
+  const { rows } = await client.query(
+    `SELECT id, quantity FROM pre_order_day_holds
+      WHERE pre_order_id = $1 ORDER BY assigned_date, id`,
+    [preOrderId]
+  );
+  for (const h of rows) {
+    if (remaining <= 0) break;
+    const q = Number(h.quantity) || 0;
+    if (q <= remaining) {
+      await client.query("DELETE FROM pre_order_day_holds WHERE id = $1", [h.id]);
+      remaining -= q;
+    } else {
+      await client.query(
+        "UPDATE pre_order_day_holds SET quantity = quantity - $2, updated_at = NOW() WHERE id = $1",
+        [h.id, remaining]
+      );
+      remaining = 0;
+    }
+  }
 }
 
 function registerPreOrders(app, deps) {
@@ -282,7 +344,7 @@ function registerPreOrders(app, deps) {
       await setSchema(client);
       const where = [];
       const params = [];
-      if (["pending", "converted", "cancelled"].includes(status)) {
+      if (["pending", "partially_converted", "converted", "cancelled"].includes(status)) {
         params.push(status);
         where.push(`status = $${params.length}`);
       }
@@ -302,7 +364,7 @@ function registerPreOrders(app, deps) {
         `SELECT ${SELECT_COLS}
            FROM pre_orders
           ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-          ORDER BY (status = 'pending') DESC, created_at DESC
+          ORDER BY (status IN ('pending','partially_converted')) DESC, created_at DESC
           LIMIT 500`,
         params
       );
@@ -316,6 +378,7 @@ function registerPreOrders(app, deps) {
         preOrders: rows,
         counts: {
           pending: byStatus.pending || 0,
+          partially_converted: byStatus.partially_converted || 0,
           converted: byStatus.converted || 0,
           cancelled: byStatus.cancelled || 0,
           all: counts.reduce((s, r) => s + r.n, 0),
@@ -436,10 +499,19 @@ function registerPreOrders(app, deps) {
     }
   });
 
-  // ---- POST /:id/convert: marcar como convertida -------------------------
+  // ---- POST /:id/convert: marcar como convertida (total o parcial) -------
   // La llama NuevaOrdenWizard DESPUÉS de que POST /api/production-orders
   // regresó OK, con los IDs y números de las órdenes que se crearon.
   // Idempotente: volver a llamarla une los números nuevos a los ya guardados.
+  //
+  // CONVERSIÓN INCREMENTAL
+  //   Una pre-orden puede traer varias POs de cliente y la tela de cada una
+  //   llega por separado. Con { partial:true, convertedPieces } el wizard
+  //   convierte SOLO la(s) PO cuya tela ya llegó: se crean sus POs reales, se
+  //   heredan al tablero, y la pre-orden queda 'partially_converted' con su
+  //   ficha PRE encogida por lo convertido — lista para volver a abrirse cuando
+  //   llegue la siguiente tela. Sin `partial` (o cuando el contador ya cubrió
+  //   todas las piezas) cierra la pre-orden con el comportamiento de siempre.
   app.post("/api/pre-orders/:id/convert", authenticateToken, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const ids = (Array.isArray(req.body?.workOrderIds) ? req.body.workOrderIds : [])
@@ -448,11 +520,15 @@ function registerPreOrders(app, deps) {
     const nos = (Array.isArray(req.body?.workOrderNos) ? req.body.workOrderNos : [])
       .map((v) => txt(v, 80))
       .filter(Boolean);
+    const partial = req.body?.partial === true;
+    const convertedPieces = Math.max(0, numOr(req.body?.convertedPieces, 0));
+
     const client = await pool.connect();
     try {
       await setSchema(client);
       const cur = await client.query(
-        `SELECT work_order_ids, work_order_nos, to_char(planned_week,'YYYY-MM-DD') AS planned_week
+        `SELECT work_order_ids, work_order_nos, pieces, converted_pieces,
+                to_char(planned_week,'YYYY-MM-DD') AS planned_week
            FROM pre_orders WHERE id = $1`, [id]);
       if (cur.rows.length === 0) return res.status(404).json({ success: false, error: "Pre-orden no encontrada" });
 
@@ -461,39 +537,57 @@ function registerPreOrders(app, deps) {
       const mergedIds = [...new Set([...prevIds.map(Number), ...ids])];
       const mergedNos = [...new Set([...prevNos, ...nos])];
 
+      const totalPieces = Number(cur.rows[0].pieces) || 0;
+      const newConvertedPieces = (Number(cur.rows[0].converted_pieces) || 0) + convertedPieces;
+      // Final si el que llama no pidió parcial, o si el contador ya cubrió todo.
+      const isFinal = !partial || newConvertedPieces >= totalPieces;
+      const newStatus = isFinal ? "converted" : "partially_converted";
+
       const { rows } = await client.query(
         `UPDATE pre_orders SET
-            status = 'converted',
+            status = $5,
             work_order_ids = $2,
             work_order_nos = $3,
-            converted_at = COALESCE(converted_at, NOW()),
-            converted_by = COALESCE(converted_by, $4),
+            converted_pieces = $6,
+            converted_at = CASE WHEN $7 THEN COALESCE(converted_at, NOW()) ELSE converted_at END,
+            converted_by = CASE WHEN $7 THEN COALESCE(converted_by, $4) ELSE converted_by END,
             updated_by = $4,
             updated_at = NOW()
           WHERE id = $1
           RETURNING ${SELECT_COLS}`,
-        [id, mergedIds, mergedNos.join(", ") || null, req.user?.id ?? null]
+        [id, mergedIds, mergedNos.join(", ") || null, req.user?.id ?? null, newStatus, newConvertedPieces, isFinal]
       );
 
       // Hereda la semana del tablero a las POs nuevas. Nunca tumba la conversión.
       let planned = 0;
       try {
-        planned = await carryPlanToWorkOrders(client, id, mergedIds, cur.rows[0].planned_week);
-        // Ya se heredó: la pre-orden deja de reservar semana.
-        await client.query("UPDATE pre_orders SET planned_week = NULL WHERE id = $1", [id]);
-        // Los "holds" del Plan Board (línea+día) ya no aplican: la PO real se
-        // asigna a los días normalmente. Se sueltan para liberar su capacidad.
-        // Protegido por si el módulo pre-order-holds aún no está desplegado.
-        try {
-          await client.query("DELETE FROM pre_order_day_holds WHERE pre_order_id = $1", [id]);
-        } catch (e) {
-          console.warn("\u26a0\ufe0f  no se pudieron soltar los holds de la pre-orden", id, e.message);
+        if (isFinal) {
+          // Comportamiento de siempre: borra la ficha PRE y suelta todos los holds.
+          planned = await carryPlanToWorkOrders(client, id, mergedIds, cur.rows[0].planned_week, { finalize: true });
+          await client.query("UPDATE pre_orders SET planned_week = NULL WHERE id = $1", [id]);
+          // Protegido por si el módulo pre-order-holds aún no está desplegado.
+          try {
+            await client.query("DELETE FROM pre_order_day_holds WHERE pre_order_id = $1", [id]);
+          } catch (e) {
+            console.warn("\u26a0\ufe0f  no se pudieron soltar los holds de la pre-orden", id, e.message);
+          }
+        } else {
+          // Parcial: mete las POs nuevas al tablero SIN borrar la ficha PRE, y
+          // encoge la ficha + los holds por lo que ya salió. Conserva planned_week
+          // para que el resto siga reservando su semana.
+          planned = await carryPlanToWorkOrders(client, id, mergedIds, cur.rows[0].planned_week,
+            { finalize: false, convertedPieces });
+          try {
+            await shrinkPreOrderHolds(client, id, convertedPieces);
+          } catch (e) {
+            console.warn("\u26a0\ufe0f  no se pudieron encoger los holds de la pre-orden", id, e.message);
+          }
         }
       } catch (e) {
         console.warn("\u26a0\ufe0f  plan carry-over falló para pre-orden", id, e.message);
       }
 
-      res.json({ success: true, preOrder: rows[0], plannedRows: planned });
+      res.json({ success: true, preOrder: rows[0], plannedRows: planned, partial: !isFinal });
     } catch (err) {
       console.error("\u274c POST /api/pre-orders/:id/convert:", err.message);
       res.status(500).json({ success: false, error: err.message });
@@ -520,12 +614,12 @@ function registerPreOrders(app, deps) {
       const { rows } = await client.query(
         `UPDATE pre_orders
             SET planned_week = $2, updated_by = $3, updated_at = NOW()
-          WHERE id = $1 AND status = 'pending'
+          WHERE id = $1 AND status IN ('pending','partially_converted')
           RETURNING ${SELECT_COLS}`,
         [id, weekStart, req.user?.id ?? null]
       );
       if (rows.length === 0) {
-        return res.status(400).json({ success: false, error: "No existe o ya no está pendiente" });
+        return res.status(400).json({ success: false, error: "No existe o ya no es planeable (pendiente o parcial)" });
       }
       res.json({ success: true, preOrder: rows[0] });
     } catch (err) {
