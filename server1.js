@@ -2019,6 +2019,157 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// PATCH /api/line-assignments/:id/insert-shift
+//
+// "Insert" a moved assignment onto an OCCUPIED day and push the whole tail of
+// that line forward by one workday. Concretely: drop order A onto line L / day D
+// where D already has an order, and A takes D while every PLANNED assignment on
+// line L with assigned_date >= D (except A itself) slides to its next workday.
+// Gaps are preserved — each affected block simply shifts +1 workday (Fri -> Mon),
+// so the relative sequence and spacing on the line are kept intact.
+//
+// Contrast with /move (which packs A into the day's remaining capacity and
+// spills the REMAINDER forward, never displacing the existing occupant). Here
+// the occupant is displaced.
+//
+// Safety:
+//  - One transaction: any failure rolls the entire ripple back.
+//  - The tail shift is applied row-by-row from the LATEST date backward so no
+//    two planned rows ever momentarily share a (work_order,line,day,color) slot
+//    and trip uq_line_assign_planned_cell (the classic shift-by-one collision).
+//  - Only status='planned' rows shift; released/completed/cancelled history is
+//    left untouched.
+//  - Weekends are skipped (a Friday block lands on the following Monday).
+// ---------------------------------------------------------------------------
+app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  const addDaysStr = (ymdStr, k) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + k);
+    return dt.toISOString().slice(0, 10);
+  };
+  const isWeekend = (ymdStr) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+    return dow === 0 || dow === 6;
+  };
+  // Next production day: +1, then hop over Sat/Sun.
+  const nextWorkday = (ymdStr) => {
+    let d = addDaysStr(ymdStr, 1);
+    while (isWeekend(d)) d = addDaysStr(d, 1);
+    return d;
+  };
+  try {
+    await setSchema(client);
+    const id = parseInt(req.params.id);
+    const { lineNo, assignedDate } = req.body;
+    if (!lineNo || !assignedDate) {
+      return res.status(400).json({ success: false, error: "lineNo y assignedDate son obligatorios" });
+    }
+    if (isWeekend(assignedDate)) {
+      return res.status(400).json({ success: false, error: "No se puede insertar en fin de semana. Elija un dia entre semana." });
+    }
+
+    await client.query("BEGIN");
+
+    const cur = await client.query(
+      "SELECT id, work_order_id, assigned_quantity, available_minutes, required_production_rate, color, status, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str FROM line_assignments WHERE id = $1",
+      [id]
+    );
+    if (cur.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Assignment not found" });
+    }
+    const a = cur.rows[0];
+    const sourceLineNo = String(a.line_no);
+    const sourceDate = a.assigned_date_str;
+    const targetLine = String(lineNo);
+    const D = assignedDate;
+
+    // 1) Remove the moved block up front (we re-insert it at the target below).
+    //    Deleting first — rather than excluding it by id — means a same-order
+    //    sibling slice on the previous workday can shift into this block's old
+    //    day without tripping uq_line_assign_planned_cell. Same delete-then-
+    //    reinsert shape the /move route uses.
+    await client.query("DELETE FROM line_assignments WHERE id = $1", [id]);
+
+    // 2) Push the whole tail of the target line forward one workday, latest
+    //    first, so each block lands on a slot the next block already vacated.
+    //    The occupant of D itself is part of the tail, so D ends up empty.
+    const tail = await client.query(
+      `SELECT id, to_char(assigned_date, 'YYYY-MM-DD') AS d
+         FROM line_assignments
+        WHERE line_no = $1
+          AND assigned_date >= $2
+          AND status = 'planned'
+        ORDER BY assigned_date DESC, id DESC`,
+      [targetLine, D]
+    );
+    for (const row of tail.rows) {
+      const nd = nextWorkday(row.d);
+      await client.query(
+        `UPDATE line_assignments
+            SET assigned_date = $1, planned_start_date = $1, planned_end_date = $1, updated_at = now()
+          WHERE id = $2`,
+        [nd, row.id]
+      );
+    }
+
+    // 3) Re-insert the moved order on the now-vacated target cell. Recompute the
+    //    informational rate columns from the target line's run for D when one
+    //    exists; otherwise keep the block's own values (columns are NOT NULL).
+    const woRes = await client.query("SELECT sam_minutes FROM work_orders WHERE id = $1", [a.work_order_id]);
+    const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
+    const { lines } = await getLineCapacityForDate(client, D);
+    const lineData = lines.find((l) => String(l.line_no) === targetLine);
+
+    let availableMinutes = parseFloat(a.available_minutes) || 0;
+    let requiredRate = parseFloat(a.required_production_rate) || 0;
+    let lineRunId = null;
+    if (lineData) {
+      const operators = parseInt(lineData.operators_count) || 20;
+      const workingHours = parseFloat(lineData.working_hours) || 8;
+      const efficiency = parseFloat(lineData.efficiency) || 0.85;
+      const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
+      availableMinutes = operators * workingHours * 60 * efficiency;
+      requiredRate = samMinutes > 0 ? availableMinutes / samMinutes : 0;
+      lineRunId = lineData.id || null;
+    }
+
+    const status = ["planned", "released", "completed", "cancelled"].includes(a.status) ? a.status : "planned";
+    const placed = await client.query(
+      `INSERT INTO line_assignments
+          (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+           available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING *`,
+      [a.work_order_id, lineRunId, targetLine, D, a.assigned_quantity,
+       availableMinutes, requiredRate, D, D, status, a.color || null]
+    );
+
+    // 4) The block's old cell may now be empty — drop any orphan draft run there.
+    if (!(sourceLineNo === targetLine && sourceDate === D)) {
+      await cleanupOrphanDraftRuns(client, sourceLineNo, sourceDate);
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      assignment: placed.rows[0] || null,
+      shifted: tail.rows.length,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ Error inserting/shifting line assignment:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // POST /api/line-assignments/move-batch
 //
