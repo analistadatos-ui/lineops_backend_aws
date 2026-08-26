@@ -890,6 +890,7 @@ registerWorkOrders(app, {
   generatePresignedGetUrl,
    uploadBufferToS3,      // add
   makeStylePhotoKey,     // add
+  deleteFromS3,          // ← add this line
 });
 const registerMechanicsSummary = require("./mecanics-summary");
 registerMechanicsSummary(app, authenticateToken);

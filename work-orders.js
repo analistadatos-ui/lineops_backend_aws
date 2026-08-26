@@ -411,7 +411,7 @@ const VALID_STATUSES = ["pending", "assigned", "in_progress", "completed", "canc
  * @param {(filename: string) => string} [deps.makeStylePhotoKey]
  */
 function registerWorkOrders(app, deps) {
-  const { authenticateToken, pool, setSchema, uploadBufferToS3, makeStylePhotoKey } = deps;
+  const { authenticateToken, pool, setSchema, uploadBufferToS3, makeStylePhotoKey, deleteFromS3 } = deps;
   // Different server files inject the presigned-GET helper under different names:
   //   server1.js → generatePresignedGetUrl (from s3-raw)
   //   server.js  → getCachedPresignedUrl   (from presignCache)
@@ -1344,6 +1344,7 @@ function registerWorkOrders(app, deps) {
   // total_to_produce plus the header fabric+date copies are recomputed.
   app.put("/api/production-orders/:id", authenticateToken, async (req, res) => {
     const client = await pool.connect();
+    let uploadedPhotoKey = null; // replacement image key; dropped from S3 only if the txn fails
     try {
       await setSchema(client);
       const { id } = req.params;
@@ -1352,7 +1353,21 @@ function registerWorkOrders(app, deps) {
         warehouseStock, extraQuantity, totalToProduce,
         customerPo, commitmentDate, fabricName, fabricCode, yield: yieldPerPiece,
         lines,
+        photoKey: photoKeyInput,   // replacement style image (from /api/master-codes/photo-upload-url)
+        removePhoto,               // boolean: clear the style image
       } = req.body;
+
+      // Photo swap/remove applies to EVERY master code this order uses (the image
+      // is a property of the style, not of one code). newPhotoFilename:
+      //   string  -> swap to this key
+      //   null    -> remove the image
+      //   undefined -> leave photos untouched
+      const wantPhotoSwap = typeof photoKeyInput === "string" && photoKeyInput.trim() !== "";
+      const wantPhotoRemove = removePhoto === true || removePhoto === "true";
+      const newPhotoFilename = wantPhotoSwap ? photoKeyInput.trim() : (wantPhotoRemove ? null : undefined);
+      const photoChanged = newPhotoFilename !== undefined;
+      let oldPhotoKeys = [];              // deleted from S3 after a successful commit
+      uploadedPhotoKey = wantPhotoSwap ? photoKeyInput.trim() : null; // dropped if the txn fails
 
       const txt = (v) => (v == null ? null : String(v).trim() || null);
       const num = (v) =>
@@ -1458,6 +1473,12 @@ function registerWorkOrders(app, deps) {
           photoUrl = mc.rows[0]?.photo_url || null;
           photoKey = mc.rows[0]?.photo_filename || null;
         }
+        // If the caller is swapping/removing the image, any NEW code created for
+        // these lines must carry the new one (existing codes are updated below).
+        if (photoChanged) {
+          photoKey = newPhotoFilename;                                             // null on remove
+          photoUrl = newPhotoFilename ? generatePresignedGetUrl(newPhotoFilename, 3600) : null;
+        }
         if (!CLI) {
           const cid = set.customer_id ?? wo.customer_id;
           const cc = await client.query("SELECT code FROM customers WHERE id = $1", [cid]);
@@ -1524,6 +1545,43 @@ function registerWorkOrders(app, deps) {
         set.fabric_supplier = set.fabric_name;
       }
 
+      // -------- style image (applies to EVERY master code of this order) ----
+      // Runs after the breakdown is (re)written so it picks up any codes just
+      // created, and also covers the case where `lines` wasn't sent at all.
+      if (photoChanged) {
+        const idRes = await client.query(
+          `SELECT DISTINCT master_code_id AS id
+             FROM work_order_lines
+            WHERE work_order_id = $1 AND master_code_id IS NOT NULL
+           UNION
+           SELECT master_code_id AS id
+             FROM work_orders
+            WHERE id = $1 AND master_code_id IS NOT NULL`,
+          [id]
+        );
+        const mcIds = idRes.rows.map((r) => r.id);
+        if (mcIds.length > 0) {
+          // Remember the old objects so we can delete them from S3 after commit.
+          const oldRes = await client.query(
+            `SELECT DISTINCT photo_filename
+               FROM master_codes
+              WHERE id = ANY($1::bigint[]) AND photo_filename IS NOT NULL`,
+            [mcIds]
+          );
+          oldPhotoKeys = oldRes.rows
+            .map((r) => r.photo_filename)
+            .filter((k) => k && k !== newPhotoFilename);
+
+          const newUrl = newPhotoFilename ? generatePresignedGetUrl(newPhotoFilename, 3600) : null;
+          await client.query(
+            `UPDATE master_codes
+                SET photo_filename = $1, photo_url = $2, updated_at = NOW()
+              WHERE id = ANY($3::bigint[])`,
+            [newPhotoFilename, newUrl, mcIds]
+          );
+        }
+      }
+
       // Explicit header values win over the ones derived from the lines.
       if (customerPo !== undefined) set.customer_po = txt(customerPo);
       if (commitmentDate !== undefined) set.commitment_date = commitmentDate || null;
@@ -1539,7 +1597,7 @@ function registerWorkOrders(app, deps) {
       }
 
       const cols = Object.keys(set);
-      if (cols.length === 0 && !Array.isArray(lines)) {
+      if (cols.length === 0 && !Array.isArray(lines) && !photoChanged) {
         await client.query("ROLLBACK");
         return res.status(400).json({ success: false, error: "No fields to update" });
       }
@@ -1555,6 +1613,14 @@ function registerWorkOrders(app, deps) {
       }
 
       await client.query("COMMIT");
+
+      // The previous image(s) are now unreferenced by this order — clean up
+      // (best effort; a leftover object is harmless, a failed request isn't).
+      if (photoChanged && oldPhotoKeys.length > 0 && typeof deleteFromS3 === "function") {
+        for (const k of oldPhotoKeys) {
+          try { await deleteFromS3(k); } catch (e) { console.error("⚠️  deleteFromS3 (old style photo):", e.message); }
+        }
+      }
 
       // Return the saved row with its fresh breakdown.
       const back = await client.query(
@@ -1574,6 +1640,11 @@ function registerWorkOrders(app, deps) {
       res.json({ success: true, message: "Production order updated", workOrder: row });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
+      // The browser already pushed the replacement image to S3; if the DB write
+      // failed nothing references it, so drop it to avoid an orphan.
+      if (uploadedPhotoKey && typeof deleteFromS3 === "function") {
+        await deleteFromS3(uploadedPhotoKey).catch(() => {});
+      }
       console.error("❌ Error updating production order:", err.message);
       if (err.code === "23505") return res.status(400).json({ success: false, error: "Línea duplicada para esta orden (talla+color+estilo)" });
       res.status(500).json({ success: false, error: err.message });
