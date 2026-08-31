@@ -40,6 +40,11 @@ const logger = winston.createLogger({
 const app = express();
 
 app.use(helmet());
+app.set("etag", false);
+app.use("/api/", (req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+});
 app.use(compression());
 app.use(express.json({ limit: "12mb" }));
 
@@ -333,7 +338,26 @@ await client.query(`
   );
 `);
 console.log("✅ quality_defect_types table ready");
-
+    // Planner-defined lines (engineering hasn't configured them yet) + draft flag.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS planner_lines(
+        line_no TEXT PRIMARY KEY,
+        operators_count INT NOT NULL DEFAULT 20,
+        working_hours NUMERIC(6,2) NOT NULL DEFAULT 8,
+        sam_minutes NUMERIC(10,2) NOT NULL DEFAULT 3.5,
+        efficiency NUMERIC(4,3) NOT NULL DEFAULT 0.85,
+        target_pcs NUMERIC(12,2) NOT NULL DEFAULT 0,
+        target_per_hour NUMERIC(12,2) NOT NULL DEFAULT 0,
+        created_by TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT chk_planner_eff CHECK (efficiency > 0 AND efficiency <= 1),
+        CONSTRAINT chk_planner_hours CHECK (working_hours > 0),
+        CONSTRAINT chk_planner_sam CHECK (sam_minutes > 0)
+      );
+    `);
+    await client.query("ALTER TABLE line_runs ADD COLUMN IF NOT EXISTS is_draft BOOLEAN NOT NULL DEFAULT false;");
+    console.log("✅ planner_lines + line_runs.is_draft ready in prod_db_schema");
 // 10. Create quality_defect_reasons table (master data)
 await client.query(`
   CREATE TABLE IF NOT EXISTS quality_defect_reasons(
@@ -500,13 +524,110 @@ await client.query("CREATE INDEX IF NOT EXISTS idx_master_codes_talla ON master_
 await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS master_code_id BIGINT REFERENCES master_codes(id) ON DELETE SET NULL;`);
 console.log("✅ work_orders.master_code_id linked to master_codes");
 
+
+// ---- Printed production tickets --------------------------------------------
+// Every confirmed print batch from the line-leader ticket builder is logged
+// here (one row per talla+color+PO per confirm). The sum of `quantity` for a
+// (work_order_id, estilo, talla, color, customer_po) is subtracted from the
+// merchant size breakdown in /api/get-run-data, so the "Asignado" quantity the
+// builder shows keeps decreasing as tickets are printed. Scoped to the work
+// order (not the run) on purpose: a new run/day for the same WO still sees the
+// already-printed amounts removed.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS ticket_prints(
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES line_runs(id) ON DELETE CASCADE,
+    work_order_id BIGINT REFERENCES work_orders(id) ON DELETE SET NULL,
+    estilo VARCHAR(20),
+    talla VARCHAR(20) NOT NULL,
+    color VARCHAR(40) NOT NULL DEFAULT '',
+    customer_po VARCHAR(80) NOT NULL DEFAULT '',
+    quantity NUMERIC(12,2) NOT NULL,
+    ticket_count INT NOT NULL DEFAULT 0,
+    printed_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_ticket_print_qty_positive CHECK (quantity > 0)
+  );
+`);
+await client.query("CREATE INDEX IF NOT EXISTS idx_ticket_prints_run ON ticket_prints(run_id);");
+await client.query("CREATE INDEX IF NOT EXISTS idx_ticket_prints_wo ON ticket_prints(work_order_id, estilo, talla, color, customer_po);");
+console.log("✅ ticket_prints table ready in prod_db_schema");
+
+
+
 await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_status ON work_orders(status);");
 await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_wo_no ON work_orders(work_order_no);");
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_line ON line_assignments(line_no, assigned_date);");
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_assignments_work_order ON line_assignments(work_order_id);");
+// ---- One work-order+color = one cell per line-day ---------------------------
+// A single (work_order, line, day, color) must live in ONE planned row. Before
+// this rule existed, repeated packing could leave several slivers of the same
+// order+color stacked in one cell (e.g. 386 + 21 + 11). Collapse any such
+// leftovers into a single row (summing the pieces), then add a partial unique
+// index so fragments can never reappear. Only 'planned' rows are touched;
+// completed/cancelled history is left exactly as it is.
+// NOTE: runMigrations() already wraps this whole block in one transaction, so
+// these run atomically — no local BEGIN/COMMIT (that would close the outer tx).
+//
+// Sum every duplicate group into its oldest row...
+await client.query(`
+  WITH dups AS (
+    SELECT MIN(id) AS keep_id,
+           SUM(assigned_quantity) AS total_qty,
+           MIN(planned_start_date) AS start_d,
+           MAX(planned_end_date)   AS end_d
+      FROM line_assignments
+     WHERE status = 'planned'
+     GROUP BY work_order_id, line_no, assigned_date, COALESCE(color, '')
+    HAVING COUNT(*) > 1
+  )
+  UPDATE line_assignments la
+     SET assigned_quantity  = d.total_qty,
+         planned_start_date = COALESCE(d.start_d, la.planned_start_date),
+         planned_end_date   = COALESCE(d.end_d,   la.planned_end_date),
+         updated_at = now()
+    FROM dups d
+   WHERE la.id = d.keep_id;
+`);
+// ...then drop the now-redundant slivers (everything but the oldest per group).
+await client.query(`
+  DELETE FROM line_assignments la
+   USING (
+     SELECT id,
+            ROW_NUMBER() OVER (
+              PARTITION BY work_order_id, line_no, assigned_date, COALESCE(color, '')
+              ORDER BY id
+            ) AS rn
+       FROM line_assignments
+      WHERE status = 'planned'
+   ) r
+   WHERE la.id = r.id AND r.rn > 1;
+`);
+// Backstop: at most one planned row per work-order+line+day+color from now on.
+await client.query(
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_line_assign_planned_cell
+     ON line_assignments (work_order_id, line_no, assigned_date, (COALESCE(color, '')))
+   WHERE status = 'planned';`
+);
+console.log("✅ line_assignments consolidated to one planned row per cell (wo+line+day+color)");
+// ── INSERTAR AQUÍ ─────────────────────────────────────────────────────────
+// line_runs.work_order_id se INSERTA en /api/save-production pero nunca se creo
+// en el CREATE TABLE de arriba. Sin esta columna resolveProducedSubquery no
+// encuentra como ligar la corrida con la orden y produced_quantity queda en 0.
+await client.query(`ALTER TABLE line_runs ADD COLUMN IF NOT EXISTS work_order_id BIGINT REFERENCES work_orders(id) ON DELETE SET NULL;`);
+await client.query("CREATE INDEX IF NOT EXISTS idx_line_runs_work_order ON line_runs(work_order_id);");
+// ────
 
-
+await registerHolidays.initSchema({ pool, setSchema });
+await registerFinishedWarehouseAnalytics.initSchema({ pool, setSchema });
+// ~línea 622, en el bloque async de arranque, junto a los otros initSchema:
+await registerPreOrders.initSchema({ pool, setSchema });
+await registerMerchantAnalytics.initSchema({ pool, setSchema });
+await registerMerchantPlan.initSchema({ pool, setSchema });
+await registerPreOrderHolds.initSchema({ pool, setSchema });   // ← add
 await registerCutOrders.initSchema({ pool, setSchema });
+await registerFinishedWarehouse.initSchema({ pool, setSchema });
+await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
 
     // Create index for faster queries
     await client.query("CREATE INDEX IF NOT EXISTS idx_capacity_history_operation ON operator_capacity_history(operation_id);");
@@ -737,6 +858,29 @@ app.post(
 app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
+const registerHolidays = require("./holidays");
+registerHolidays(app, { authenticateToken, pool, setSchema });
+// ~línea 867, junto a registerMerchantPlan:
+const registerPreOrders = require("./pre-orders");
+registerPreOrders(app, { authenticateToken, pool, setSchema });
+// with the other requires / registrations, near registerFinishedWarehouse:
+const registerFinishedWarehouseAnalytics = require("./finished-warehouse-analytics");
+registerFinishedWarehouseAnalytics(app, { authenticateToken, pool, setSchema });
+
+const registerPreOrderHolds = require("./pre-order-holds");
+registerPreOrderHolds(app, { authenticateToken, pool, setSchema });
+
+const registerCutOrderAnalytics = require("./cut-order-analytics");
+registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema });
+
+const registerMerchantAnalytics = require("./merchant-analytics");
+registerMerchantAnalytics(app, { authenticateToken, pool, setSchema });
+
+const registerMerchantPlan = require("./merchant-plan");
+registerMerchantPlan(app, { authenticateToken, pool, setSchema });
+
+const registerFinishedWarehouse = require("./finished-warehouse");
+registerFinishedWarehouse(app, { authenticateToken, pool, setSchema });
 
 const registerCutOrders = require("./cut-orders");
 registerCutOrders(app, { authenticateToken, pool, setSchema });
@@ -749,6 +893,7 @@ registerWorkOrders(app, {
   generatePresignedGetUrl,
    uploadBufferToS3,      // add
   makeStylePhotoKey,     // add
+  deleteFromS3,          // ← add this line
 });
 const registerMechanicsSummary = require("./mecanics-summary");
 registerMechanicsSummary(app, authenticateToken);
@@ -1093,7 +1238,46 @@ app.post(
       }
 
       await client.query("COMMIT");
-      res.json({ success: true, updatedCount });
+
+       let autoCompleted = null;
+      try {
+        const runInfo = await client.query(
+          `SELECT work_order_id, line_no, to_char(run_date, 'YYYY-MM-DD') AS day
+             FROM line_runs WHERE id = $1`,
+          [runId]
+        );
+        const r = runInfo.rows[0];
+        if (r && r.work_order_id) {
+          autoCompleted = await registerWorkOrders.autoCompleteDay(client, {
+            workOrderId: r.work_order_id,
+            lineNo: r.line_no,
+            day: r.day,
+          });
+        }
+      } catch (e) {
+        console.warn("⚠️  auto-cierre de celda falló (el guardado sí se realizó):", e.message);
+      }
+
+      // Mueve el estado de la ORDEN según lo producido: producido>0 -> en proceso,
+      // producido>=asignado -> terminada. Solo empuja hacia adelante y nunca
+      // degrada. Es aparte del auto-cierre de celda (autoCompleteDay), que solo
+      // toca line_assignments; esto actualiza wo.status, que es lo que ve el
+      // planeador en OrderStatus.jsx.
+      let statusChange = null;
+      try {
+        const runInfo2 = await client.query(
+          `SELECT work_order_id FROM line_runs WHERE id = $1`,
+          [runId]
+        );
+        const woId = runInfo2.rows[0]?.work_order_id;
+        if (woId) {
+          statusChange = await registerWorkOrders.refreshWorkOrderStatusFromProduction(client, woId);
+        }
+      } catch (e) {
+        console.warn("⚠️  recálculo de estado de la orden falló (el guardado sí se realizó):", e.message);
+      }
+
+      res.json({ success: true, updatedCount, autoCompleted, statusChange });
     } catch (err) {
       await client.query("ROLLBACK");
       next(err);
@@ -1102,6 +1286,192 @@ app.post(
     }
   }
 );
+
+
+// ✅ Confirm & save a batch of printed tickets.
+// Called from the line-leader ticket builder when the leader presses
+// "Confirmar y guardar" on the generated tickets. Persists what was printed so
+// the merchant size breakdown returned by /api/get-run-data is reduced by the
+// printed amount on subsequent loads (see the ticket_prints subtraction below).
+//
+// Body: { tickets: [{ talla, color?, customerPo?, qty, count? }, ...] }
+//   - qty:   pieces on that ticket/line
+//   - count: how many physical tickets it represents (optional, for the log)
+// Multiple entries for the same talla+color+PO are aggregated into one row.
+app.post("/api/lineleader/confirm-tickets/:runId", authenticateToken, async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { runId } = req.params;
+    const { tickets } = req.body;
+
+    if (!Array.isArray(tickets) || tickets.length === 0) {
+      return res.status(400).json({ success: false, error: "Missing tickets array" });
+    }
+
+    // Resolve the run so we can scope the print log to the work order + estilo.
+    const runResult = await client.query(
+      `SELECT id, work_order_id, style FROM line_runs WHERE id = $1`,
+      [runId]
+    );
+    if (runResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Run not found" });
+    }
+    const { work_order_id: workOrderId, style: estilo } = runResult.rows[0];
+
+    // Aggregate incoming tickets by talla+color+PO.
+    const norm = (v) => String(v == null ? "" : v).trim();
+    const agg = new Map(); // key -> { talla, color, customerPo, quantity, count }
+    for (const t of tickets) {
+      const talla = norm(t.talla);
+      if (!talla) continue;
+      const color = norm(t.color);
+      const customerPo = norm(t.customerPo ?? t.customer_po);
+      const qty = Math.max(0, Math.floor(Number(t.qty) || 0));
+      if (qty <= 0) continue;
+      const count = Math.max(0, Math.floor(Number(t.count) || 1));
+      const key = `${talla}||${color}||${customerPo}`;
+      const cur = agg.get(key) || { talla, color, customerPo, quantity: 0, count: 0 };
+      cur.quantity += qty;
+      cur.count += count;
+      agg.set(key, cur);
+    }
+
+    const rows = [...agg.values()];
+    if (rows.length === 0) {
+      return res.status(400).json({ success: false, error: "No valid ticket quantities to save" });
+    }
+
+    // Defensive guard: never let confirmed prints exceed the merchant quantity
+    // assigned to a size. We compare (already printed + this batch) against the
+    // work-order size breakdown, using the same COALESCE grouping as
+    // get-run-data so the keys line up.
+    if (workOrderId) {
+      const overflow = [];
+      for (const r of rows) {
+        let assignedRes = await client.query(
+          `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+             FROM work_order_lines
+            WHERE work_order_id = $1 AND estilo = $2
+              AND talla = $3 AND COALESCE(color,'') = $4 AND COALESCE(customer_po,'') = $5`,
+          [workOrderId, estilo, r.talla, r.color, r.customerPo]
+        );
+        let assigned = Number(assignedRes.rows[0]?.qty || 0);
+        if (assigned === 0) {
+          assignedRes = await client.query(
+            `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+               FROM work_order_lines
+              WHERE work_order_id = $1
+                AND talla = $2 AND COALESCE(color,'') = $3 AND COALESCE(customer_po,'') = $4`,
+            [workOrderId, r.talla, r.color, r.customerPo]
+          );
+          assigned = Number(assignedRes.rows[0]?.qty || 0);
+        }
+
+        const printedRes = await client.query(
+          `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+             FROM ticket_prints
+            WHERE work_order_id = $1 AND (estilo = $2 OR estilo IS NULL)
+              AND talla = $3 AND color = $4 AND customer_po = $5`,
+          [workOrderId, estilo, r.talla, r.color, r.customerPo]
+        );
+        const alreadyPrinted = Number(printedRes.rows[0]?.qty || 0);
+
+        // Only enforce when we actually have a merchant assignment to compare
+        // against; sizes without a breakdown (assigned = 0) are left unguarded.
+        if (assigned > 0 && alreadyPrinted + r.quantity > assigned) {
+          overflow.push({
+            talla: r.talla,
+            color: r.color,
+            customerPo: r.customerPo,
+            assigned,
+            alreadyPrinted,
+            requested: r.quantity,
+            remaining: Math.max(0, assigned - alreadyPrinted),
+          });
+        }
+      }
+      if (overflow.length > 0) {
+        return res.status(409).json({
+          success: false,
+          error: "La cantidad a imprimir excede lo asignado para una o más tallas.",
+          overflow,
+        });
+      }
+    }
+
+    // Persist one log row per aggregated size.
+    await client.query("BEGIN");
+    let savedQty = 0;
+    let savedTickets = 0;
+    for (const r of rows) {
+      await client.query(
+        `INSERT INTO ticket_prints
+           (run_id, work_order_id, estilo, talla, color, customer_po, quantity, ticket_count, printed_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [runId, workOrderId, estilo, r.talla, r.color, r.customerPo, r.quantity, r.count, req.user?.id || null]
+      );
+      savedQty += r.quantity;
+      savedTickets += r.count;
+    }
+    await client.query("COMMIT");
+
+    // Return the new remaining per size so the client can update immediately.
+    const remaining = [];
+    if (workOrderId) {
+      for (const r of rows) {
+        let assignedRes = await client.query(
+          `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+             FROM work_order_lines
+            WHERE work_order_id = $1 AND estilo = $2
+              AND talla = $3 AND COALESCE(color,'') = $4 AND COALESCE(customer_po,'') = $5`,
+          [workOrderId, estilo, r.talla, r.color, r.customerPo]
+        );
+        let assigned = Number(assignedRes.rows[0]?.qty || 0);
+        if (assigned === 0) {
+          assignedRes = await client.query(
+            `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+               FROM work_order_lines
+              WHERE work_order_id = $1
+                AND talla = $2 AND COALESCE(color,'') = $3 AND COALESCE(customer_po,'') = $4`,
+            [workOrderId, r.talla, r.color, r.customerPo]
+          );
+          assigned = Number(assignedRes.rows[0]?.qty || 0);
+        }
+        const printedRes = await client.query(
+          `SELECT COALESCE(SUM(quantity), 0)::numeric AS qty
+             FROM ticket_prints
+            WHERE work_order_id = $1 AND (estilo = $2 OR estilo IS NULL)
+              AND talla = $3 AND color = $4 AND customer_po = $5`,
+          [workOrderId, estilo, r.talla, r.color, r.customerPo]
+        );
+        const printed = Number(printedRes.rows[0]?.qty || 0);
+        remaining.push({
+          talla: r.talla,
+          color: r.color,
+          customerPo: r.customerPo,
+          printed,
+          remaining: Math.max(0, assigned - printed),
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      savedQty,
+      savedTickets,
+      savedRows: rows.length,
+      remaining,
+    });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("❌ confirm-tickets error:", err.message);
+    next(err);
+  } finally {
+    client.release();
+  }
+});
 
 // ----------------------------------------------------------------------
 // 13. DATA RETRIEVAL ENDPOINTS
@@ -1138,6 +1508,96 @@ app.get("/api/get-run-data/:runId", authenticateToken, async (req, res, next) =>
       [runId]
     );
 
+    // ---- Merchant size breakdown (talla + color + PO + cantidad) ----------
+    // One row per talla+color+PO so each printed ticket can carry its own color
+    // and PO cliente. Prefer lines matching this run's estilo; fall back to all
+    // lines on the work order. Wrapped in try/catch so an older DB without
+    // work_order_lines never breaks the run screen (sizes just come back []).
+    let sizes = [];
+    try {
+      const woId = runResult.rows[0].work_order_id;
+      if (woId) {
+        const styleName = runResult.rows[0].style;
+        let sizesResult = await client.query(
+          `SELECT talla,
+                  COALESCE(color, '')       AS color,
+                  COALESCE(customer_po, '') AS customer_po,
+                  SUM(quantity)::numeric    AS quantity
+             FROM work_order_lines
+            WHERE work_order_id = $1 AND estilo = $2
+            GROUP BY talla, color, customer_po
+            ORDER BY talla, color`,
+          [woId, styleName]
+        );
+        if (sizesResult.rows.length === 0) {
+          sizesResult = await client.query(
+            `SELECT talla,
+                    COALESCE(color, '')       AS color,
+                    COALESCE(customer_po, '') AS customer_po,
+                    SUM(quantity)::numeric    AS quantity
+               FROM work_order_lines
+              WHERE work_order_id = $1
+              GROUP BY talla, color, customer_po
+              ORDER BY talla, color`,
+            [woId]
+          );
+        }
+        sizes = sizesResult.rows.map((r) => ({
+          talla: r.talla,
+          color: r.color || "",
+          customerPo: r.customer_po || "",
+          quantity: Number(r.quantity) || 0,
+        }));
+      }
+    } catch (e) {
+      console.warn("get-run-data: size breakdown unavailable:", e.message);
+      sizes = [];
+    }
+
+    // ---- Subtract already-printed tickets from the size breakdown ----------
+    // The line-leader ticket builder seeds each size's editable quantity from
+    // `quantity` above, so returning the *remaining* (assigned − printed) makes
+    // the "Asignado" figure shrink as tickets get confirmed. Scoped to the work
+    // order + estilo so a new run/day for the same WO still reflects prior
+    // prints. Wrapped in try/catch so a missing ticket_prints table never breaks
+    // the run screen. `assignedQuantity`/`printedQuantity` are added for the UI.
+    try {
+      if (sizes.length) {
+        const woId = runResult.rows[0].work_order_id;
+        const styleName = runResult.rows[0].style;
+        if (woId) {
+          const printedResult = await client.query(
+            `SELECT talla,
+                    COALESCE(color, '')       AS color,
+                    COALESCE(customer_po, '') AS customer_po,
+                    SUM(quantity)::numeric    AS printed
+               FROM ticket_prints
+              WHERE work_order_id = $1 AND (estilo = $2 OR estilo IS NULL)
+              GROUP BY talla, color, customer_po`,
+            [woId, styleName]
+          );
+          const printedMap = new Map();
+          for (const p of printedResult.rows) {
+            const key = `${p.talla}||${p.color || ""}||${p.customer_po || ""}`;
+            printedMap.set(key, Number(p.printed) || 0);
+          }
+          sizes = sizes.map((s) => {
+            const key = `${s.talla}||${s.color || ""}||${s.customerPo || ""}`;
+            const printed = printedMap.get(key) || 0;
+            const assigned = Number(s.quantity) || 0;
+            return {
+              ...s,
+              assignedQuantity: assigned,                 // original merchant qty
+              printedQuantity: printed,                   // total already printed
+              quantity: Math.max(0, assigned - printed),  // remaining -> builder
+            };
+          });
+        }
+      }
+    } catch (e) {
+      console.warn("get-run-data: printed-ticket subtraction skipped:", e.message);
+    }
+
     const operationsData = [];
     for (const operator of operatorsResult.rows) {
       const opsResult = await client.query(
@@ -1164,6 +1624,7 @@ app.get("/api/get-run-data/:runId", authenticateToken, async (req, res, next) =>
       operators: operatorsResult.rows,
       operations: operationsData,
       slotTargets: slotTargetsResult.rows,
+      sizes,
     });
   } catch (err) {
     next(err);
@@ -1178,7 +1639,7 @@ app.get("/api/line-runs", authenticateToken, async (req, res, next) => {
     await setSchema(client);
     const result = await client.query(
       `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes,
-              efficiency, target_pcs, target_per_hour, created_at
+              efficiency, target_pcs, target_per_hour, is_draft, created_at
        FROM line_runs
        ORDER BY run_date DESC, line_no`
     );
@@ -1190,7 +1651,6 @@ app.get("/api/line-runs", authenticateToken, async (req, res, next) => {
   }
 });
 
-// ---------------------------------------------------------------------------
 // PATCH /api/line-runs/operators  —  add to server.js (near the other
 // /api/line-runs routes). Changing the number of sewers (operators) on a line
 // recomputes its daily capacity:
@@ -1200,44 +1660,62 @@ app.get("/api/line-runs", authenticateToken, async (req, res, next) => {
 //   target_per_hour       = target_pcs ÷ working_hours
 //
 // By default it applies to ALL runs of the line (each recomputed with its own
-// working_hours / efficiency / SAM). Pass an optional `date` to scope it to a
-// single run_date.
+// working_hours / efficiency / SAM). Pass an optional `style` to scope it to a
+// single style (e.g. "DP-441") on that line, `from` (YYYY-MM-DD, inclusive) to
+// only touch runs on/after that date so historical months stay intact, and/or
+// `date` to scope it to a single run_date.
+//
+// If a `style` + effective date (`date` or `from`) is given but no run exists on
+// that day for that style, a run is CREATED for that day — cloning the line's
+// most recent run parameters (hours/efficiency/SAM) — so per-style operator
+// changes take effect even on planned days that had no run yet. Earlier runs are
+// never modified.
 // ---------------------------------------------------------------------------
 app.patch("/api/line-runs/operators", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
-    const { lineNo, operators, date } = req.body;
+    const { lineNo, operators, date, style, from } = req.body;
     const ops = parseInt(operators);
- 
+
     if (lineNo === undefined || lineNo === null || String(lineNo).trim() === "" || isNaN(ops) || ops < 0) {
       return res.status(400).json({ success: false, error: "lineNo y operators (>= 0) son obligatorios" });
     }
- 
+
+    const styleStr = (style !== undefined && style !== null && String(style).trim() !== "") ? String(style).trim() : null;
+    const anchor = date || from || null; // the day the change should take effect
+
+    // Recompute a run's daily capacity for the new operator count.
+    const calc = (wh, eff, sam) => {
+      const availableMin = ops * wh * 60 * eff;
+      const targetPcs = sam > 0 ? availableMin / sam : 0;
+      const targetPerHour = wh > 0 ? targetPcs / wh : 0;
+      return { targetPcs, targetPerHour };
+    };
+
+    // 1) Existing runs in scope (line [+ style] [+ from/date]).
     const params = [String(lineNo)];
     let where = "WHERE line_no = $1";
-    if (date) {
-      params.push(date);
-      where += " AND run_date = $2";
-    }
- 
+    if (styleStr) { params.push(styleStr); where += ` AND style = $${params.length}`; }
+    // `from` (inclusive) keeps historical months intact: only runs on/after this
+    // date are recomputed, so past capacity/efficiency figures never change.
+    if (from) { params.push(from); where += ` AND run_date >= $${params.length}`; }
+    if (date) { params.push(date); where += ` AND run_date = $${params.length}`; }
+
     const runs = await client.query(
-      `SELECT id, working_hours, efficiency, sam_minutes FROM line_runs ${where}`,
+      `SELECT id, to_char(run_date, 'YYYY-MM-DD') AS run_date, working_hours, efficiency, sam_minutes
+         FROM line_runs ${where}`,
       params
     );
-    if (runs.rows.length === 0) {
-      return res.status(404).json({ success: false, error: "No hay corridas para esa línea" });
-    }
- 
+
     await client.query("BEGIN");
+
     let updated = 0;
     for (const r of runs.rows) {
       const wh = parseFloat(r.working_hours) || 0;
       const eff = parseFloat(r.efficiency) || 0;
       const sam = parseFloat(r.sam_minutes) || 0;
-      const availableMin = ops * wh * 60 * eff;
-      const targetPcs = sam > 0 ? availableMin / sam : 0;
-      const targetPerHour = wh > 0 ? targetPcs / wh : 0;
+      const { targetPcs, targetPerHour } = calc(wh, eff, sam);
       await client.query(
         `UPDATE line_runs
             SET operators_count = $1, target_pcs = $2, target_per_hour = $3, updated_at = now()
@@ -1246,9 +1724,53 @@ app.patch("/api/line-runs/operators", authenticateToken, async (req, res) => {
       );
       updated++;
     }
+
+    // 2) If a style + effective date were given but no run exists on that exact
+    //    day for that style, create one so the change actually takes effect.
+    //    We clone the line's most recent run parameters (hours / efficiency /
+    //    SAM) — history is never touched, we only ADD a new dated run.
+    let created = 0;
+    const hasAnchorRun = anchor ? runs.rows.some((r) => r.run_date === anchor) : true;
+
+    if (styleStr && anchor && !hasAnchorRun) {
+      const tmpl = await client.query(
+        `SELECT working_hours, efficiency, sam_minutes
+           FROM line_runs
+          WHERE line_no = $1
+          ORDER BY (style = $2) DESC, (run_date <= $3) DESC, run_date DESC
+          LIMIT 1`,
+        [String(lineNo), styleStr, anchor]
+      );
+      if (tmpl.rows.length > 0) {
+        const wh = parseFloat(tmpl.rows[0].working_hours) || 0;
+        const eff = parseFloat(tmpl.rows[0].efficiency) || 0;
+        const sam = parseFloat(tmpl.rows[0].sam_minutes) || 0;
+        const { targetPcs, targetPerHour } = calc(wh, eff, sam);
+        await client.query(
+          `INSERT INTO line_runs
+             (line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
+           ON CONFLICT (line_no, run_date, style)
+           DO UPDATE SET operators_count = EXCLUDED.operators_count,
+                         target_pcs      = EXCLUDED.target_pcs,
+                         target_per_hour = EXCLUDED.target_per_hour,
+                         updated_at      = now()`,
+          [String(lineNo), anchor, styleStr, ops, wh, sam, eff, targetPcs, targetPerHour]
+        );
+        created++;
+      }
+    }
+
+    if (updated === 0 && created === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        error: "No hay corridas ni configuración base para esa línea; no se pudo aplicar el cambio.",
+      });
+    }
+
     await client.query("COMMIT");
- 
-    res.json({ success: true, updated, operators: ops });
+    res.json({ success: true, updated, created, operators: ops, style: styleStr, from: from ?? null, date: date ?? null });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("❌ Error updating line operators:", err.message);
@@ -1280,6 +1802,78 @@ app.get("/api/line-runs/:lineNo", authenticateToken, async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// mergeOrInsertAssignment — keep one planned row per (work_order, line, day,
+// color). If a matching planned/released row already exists for that cell, add
+// the pieces to it instead of creating a second sliver; otherwise insert a new
+// row. Completed/cancelled rows are never merged into (their produced history
+// must stay intact), so those always insert a fresh row.
+//
+//   a = { workOrderId, lineRunId, lineNo, assignedDate, quantity,
+//         availableMinutes, requiredRate, startDate, endDate, status, color }
+// Must be called inside an open transaction on `client`.
+// ---------------------------------------------------------------------------
+async function mergeOrInsertAssignment(client, a) {
+  const mergeable = a.status === "planned" || a.status === "released";
+
+  const findExisting = () => client.query(
+    `SELECT id FROM line_assignments
+      WHERE work_order_id = $1
+        AND line_no = $2
+        AND assigned_date = $3
+        AND COALESCE(color, '') = COALESCE($4, '')
+        AND status = $5
+      ORDER BY id ASC
+      LIMIT 1
+      FOR UPDATE`,
+    [a.workOrderId, String(a.lineNo), a.assignedDate, a.color ?? null, a.status]
+  );
+
+  const applyMerge = async (id) => (await client.query(
+    `UPDATE line_assignments
+        SET assigned_quantity        = assigned_quantity + $2,
+            available_minutes        = $3,
+            required_production_rate  = $4,
+            planned_start_date        = LEAST(COALESCE(planned_start_date, $5::date), $5::date),
+            planned_end_date          = GREATEST(COALESCE(planned_end_date, $6::date), $6::date),
+            line_run_id               = COALESCE($7, line_run_id),
+            updated_at                = now()
+      WHERE id = $1
+    RETURNING *`,
+    [id, a.quantity, a.availableMinutes, a.requiredRate, a.startDate, a.endDate, a.lineRunId ?? null]
+  )).rows[0];
+
+  if (mergeable) {
+    const found = await findExisting();
+    if (found.rows.length) return applyMerge(found.rows[0].id);
+  }
+
+  // No mergeable row yet → insert. A rare concurrent insert can trip the
+  // partial unique index; if so, roll back just this statement and merge into
+  // whatever landed first.
+  await client.query("SAVEPOINT ins_assign");
+  try {
+    const ins = await client.query(
+      `INSERT INTO line_assignments
+         (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+          available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING *`,
+      [a.workOrderId, a.lineRunId ?? null, String(a.lineNo), a.assignedDate, a.quantity,
+       a.availableMinutes, a.requiredRate, a.startDate, a.endDate, a.status, a.color ?? null]
+    );
+    await client.query("RELEASE SAVEPOINT ins_assign");
+    return ins.rows[0];
+  } catch (e) {
+    if (e.code === "23505" && mergeable) {
+      await client.query("ROLLBACK TO SAVEPOINT ins_assign");
+      const found = await findExisting();
+      if (found.rows.length) return applyMerge(found.rows[0].id);
+    }
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // PATCH /api/line-assignments/:id/move  —  add to server.js near the other
 // line-assignments routes.
 //
@@ -1296,6 +1890,12 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     dt.setUTCDate(dt.getUTCDate() + n);
     return dt.toISOString().slice(0, 10);
   };
+  // True for Saturday/Sunday (no timezone drift). No production on weekends.
+  const isWeekend = (ymdStr) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sun, 6 = Sat
+    return dow === 0 || dow === 6;
+  };
   try {
     await setSchema(client);
     const id = parseInt(req.params.id);
@@ -1308,7 +1908,7 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     await client.query("BEGIN");
 
     const cur = await client.query(
-      "SELECT id, work_order_id, assigned_quantity, color, status FROM line_assignments WHERE id = $1",
+      "SELECT id, work_order_id, assigned_quantity, color, status, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str FROM line_assignments WHERE id = $1",
       [id]
     );
     if (cur.rows.length === 0) {
@@ -1316,6 +1916,11 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       return res.status(404).json({ success: false, error: "Assignment not found" });
     }
     const original = cur.rows[0];
+    // Remember where this block sat so we can drop its (now stale) draft run if
+    // the day ends up empty after the move.
+    const sourceLineNo = String(original.line_no);
+    const sourceDate = original.assigned_date_str;
+
     const totalQty = parseFloat(original.assigned_quantity) || 0;
     const workOrderId = original.work_order_id;
     const color = original.color || null;
@@ -1337,9 +1942,9 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
 
     // Walk the target line day by day from assignedDate, filling each day's
     // remaining capacity and carrying the remainder forward — the same packing
-    // rule as a pool placement. Days with no run configured, or already full,
-    // are skipped. All-or-nothing: if the whole quantity can't fit within the
-    // horizon, roll back and report the shortfall.
+    // rule as a pool placement. Weekends, days with no run configured, or days
+    // already full are skipped. All-or-nothing: if the whole quantity can't fit
+    // within the horizon, roll back and report the shortfall.
     const MAX_DAYS = 180;
     let remaining = totalQty;
     let dayStr = assignedDate;
@@ -1348,6 +1953,7 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
 
     while (remaining > 0 && scanned < MAX_DAYS) {
       scanned++;
+      if (isWeekend(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend work
       const { lines } = await getLineCapacityForDate(client, dayStr);
       const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
       if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no capacity configured -> skip
@@ -1382,6 +1988,8 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
          effectiveDailyMinutes, piecesPerDay, color, status]
       );
       createdRows.push(ins.rows[0]);
+      // NOTE: drafts are no longer auto-created on move. The planner pushes work
+      // to the line leaders explicitly via POST /api/line-assignments/confirm.
       remaining -= chunk;
       dayStr = addDaysStr(dayStr, 1);
     }
@@ -1394,6 +2002,11 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       });
     }
 
+    // The source day may now be empty. If it only had an unconfirmed draft run
+    // (created before the planner confirmed), drop it so line leaders don't keep
+    // seeing a draft for a day the order was moved away from.
+    await cleanupOrphanDraftRuns(client, sourceLineNo, sourceDate);
+
     await client.query("COMMIT");
     res.json({
       success: true,
@@ -1404,6 +2017,325 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("❌ Error moving line assignment:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// PATCH /api/line-assignments/:id/insert-shift
+//
+// "Insert" a moved assignment onto an OCCUPIED day and push the whole tail of
+// that line forward by one workday. Concretely: drop order A onto line L / day D
+// where D already has an order, and A takes D while every PLANNED assignment on
+// line L with assigned_date >= D (except A itself) slides to its next workday.
+// Gaps are preserved — each affected block simply shifts +1 workday (Fri -> Mon),
+// so the relative sequence and spacing on the line are kept intact.
+//
+// Contrast with /move (which packs A into the day's remaining capacity and
+// spills the REMAINDER forward, never displacing the existing occupant). Here
+// the occupant is displaced.
+//
+// Safety:
+//  - One transaction: any failure rolls the entire ripple back.
+//  - The tail shift is applied row-by-row from the LATEST date backward so no
+//    two planned rows ever momentarily share a (work_order,line,day,color) slot
+//    and trip uq_line_assign_planned_cell (the classic shift-by-one collision).
+//  - Only status='planned' rows shift; released/completed/cancelled history is
+//    left untouched.
+//  - Weekends are skipped (a Friday block lands on the following Monday).
+// ---------------------------------------------------------------------------
+app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  const addDaysStr = (ymdStr, k) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + k);
+    return dt.toISOString().slice(0, 10);
+  };
+  const isWeekend = (ymdStr) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+    return dow === 0 || dow === 6;
+  };
+  // Next production day: +1, then hop over Sat/Sun.
+  const nextWorkday = (ymdStr) => {
+    let d = addDaysStr(ymdStr, 1);
+    while (isWeekend(d)) d = addDaysStr(d, 1);
+    return d;
+  };
+  try {
+    await setSchema(client);
+    const id = parseInt(req.params.id);
+    const { lineNo, assignedDate } = req.body;
+    if (!lineNo || !assignedDate) {
+      return res.status(400).json({ success: false, error: "lineNo y assignedDate son obligatorios" });
+    }
+    if (isWeekend(assignedDate)) {
+      return res.status(400).json({ success: false, error: "No se puede insertar en fin de semana. Elija un dia entre semana." });
+    }
+
+    await client.query("BEGIN");
+
+    const cur = await client.query(
+      "SELECT id, work_order_id, assigned_quantity, available_minutes, required_production_rate, color, status, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str FROM line_assignments WHERE id = $1",
+      [id]
+    );
+    if (cur.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Assignment not found" });
+    }
+    const a = cur.rows[0];
+    const sourceLineNo = String(a.line_no);
+    const sourceDate = a.assigned_date_str;
+    const targetLine = String(lineNo);
+    const D = assignedDate;
+
+    // 1) Remove the moved block up front (we re-insert it at the target below).
+    //    Deleting first — rather than excluding it by id — means a same-order
+    //    sibling slice on the previous workday can shift into this block's old
+    //    day without tripping uq_line_assign_planned_cell. Same delete-then-
+    //    reinsert shape the /move route uses.
+    await client.query("DELETE FROM line_assignments WHERE id = $1", [id]);
+
+    // 2) Push the whole tail of the target line forward one workday, latest
+    //    first, so each block lands on a slot the next block already vacated.
+    //    The occupant of D itself is part of the tail, so D ends up empty.
+    const tail = await client.query(
+      `SELECT id, to_char(assigned_date, 'YYYY-MM-DD') AS d
+         FROM line_assignments
+        WHERE line_no = $1
+          AND assigned_date >= $2
+          AND status = 'planned'
+        ORDER BY assigned_date DESC, id DESC`,
+      [targetLine, D]
+    );
+    for (const row of tail.rows) {
+      const nd = nextWorkday(row.d);
+      await client.query(
+        `UPDATE line_assignments
+            SET assigned_date = $1, planned_start_date = $1, planned_end_date = $1, updated_at = now()
+          WHERE id = $2`,
+        [nd, row.id]
+      );
+    }
+
+    // 3) Re-insert the moved order on the now-vacated target cell. Recompute the
+    //    informational rate columns from the target line's run for D when one
+    //    exists; otherwise keep the block's own values (columns are NOT NULL).
+    const woRes = await client.query("SELECT sam_minutes FROM work_orders WHERE id = $1", [a.work_order_id]);
+    const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
+    const { lines } = await getLineCapacityForDate(client, D);
+    const lineData = lines.find((l) => String(l.line_no) === targetLine);
+
+    let availableMinutes = parseFloat(a.available_minutes) || 0;
+    let requiredRate = parseFloat(a.required_production_rate) || 0;
+    let lineRunId = null;
+    if (lineData) {
+      const operators = parseInt(lineData.operators_count) || 20;
+      const workingHours = parseFloat(lineData.working_hours) || 8;
+      const efficiency = parseFloat(lineData.efficiency) || 0.85;
+      const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
+      availableMinutes = operators * workingHours * 60 * efficiency;
+      requiredRate = samMinutes > 0 ? availableMinutes / samMinutes : 0;
+      lineRunId = lineData.id || null;
+    }
+
+    const status = ["planned", "released", "completed", "cancelled"].includes(a.status) ? a.status : "planned";
+    const placed = await client.query(
+      `INSERT INTO line_assignments
+          (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+           available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING *`,
+      [a.work_order_id, lineRunId, targetLine, D, a.assigned_quantity,
+       availableMinutes, requiredRate, D, D, status, a.color || null]
+    );
+
+    // 4) The block's old cell may now be empty — drop any orphan draft run there.
+    if (!(sourceLineNo === targetLine && sourceDate === D)) {
+      await cleanupOrphanDraftRuns(client, sourceLineNo, sourceDate);
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      assignment: placed.rows[0] || null,
+      shifted: tail.rows.length,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ Error inserting/shifting line assignment:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/line-assignments/move-batch
+//
+// Pile several existing assignments into ONE target line, starting at
+// `assignedDate`, and re-pack them forward day by day. All selected blocks may
+// come from different lines, days, orders or colors; each keeps its own row.
+// The packing rule is identical to the single move: fill each day's remaining
+// capacity, spill the rest to the next day. Rows inserted earlier in this same
+// transaction count as "used", so consecutive blocks stack naturally onto the
+// following days. All-or-nothing: if the whole selection can't fit within the
+// horizon, roll back and leave every block exactly where it was.
+// ---------------------------------------------------------------------------
+app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  const addDaysStr = (ymdStr, n) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + n);
+    return dt.toISOString().slice(0, 10);
+  };
+  const isWeekend = (ymdStr) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sun, 6 = Sat
+    return dow === 0 || dow === 6;
+  };
+  try {
+    await setSchema(client);
+    const { ids, lineNo, assignedDate } = req.body;
+    const idList = Array.isArray(ids)
+      ? [...new Set(ids.map((n) => parseInt(n)).filter((n) => Number.isInteger(n)))]
+      : [];
+
+    if (idList.length === 0 || !lineNo || !assignedDate) {
+      return res.status(400).json({
+        success: false,
+        error: "ids (no vacío), lineNo y assignedDate son obligatorios",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // Load the selected assignments. Order them by their current position so the
+    // re-pack is deterministic (earliest day first, then id).
+    const cur = await client.query(
+      `SELECT id, work_order_id, assigned_quantity, color, status,
+              line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str
+         FROM line_assignments
+        WHERE id = ANY($1::int[])
+        ORDER BY assigned_date ASC, id ASC`,
+      [idList]
+    );
+    if (cur.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "No se encontraron las asignaciones" });
+    }
+
+    // Remember every (line, day) these blocks came from so we can drop their
+    // stale draft runs afterwards if the source day ends up empty.
+    const sourceCells = [
+      ...new Map(
+        cur.rows.map((r) => [`${r.line_no}|${r.assigned_date_str}`, { lineNo: String(r.line_no), date: r.assigned_date_str }])
+      ).values(),
+    ];
+
+    // Free every selected block first so their old slots can be reused.
+    await client.query("DELETE FROM line_assignments WHERE id = ANY($1::int[])", [idList]);
+
+    const MAX_DAYS = 180;
+    const createdRows = [];
+
+    for (const original of cur.rows) {
+      const totalQty = parseFloat(original.assigned_quantity) || 0;
+      if (totalQty <= 0) continue;
+      const workOrderId = original.work_order_id;
+      const color = original.color || null;
+      const status = ["planned", "released", "completed", "cancelled"].includes(original.status)
+        ? original.status
+        : "planned";
+
+      // Prefer the work order's own SAM for the informational rate columns.
+      const woRes = await client.query(
+        "SELECT sam_minutes FROM work_orders WHERE id = $1",
+        [workOrderId]
+      );
+      const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
+
+      let remaining = totalQty;
+      let dayStr = assignedDate;
+      let scanned = 0;
+
+      while (remaining > 0 && scanned < MAX_DAYS) {
+        scanned++;
+        if (isWeekend(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; } 
+        const { lines } = await getLineCapacityForDate(client, dayStr);
+        const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
+        if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no run -> skip
+
+        const usedRes = await client.query(
+          `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
+             FROM line_assignments
+            WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
+          [String(lineNo), dayStr]
+        );
+        const used = parseFloat(usedRes.rows[0].used) || 0;
+        const capacity = parseFloat(lineData.target_pcs) || 0;
+        const available = Math.max(0, capacity - used);
+        if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
+
+        const chunk = Math.min(remaining, available);
+
+        const operators = parseInt(lineData.operators_count) || 20;
+        const workingHours = parseFloat(lineData.working_hours) || 8;
+        const efficiency = parseFloat(lineData.efficiency) || 0.85;
+        const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
+        const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
+        const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
+
+        const row = await mergeOrInsertAssignment(client, {
+          workOrderId,
+          lineRunId: lineData.id || null,
+          lineNo: String(lineNo),
+          assignedDate: dayStr,
+          quantity: chunk,
+          availableMinutes: effectiveDailyMinutes,
+          requiredRate: piecesPerDay,
+          startDate: dayStr,
+          endDate: dayStr,
+          status,
+          color,
+        });
+        createdRows.push(row);
+        // NOTE: drafts are no longer auto-created on move. Line leaders receive
+        // work only when the planner confirms (POST /api/line-assignments/confirm).
+        remaining -= chunk;
+        dayStr = addDaysStr(dayStr, 1);
+      }
+
+      if (remaining > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          error: `La línea ${lineNo} no tiene capacidad suficiente para reacomodar todas las casillas seleccionadas desde el ${assignedDate}.`,
+        });
+      }
+    }
+
+    // Drop any now-empty source day's unconfirmed draft run so line leaders stop
+    // seeing drafts for days these blocks were moved away from.
+    for (const cell of sourceCells) {
+      await cleanupOrphanDraftRuns(client, cell.lineNo, cell.date);
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      assignments: createdRows,
+      cells: createdRows.length,
+      moved: idList.length,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ Error moving batch of line assignments:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
@@ -1422,7 +2354,10 @@ app.get("/api/lineleader/latest-run", authenticateToken, allowRoles("line_leader
     }
 
     const runQ = await client.query(
-      `SELECT * FROM line_runs WHERE line_no = $1 ORDER BY created_at DESC LIMIT 1`,
+      `SELECT * FROM line_runs
+         WHERE line_no = $1 AND is_draft = false AND run_date <= CURRENT_DATE
+         ORDER BY run_date DESC, created_at DESC
+         LIMIT 1`,
       [line]
     );
     if (runQ.rowCount === 0) {
@@ -1659,7 +2594,7 @@ app.get("/api/multi-style/latest-group", authenticateToken, async (req, res) => 
     // Get the latest run date for this line
     const latestDate = await client.query(
       `SELECT DISTINCT run_date FROM line_runs
-       WHERE line_no = $1
+       WHERE line_no = $1 AND is_draft = false AND run_date <= CURRENT_DATE
        ORDER BY run_date DESC
        LIMIT 1`,
       [line]
@@ -1677,7 +2612,7 @@ app.get("/api/multi-style/latest-group", authenticateToken, async (req, res) => 
     // Now get all runs for that date
     const runs = await client.query(
       `SELECT * FROM line_runs
-       WHERE line_no = $1 AND run_date = $2
+       WHERE line_no = $1 AND run_date = $2 AND is_draft = false
        ORDER BY style_group_id NULLS FIRST, id`,
       [line, date]
     );
@@ -2088,6 +3023,8 @@ app.post(
     param("runId").isInt({ gt: 0 }).withMessage("Valid run ID required"),
     body("newDate").isDate().withMessage("Valid newDate (YYYY-MM-DD) required"),
     body("newLineNo").optional().isString().withMessage("newLineNo must be a string if provided"),
+    body("workOrderId").optional({ nullable: true }).isInt({ min: 1 }).withMessage("workOrderId must be a positive integer"),   // ← ADD THIS
+
   ]),
   async (req, res, next) => {
     const client = await pool.connect();
@@ -2098,6 +3035,7 @@ app.post(
       const { runId } = req.params;
       const { newDate } = req.body;            // required: YYYY-MM-DD
       const newLineNo = req.body.newLineNo;    // optional – if omitted, same line_no is used
+      const workOrderId = req.body.workOrderId; // ← ADD THIS
 
       // 1. Get source run
       const sourceRunRes = await client.query(
@@ -2113,23 +3051,24 @@ app.post(
 
       // 2. Insert new line_run
       const newRunRes = await client.query(
-        `INSERT INTO line_runs
-           (line_no, run_date, style, operators_count, working_hours,
-            sam_minutes, efficiency, target_pcs, target_per_hour, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-         RETURNING id`,
-        [
-          newLineNo || src.line_no,
-          newDate,
-          src.style,
-          src.operators_count,
-          src.working_hours,
-          src.sam_minutes,
-          src.efficiency,
-          src.target_pcs,
-          src.target_per_hour,
-        ]
-      );
+  `INSERT INTO line_runs
+     (line_no, run_date, style, operators_count, working_hours,
+      sam_minutes, efficiency, target_pcs, target_per_hour, work_order_id, created_at, updated_at)
+   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+   RETURNING id`,
+  [
+    newLineNo || src.line_no,
+    newDate,
+    src.style,
+    src.operators_count,
+    src.working_hours,
+    src.sam_minutes,
+    src.efficiency,
+    src.target_pcs,
+    src.target_per_hour,
+    workOrderId || null,   // ← ADD THIS (matches new $10)
+  ]
+);
       const newRunId = newRunRes.rows[0].id;
 
       // 3. Copy shift_slots – store mapping old slot_id -> new slot_id
@@ -3153,7 +4092,7 @@ app.get("/api/run-capacity-history/:runId", authenticateToken, async (req, res) 
 
 // Helper middleware for quality inspector access
 const requireQualityInspector = (req, res, next) => {
-  const allowedRoles = ['quality_inspector', 'engineer', 'supervisor', 'soporte_it', 'master'];
+  const allowedRoles = ['quality_inspector', 'engineer', 'supervisor', 'soporte_it', 'master','quality_head'];
   if (!allowedRoles.includes(req.user?.role)) {
     return res.status(403).json({
       success: false,
@@ -3555,7 +4494,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
   try {
     await setSchema(client);
 
-    if (!['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'quality_inspector'].includes(req.user?.role)) {
+    if (!['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'quality_inspector', 'quality_head'].includes(req.user?.role)) {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
 
@@ -4123,44 +5062,177 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
  * nobody has entered a line_run for yet.
  */
 async function getLineCapacityForDate(client, date) {
-  const exact = await client.query(
-    `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour
-     FROM line_runs WHERE run_date = $1 ORDER BY line_no::int`,
+  // Each line resolves to its OWN most-recent config on/before `date` (else its
+  // closest future one), so a line never disappears just because another line
+  // ran more recently — that was the cause of "faltan" on future dates.
+  const perLine = await client.query(
+    `SELECT DISTINCT ON (line_no)
+            id, line_no, run_date, style, operators_count, working_hours,
+            sam_minutes, efficiency, target_pcs, target_per_hour
+       FROM line_runs
+      ORDER BY line_no,
+               (run_date <= $1) DESC,
+               ABS(run_date - $1::date) ASC`,
     [date]
   );
+  const lines = perLine.rows;
 
-  if (exact.rows.length > 0) {
-    return { lines: exact.rows, capacitySource: "exact", capacityDate: date };
-  }
-
-  // Fall back to the most recent run_date on or before the requested date
-  const fallbackDateResult = await client.query(
-    `SELECT MAX(run_date) as fallback_date FROM line_runs WHERE run_date <= $1`,
-    [date]
+  // Merge in planner-defined lines (engineering hasn't configured yet) for any
+  // line_no not already present. Inlined so this function has no dependency.
+  const present = new Set(lines.map((l) => String(l.line_no)));
+  const seeds = await client.query(
+    `SELECT line_no, operators_count, working_hours, sam_minutes,
+            efficiency, target_pcs, target_per_hour
+       FROM planner_lines`
   );
-  let fallbackDate = fallbackDateResult.rows[0]?.fallback_date;
+  const extra = seeds.rows
+    .filter((r) => !present.has(String(r.line_no)))
+    .map((r) => ({
+      id: null,
+      line_no: r.line_no,
+      run_date: date,
+      style: null,
+      operators_count: r.operators_count,
+      working_hours: r.working_hours,
+      sam_minutes: r.sam_minutes,
+      efficiency: r.efficiency,
+      target_pcs: r.target_pcs,
+      target_per_hour: r.target_per_hour,
+    }));
 
-  if (!fallbackDate) {
-    // Nothing before the date either — just use the latest configuration that exists at all
-    const anyDateResult = await client.query(`SELECT MAX(run_date) as any_date FROM line_runs`);
-    fallbackDate = anyDateResult.rows[0]?.any_date;
-  }
-
-  if (!fallbackDate) {
-    return { lines: [], capacitySource: "none", capacityDate: null };
-  }
-
-  const fallback = await client.query(
-    `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour
-     FROM line_runs WHERE run_date = $1 ORDER BY line_no::int`,
-    [fallbackDate]
-  );
-
-  const dateStr = fallbackDate instanceof Date ? fallbackDate.toISOString().slice(0, 10) : fallbackDate;
-  return { lines: fallback.rows, capacitySource: "fallback", capacityDate: dateStr };
+  const allLines = extra.length ? [...lines, ...extra] : lines;
+  return {
+    lines: allLines,
+    capacitySource: lines.length ? "per-line" : (allLines.length ? "planner" : "none"),
+    capacityDate: date,
+  };
 }
 
+// GET /api/planning/lines — planner-defined lines (engineering hasn't
+// configured them yet). The board shows these as empty lines so orders can be
+// dropped before any run exists.
+app.get("/api/planning/lines", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const result = await client.query(
+      `SELECT line_no, operators_count, working_hours, sam_minutes,
+              efficiency, target_pcs, target_per_hour, created_at
+         FROM planner_lines ORDER BY line_no::int`
+    );
+    res.json({ success: true, lines: result.rows });
+  } catch (err) {
+    console.error("❌ Error listing planner lines:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+// POST /api/planning/lines — create a planner line (not configured by
+// engineering). Stored in planner_lines, NOT line_runs. Assigning an order to
+// it later auto-creates a draft run. efficiency accepts 0.85 or 85.
+app.post(
+  "/api/planning/lines",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { lineNo, operatorsCount, workingHours, efficiency, samMinutes } = req.body;
+      const line = String(lineNo ?? "").trim();
+      if (!line) return res.status(400).json({ success: false, error: "lineNo is required" });
 
+      const existingRun = await client.query("SELECT 1 FROM line_runs WHERE line_no = $1 LIMIT 1", [line]);
+      if (existingRun.rowCount > 0) {
+        return res.status(409).json({ success: false, error: `La línea ${line} ya está configurada por ingeniería.` });
+      }
+
+      const operators = Number.isFinite(+operatorsCount) && +operatorsCount > 0 ? Math.floor(+operatorsCount) : 20;
+      const hours = Number.isFinite(+workingHours) && +workingHours > 0 ? +workingHours : 8;
+      let eff = Number.isFinite(+efficiency) && +efficiency > 0 ? +efficiency : 0.85;
+      if (eff > 1) eff = eff / 100;
+      if (eff > 1) eff = 1;
+      const sam = Number.isFinite(+samMinutes) && +samMinutes > 0 ? +samMinutes : 3.5;
+      const targetPcs = Math.round((operators * hours * 60 * eff) / sam);
+      const targetPerHour = hours > 0 ? Math.round(targetPcs / hours) : 0;
+
+      const result = await client.query(
+        `INSERT INTO planner_lines
+           (line_no, operators_count, working_hours, sam_minutes, efficiency,
+            target_pcs, target_per_hour, created_by, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+         ON CONFLICT (line_no) DO UPDATE
+           SET operators_count = EXCLUDED.operators_count,
+               working_hours   = EXCLUDED.working_hours,
+               sam_minutes     = EXCLUDED.sam_minutes,
+               efficiency      = EXCLUDED.efficiency,
+               target_pcs      = EXCLUDED.target_pcs,
+               target_per_hour = EXCLUDED.target_per_hour,
+               updated_at      = NOW()
+         RETURNING *`,
+        [line, operators, hours, sam, eff, targetPcs, targetPerHour, req.user?.username || null]
+      );
+      res.json({ success: true, line: result.rows[0] });
+    } catch (err) {
+      console.error("❌ Error creating planner line:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  }
+);
+// DELETE /api/planning/lines/:lineNo — remove a planner line (blocked if it
+// still has assignments).
+app.delete(
+  "/api/planning/lines/:lineNo",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const line = String(req.params.lineNo ?? "").trim();
+      const used = await client.query(
+        `SELECT COUNT(*)::int AS n FROM line_assignments
+          WHERE line_no = $1 AND status NOT IN ('cancelled', 'rejected')`,
+        [line]
+      );
+      if ((used.rows[0]?.n || 0) > 0) {
+        return res.status(409).json({ success: false, error: `La línea ${line} tiene asignaciones. Quítelas primero.` });
+      }
+      await client.query("DELETE FROM planner_lines WHERE line_no = $1", [line]);
+      res.json({ success: true, lineNo: line });
+    } catch (err) {
+      console.error("❌ Error deleting planner line:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// POST /api/run/:runId/confirm — clear the draft flag on an auto-created run.
+app.post(
+  "/api/run/:runId/confirm",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const runId = parseInt(req.params.runId);
+      const r = await client.query(
+        "UPDATE line_runs SET is_draft = false, updated_at = NOW() WHERE id = $1 RETURNING id, line_no, run_date, style, is_draft",
+        [runId]
+      );
+      if (r.rowCount === 0) return res.status(404).json({ success: false, error: "Run not found" });
+      res.json({ success: true, run: r.rows[0] });
+    } catch (err) {
+      console.error("❌ Error confirming run:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  }
+);
 /**
  * GET /api/planning/available-lines?date=YYYY-MM-DD
  * Per-line capacity for a date, minus whatever is already assigned that date.
@@ -4186,6 +5258,22 @@ app.get("/api/planning/available-lines", authenticateToken, async (req, res) => 
     const assignedByLine = {};
     assignedResult.rows.forEach((r) => { assignedByLine[r.line_no] = parseFloat(r.assigned) || 0; });
 
+    // ── add: pre-order holds occupy capacity too ──
+    try {
+      const heldResult = await client.query(
+        `SELECT line_no, COALESCE(SUM(quantity), 0) AS held
+           FROM pre_order_day_holds
+          WHERE assigned_date = $1
+          GROUP BY line_no`,
+        [date]
+      );
+      heldResult.rows.forEach((r) => {
+        assignedByLine[r.line_no] = (assignedByLine[r.line_no] || 0) + (parseFloat(r.held) || 0);
+      });
+    } catch (e) {
+      console.warn("⚠️  pre_order_day_holds not available for capacity:", e.message);
+    }
+
     // Which work orders make up each line's load that day (for the dashboard bar)
     const workOrdersResult = await client.query(
       `SELECT la.line_no,
@@ -4206,22 +5294,38 @@ app.get("/api/planning/available-lines", authenticateToken, async (req, res) => 
         assigned_quantity: Math.round((parseFloat(r.assigned_quantity) || 0) * 100) / 100,
       });
     });
+        // Días festivos / paros close the day for the whole plant (line_no NULL) or
+    // for a single line. A blocked line reports zero available capacity so the
+    // board won't spill work onto it. Best-effort: ignore if the module is absent.
+    let plantHoliday = null;
+    const lineHolidays = new Set();
+    try {
+      const hrows = await registerHolidays.holidaysBetween(client, { from: date, to: date });
+      for (const h of hrows) {
+        if (h.line_no == null) plantHoliday = h;
+        else lineHolidays.add(String(h.line_no));
+      }
+    } catch (e) {
+      console.warn("⚠️  holidays not available for capacity:", e.message);
+    }
 
     const linesWithAvailability = lines.map((line) => {
       const targetPcs = parseFloat(line.target_pcs) || 0;
       const assigned = assignedByLine[line.line_no] || 0;
-      const available = Math.max(0, targetPcs - assigned);
+      const blocked = !!plantHoliday || lineHolidays.has(String(line.line_no));
+      const available = blocked ? 0 : Math.max(0, targetPcs - assigned);
       const utilizationPercentage = targetPcs > 0 ? (assigned / targetPcs) * 100 : 0;
       return {
         ...line,
         assigned_quantity: Math.round(assigned * 100) / 100,
         available_capacity: Math.round(available * 100) / 100,
         utilization_percentage: Math.round(utilizationPercentage * 10) / 10,
-        work_orders: workOrdersByLine[line.line_no] || [],
+        holiday: blocked ? (plantHoliday || { line_no: line.line_no }) : null,
       };
     });
 
-    res.json({ success: true, lines: linesWithAvailability, capacitySource, capacityDate });
+    res.json({ success: true, lines: linesWithAvailability, capacitySource, capacityDate, holiday: plantHoliday || null });
+    
   } catch (err) {
     console.error("❌ Error fetching available lines:", err.message);
     res.status(500).json({ success: false, error: err.message });
@@ -4355,6 +5459,10 @@ app.get("/api/planning/dashboard", authenticateToken, async (req, res) => {
 /**
  * GET /api/line-assignments?workOrderId=123
  */
+
+/**
+ * GET /api/line-assignments?workOrderId=123
+ */
 app.get("/api/line-assignments", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -4362,21 +5470,7 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
     const { workOrderId, lineNo, date } = req.query;
 
     let query = `
-      SELECT la.id,
-             la.work_order_id,
-             la.line_run_id,
-             la.line_no,
-             to_char(la.assigned_date, 'YYYY-MM-DD')       AS assigned_date,
-             la.assigned_quantity,
-             la.available_minutes,
-             la.required_production_rate,
-             to_char(la.planned_start_date, 'YYYY-MM-DD')  AS planned_start_date,
-             to_char(la.planned_end_date, 'YYYY-MM-DD')    AS planned_end_date,
-             la.priority,
-             la.status,
-             la.color,
-             la.created_at,
-             la.updated_at,
+      SELECT la.*,
              wo.work_order_no,
              wo.style_description,
              wo.customer_name
@@ -4410,16 +5504,261 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
   }
 });
 
+async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderId, style }) {
+  const line = String(lineNo);
+  if (!runDate) return { runId: null, created: false };
+ 
+  // Style must be resolved BEFORE the existence check — it is part of the key.
+  let runStyle = style;
+  if (!runStyle && workOrderId != null) {
+    const wo = await client.query(
+      "SELECT style_code, estilo FROM work_orders WHERE id = $1",
+      [workOrderId]
+    );
+    runStyle = wo.rows[0]?.style_code || wo.rows[0]?.estilo || null;
+  }
+  runStyle = runStyle || "SIN ESTILO";
+ 
+  // Point this order's cells on this line-day at `runId`, whatever they held
+  // before. Re-pointing a stale link is the entire purpose of this step.
+  const linkAssignments = async (runId) => {
+    const upd = await client.query(
+      `UPDATE line_assignments
+          SET line_run_id = $1, updated_at = NOW()
+        WHERE line_no = $2
+          AND assigned_date = $3::date
+          AND status NOT IN ('cancelled', 'rejected')
+          AND ($4::bigint IS NULL OR work_order_id = $4::bigint)
+          AND line_run_id IS DISTINCT FROM $1`,
+      [runId, line, runDate, workOrderId ?? null]
+    );
+    console.log(`   ↳ linked ${upd.rowCount} assignment(s) to run ${runId}`);
+    return upd.rowCount;
+  };
+ 
+  const existing = await client.query(
+    "SELECT id FROM line_runs WHERE line_no = $1 AND run_date = $2::date AND style = $3 LIMIT 1",
+    [line, runDate, runStyle]
+  );
+  if (existing.rowCount > 0) {
+    const runId = existing.rows[0].id;
+    console.log(`   ↳ run ${runId} already exists for L${line} ${runDate} "${runStyle}"`);
+    await linkAssignments(runId);
+    return { runId, created: false };
+  }
+ 
+  // Template = the line's most recent run, preferring the SAME style. Supplies
+  // the capacity numbers and the operator roster. Falls back to planner_lines,
+  // then to hardcoded defaults, for a planner-defined line with no runs yet.
+  const tpl = await client.query(
+    `SELECT id, operators_count, working_hours, sam_minutes, efficiency
+       FROM line_runs
+      WHERE line_no = $1
+      ORDER BY (style = $2) DESC, run_date DESC, created_at DESC
+      LIMIT 1`,
+    [line, runStyle]
+  );
+  let src = tpl.rows[0];
+  const templateRunId = src?.id ?? null;
+  if (!src) {
+    const pl = await client.query(
+      `SELECT operators_count, working_hours, sam_minutes, efficiency
+         FROM planner_lines WHERE line_no = $1`,
+      [line]
+    );
+    src = pl.rows[0];
+  }
+ 
+  const operators = parseInt(src?.operators_count) || 20;
+  const hours = parseFloat(src?.working_hours) || 8;
+  let eff = parseFloat(src?.efficiency) || 0.85;
+  if (eff > 1) eff = eff / 100;   // tolerate 85 meaning 0.85
+  if (eff > 1) eff = 1;           // chk_efficiency_range: 0 < eff <= 1
+  const sam = parseFloat(src?.sam_minutes) || 3.5;
+  const targetPcs = Math.round((operators * hours * 60 * eff) / sam);
+  const targetPerHour = hours > 0 ? Math.round(targetPcs / hours) : 0;
+ 
+  console.log(
+    `   ↳ inserting draft L${line} ${runDate} "${runStyle}" ` +
+    `(ops=${operators} h=${hours} sam=${sam} eff=${eff} target=${targetPcs}) tpl=${templateRunId}`
+  );
+ 
+  const ins = await client.query(
+    `INSERT INTO line_runs
+       (line_no, run_date, style, operators_count, working_hours, sam_minutes,
+        efficiency, target_pcs, target_per_hour, work_order_id, is_draft, created_at, updated_at)
+     VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9, $10, true, NOW(), NOW())
+     ON CONFLICT ON CONSTRAINT uq_line_run DO NOTHING
+     RETURNING id`,
+    [line, runDate, runStyle, operators, hours, sam, eff, targetPcs, targetPerHour, workOrderId ?? null]
+  );
+ 
+  // Lost a race with a concurrent confirm: adopt the winner instead of bailing.
+  if (ins.rowCount === 0) {
+    const again = await client.query(
+      "SELECT id FROM line_runs WHERE line_no = $1 AND run_date = $2::date AND style = $3 LIMIT 1",
+      [line, runDate, runStyle]
+    );
+    if (!again.rows[0]) {
+      console.warn(`   ↳ INSERT did nothing and no row found for L${line} ${runDate} "${runStyle}"`);
+      return { runId: null, created: false };
+    }
+    await linkAssignments(again.rows[0].id);
+    return { runId: again.rows[0].id, created: false };
+  }
+ 
+  const runId = ins.rows[0].id;
+  console.log(`   ↳ created run ${runId}`);
+ 
+  await client.query(
+    `INSERT INTO shift_slots (run_id, slot_order, slot_label, slot_start, slot_end, planned_hours)
+     VALUES ($1, 1, $2, NULL, NULL, $3)`,
+    [runId, "Turno", hours]
+  );
+ 
+  // Inherit the operator roster from the template (operations aren't copied).
+  if (templateRunId) {
+    await client.query(
+      `INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
+       SELECT $1, operator_no, operator_name, NOW()
+         FROM run_operators WHERE run_id = $2
+       ON CONFLICT (run_id, operator_no) DO NOTHING`,
+      [runId, templateRunId]
+    );
+  }
+ 
+  await linkAssignments(runId);
+  return { runId, created: true };
+}
 
+// Remove an auto-created DRAFT run for a (line, day) once that cell no longer
+// has any active planner assignment. Confirmed runs (is_draft = false) — ones a
+// line leader already accepted, or that engineering configured directly — are
+// never touched, and days that still hold an assignment are left alone. Child
+// rows (shift_slots, run_operators, …) cascade on delete; line_assignments.
+// line_run_id is ON DELETE SET NULL, so any stray link just clears.
+async function cleanupOrphanDraftRuns(client, lineNo, runDate) {
+  if (!lineNo || !runDate) return 0;
+  const del = await client.query(
+    `DELETE FROM line_runs lr
+      WHERE lr.line_no = $1
+        AND lr.run_date = $2
+        AND lr.is_draft = true
+        AND NOT EXISTS (
+          SELECT 1 FROM line_assignments la
+           WHERE la.line_no = lr.line_no
+             AND la.assigned_date = lr.run_date
+             AND la.status NOT IN ('cancelled', 'rejected')
+        )
+      RETURNING lr.id`,
+    [String(lineNo), runDate]
+  );
+  return del.rowCount;
+}
 
+// ---------------------------------------------------------------------------
+// POST /api/line-assignments/confirm
+//
+// The planner's explicit "send to line leaders" step. Given a set of assignment
+// ids (the cells the planner selected), create a DRAFT run for every distinct
+// (line, day) among them that doesn't already have a run. This replaces the old
+// behaviour where a draft was auto-created on every assign/move — which left a
+// stale draft behind each time an order was dragged to a new day.
+//
+// Body: { ids: number[] }   (assignment ids)
+// Returns: { success, created, alreadyPresent, cells, message }
+// ---------------------------------------------------------------------------
+app.post("/api/line-assignments/confirm", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  console.log("🔵 CONFIRM hit:", JSON.stringify(req.body), "user:", req.user?.id ?? req.user?.username);
+  try {
+    await setSchema(client);
+ 
+    const idList = Array.isArray(req.body?.ids)
+      ? [...new Set(req.body.ids.map((n) => parseInt(n)).filter((n) => Number.isInteger(n)))]
+      : [];
+    console.log("🔵 idList:", idList);
+ 
+    if (idList.length === 0) {
+      return res.status(400).json({ success: false, error: "ids (no vacío) es obligatorio" });
+    }
+ 
+    await client.query("BEGIN");
+ 
+    // Resolve the selected assignments to their distinct (line, day, order)
+    // cells. COALESCE guards a NULL status, which would otherwise make
+    // `status NOT IN (...)` evaluate to NULL and silently drop the row.
+    const rows = await client.query(
+      `SELECT DISTINCT line_no,
+              to_char(assigned_date, 'YYYY-MM-DD') AS run_date,
+              work_order_id
+         FROM line_assignments
+        WHERE id = ANY($1::bigint[])
+          AND assigned_date IS NOT NULL
+          AND COALESCE(status, 'planned') NOT IN ('cancelled', 'rejected')`,
+      [idList]
+    );
+    console.log("🔵 cells resolved:", rows.rows);
+ 
+    if (rows.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "No se encontraron asignaciones para confirmar" });
+    }
+ 
+    let created = 0;
+    let alreadyPresent = 0;
+    let failed = 0;
+    const confirmedCells = [];
+    const runIds = [];
+ 
+    for (const cell of rows.rows) {
+      const lineNo = String(cell.line_no);
+      const runDate = cell.run_date;
+ 
+      const { runId, created: isNew } = await ensureDraftRunForAssignment(client, {
+        lineNo,
+        runDate,
+        workOrderId: cell.work_order_id,
+        style: null,
+      });
+ 
+      if (!runId) {
+        failed++;
+        console.warn(`🟠 no run produced for L${lineNo} ${runDate} wo=${cell.work_order_id}`);
+        continue;
+      }
+ 
+      if (isNew) created++;
+      else alreadyPresent++;
+      runIds.push(runId);
+      confirmedCells.push({ lineNo, runDate, runId, isNew });
+    }
+ 
+    await client.query("COMMIT");
+    console.log(`🟢 CONFIRM done: created=${created} already=${alreadyPresent} failed=${failed} runIds=${runIds}`);
+ 
+    res.json({
+      success: true,
+      created,
+      alreadyPresent,
+      failed,
+      runIds,
+      cells: confirmedCells.length,
+      message:
+        `Se enviaron ${confirmedCells.length} casilla(s) a los líderes de línea ` +
+        `(${created} nueva(s), ${alreadyPresent} ya existente(s)` +
+        (failed > 0 ? `, ${failed} con error` : "") + `).`,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ CONFIRM failed:", err.code, err.constraint, err.message);
+    console.error(err.stack);
+    res.status(500).json({ success: false, error: err.message, code: err.code });
+  } finally {
+    client.release();
+  }
+});
 
-/**
- * POST /api/line-assignments
- * Assigns a quantity of a work order to a production line on a given date.
- * Uses the work order's own SAM (set from its master code, if one was
- * selected) rather than the line's generic SAM, so the day/rate math
- * reflects the actual style being produced.
- */
 app.post("/api/line-assignments", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -4431,6 +5770,35 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
     if (!workOrderId || !lineNo || !assignedDate || !quantity || parseFloat(quantity) <= 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({ success: false, error: "workOrderId, lineNo, assignedDate and a positive quantity are required" });
+    }
+
+    // No production on weekends: reject Sat/Sun assignment dates outright.
+    const isWeekendYmd = (ymdStr) => {
+      const [y, m, d] = String(ymdStr).split("-").map(Number);
+      const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sun, 6 = Sat
+      return dow === 0 || dow === 6;
+    };
+    if (isWeekendYmd(assignedDate)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: "No se puede asignar en fin de semana (sábado o domingo)." });
+    }
+
+    // No production on non-working days (Días festivos / paros). A plant-wide
+    // holiday blocks every line; a line-specific one blocks just that line.
+    // If the holidays module/table isn't available we don't block assignments.
+    try {
+      const hol = await registerHolidays.isHoliday(client, { date: assignedDate, lineNo });
+      if (hol) {
+        await client.query("ROLLBACK");
+        const scope = hol.line_no ? `la Línea ${hol.line_no}` : "toda la planta";
+        return res.status(400).json({
+          success: false,
+          error: `${assignedDate} es un día no laborable para ${scope}${hol.name ? ` (${hol.name})` : ""}.`,
+          holiday: hol,
+        });
+      }
+    } catch (e) {
+      console.warn("⚠️  holiday check skipped:", e.message);
     }
 
     const woResult = await client.query(
@@ -4476,7 +5844,23 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       [lineNo, assignedDate]
     );
     const alreadyAssigned = parseFloat(alreadyAssignedResult.rows[0].total) || 0;
-    const availableCapacity = Math.max(0, parseFloat(lineData.target_pcs) - alreadyAssigned);
+
+    // ── add: holds on this line/day also occupy capacity ──
+    let heldOnCell = 0;
+    try {
+      const heldRes = await client.query(
+        `SELECT COALESCE(SUM(quantity), 0) AS total FROM pre_order_day_holds
+          WHERE line_no = $1 AND assigned_date = $2`,
+        [lineNo, assignedDate]
+      );
+      heldOnCell = parseFloat(heldRes.rows[0].total) || 0;
+    } catch (e) {
+      heldOnCell = 0;
+    }
+
+    // change this line to also subtract heldOnCell:
+    const availableCapacity = Math.max(0, parseFloat(lineData.target_pcs) - alreadyAssigned - heldOnCell);
+
     if (qty > availableCapacity) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -4485,26 +5869,24 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       });
     }
 
-    const result = await client.query(
-      `INSERT INTO line_assignments (
-        work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
-        available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'planned', $10)
-      RETURNING *`,
-      [
-        parseInt(workOrderId),
-        lineData.id || null,
-        lineNo,
-        assignedDate,
-        qty,
-        effectiveDailyMinutes,
-        piecesPerDay,
-        startDate,
-        plannedEndDate,
-        color || null
-      ]
-    );
+    
+    // One planned row per (work_order, line, day, color): if this cell already
+    // holds pieces of the same order+color, add to that row instead of stacking
+    // a second sliver. Spilling to the next day still happens upstream, since
+    // the caller only sends what fits in this day's remaining capacity.
+    const assignment = await mergeOrInsertAssignment(client, {
+      workOrderId: parseInt(workOrderId),
+      lineRunId: lineData.id || null,
+      lineNo,
+      assignedDate,
+      quantity: qty,
+      availableMinutes: effectiveDailyMinutes,
+      requiredRate: piecesPerDay,
+      startDate,
+      endDate: plannedEndDate,
+      status: "planned",
+      color: color || null,
+    });
 
     // Move the work order out of 'pending' now that it has at least one assignment
     await client.query(
@@ -4512,9 +5894,11 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       [parseInt(workOrderId)]
     );
 
+    
+
     await client.query("COMMIT");
 
-    res.json({ success: true, message: "Line assignment created", assignment: result.rows[0] });
+    res.json({ success: true, message: "Line assignment created", assignment });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error creating line assignment:", err.message);
@@ -4523,6 +5907,8 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
     client.release();
   }
 });
+
+
 
 app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -4533,16 +5919,72 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
     const { id } = req.params;
 
     const existing = await client.query(
-      "SELECT work_order_id FROM line_assignments WHERE id = $1",
+      "SELECT work_order_id, assigned_date, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str, (assigned_date < CURRENT_DATE) AS is_past FROM line_assignments WHERE id = $1",
       [parseInt(id)]
     );
     if (existing.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, error: "Assignment not found" });
     }
+    const delLineNo = String(existing.rows[0].line_no);
+    const delDate = existing.rows[0].assigned_date_str;
+    // Safety net: never delete a cell dated before today (old assigned quantity).
+    if (existing.rows[0].is_past) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: "No se puede eliminar una asignación de un día anterior a hoy (cantidad ya asignada).",
+      });
+    }
     const workOrderId = existing.rows[0].work_order_id;
+    const row = existing.rows[0];
 
-    await client.query("DELETE FROM line_assignments WHERE id = $1", [parseInt(id)]);
+    // A cell that already has production behind it must never be hard-deleted:
+    // SUM(assigned_quantity) would silently lose pieces that were really sewn,
+    // and the board would re-assign work the floor already did.
+    const cellProduced =
+      Number(row.produced_quantity) > 0
+        ? Number(row.produced_quantity)
+        : (
+            await client.query(
+              `SELECT COALESCE(SUM(se.sewed_qty), 0) AS produced
+                 FROM line_runs lr
+                 JOIN operation_sewed_entries se ON se.run_id = lr.id
+                WHERE lr.line_no = $1 AND lr.run_date = $2::date`,
+              [String(row.line_no), row.assigned_date]
+            )
+          ).rows[0].produced;
+
+    if (Number(cellProduced) > 0 && !req.query.force) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error:
+          `Esa celda ya tiene ${Number(cellProduced)} piezas reportadas. ` +
+          `Liquidala con /api/line-assignments/settle-day, o repite con ?force=true ` +
+          `para cancelarla (no se borra: se conserva el historial).`,
+        produced: Number(cellProduced),
+        assigned: Number(row.assigned_quantity) || 0,
+      });
+    }
+
+    if (Number(cellProduced) > 0) {
+      // Forced: cancel, never delete. Cancelled rows are excluded from every
+      // assigned SUM, so the pool frees up exactly as a delete would, but the
+      // produced history survives.
+      await client.query(
+        `UPDATE line_assignments SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
+        [parseInt(id)]
+      );
+    } else {
+      await client.query("DELETE FROM line_assignments WHERE id = $1", [parseInt(id)]);
+    }
+
+    // Whether the cell was hard-deleted or soft-cancelled, the day may now have
+    // no active assignment. Drop its unconfirmed draft run so line leaders don't
+    // keep seeing a draft for an emptied cell. (Cancelled rows count as inactive,
+    // and a cell with real production has a confirmed run, which is never touched.)
+    await cleanupOrphanDraftRuns(client, delLineNo, delDate);
 
     // If no active assignments remain, return the work order to 'pending'
     // (mirror of the POST, which moves 'pending' -> 'assigned').
@@ -4978,6 +6420,147 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
     client.release();
   }
 });
+
+/**
+ * Paste into server1.js next to the other /api/skyrina routes.
+ *
+ * GET /api/skyrina/daily-production?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ *
+ * Returns one row per calendar day in the range (days with no runs come back as
+ * zeros, so the chart keeps its gaps instead of silently closing them).
+ *
+ * Produced = packing/empaque sewed quantities, matching /api/skyrina/period-summary.
+ * Meta     = sum of target_pcs across that day's runs.
+ *
+ * Overview.jsx works without this — it falls back to one period-summary call per
+ * day. This route turns 30 round trips into 1.
+ */
+app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { startDate, endDate, style, lineNo } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        error: "startDate and endDate parameters required",
+      });
+    }
+
+    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    let runFilters = "";
+
+    if (style && style !== 'all') {
+      runFilters += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+    if (lineNo && lineNo !== 'all') {
+      runFilters += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+
+    const query = `
+      WITH calendar AS (
+        SELECT generate_series($1::date, $2::date, '1 day')::date AS day
+      ),
+      filtered_runs AS (
+        SELECT
+          lr.id          AS run_id,
+          lr.run_date    AS run_date,
+          lr.target_pcs  AS target_pcs,
+          lr.sam_minutes AS sam_minutes,
+          (lr.working_hours * lr.operators_count * 60) AS available_minutes
+        FROM line_runs lr
+        WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
+      ),
+      -- Denominator: available minutes are summed over EVERY run on the day,
+      -- not only over runs that happen to contain a packing operation. This is
+      -- the same rule /api/skyrina/period-summary applies to the whole range.
+      daily_target AS (
+        SELECT
+          run_date,
+          COUNT(*)                                AS runs,
+          COALESCE(SUM(target_pcs), 0)            AS target,
+          COALESCE(SUM(available_minutes), 0)     AS available_minutes
+        FROM filtered_runs
+        GROUP BY run_date
+      ),
+      run_packing_totals AS (
+        SELECT
+          fr.run_id,
+          fr.run_date,
+          fr.sam_minutes,
+          COALESCE(SUM(se.sewed_qty), 0) AS packing_total
+        FROM filtered_runs fr
+        JOIN run_operators ro          ON fr.run_id = ro.run_id
+        JOIN operator_operations oo    ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+        GROUP BY fr.run_id, fr.run_date, fr.sam_minutes
+      ),
+      -- Numerator: SAM output = packed pieces * SAM of the run they came from.
+      daily_produced AS (
+        SELECT
+          run_date,
+          COALESCE(SUM(packing_total), 0)               AS produced,
+          COALESCE(SUM(packing_total * sam_minutes), 0) AS sam_output
+        FROM run_packing_totals
+        GROUP BY run_date
+      )
+      SELECT
+        c.day                              AS date,
+        COALESCE(dt.runs, 0)               AS runs,
+        COALESCE(dp.produced, 0)           AS produced,
+        COALESCE(dt.target, 0)             AS target,
+        COALESCE(dt.available_minutes, 0)  AS available_minutes,
+        COALESCE(dp.sam_output, 0)         AS sam_output,
+        CASE
+          WHEN COALESCE(dt.available_minutes, 0) > 0
+          THEN (COALESCE(dp.sam_output, 0) / dt.available_minutes) * 100
+          ELSE 0
+        END                                AS efficiency
+      FROM calendar c
+      LEFT JOIN daily_produced dp ON dp.run_date = c.day
+      LEFT JOIN daily_target   dt ON dt.run_date = c.day
+      ORDER BY c.day ASC
+    `;
+
+    const result = await client.query(query, params);
+
+    const days = result.rows.map((row) => ({
+      // send a plain YYYY-MM-DD string so the client never re-parses in UTC
+      date: row.date instanceof Date
+        ? `${row.date.getFullYear()}-${String(row.date.getMonth() + 1).padStart(2, '0')}-${String(row.date.getDate()).padStart(2, '0')}`
+        : String(row.date).slice(0, 10),
+      runs: parseInt(row.runs, 10) || 0,
+      produced: parseFloat(row.produced) || 0,
+      target: parseFloat(row.target) || 0,
+      // NO ROUNDING - keep the exact value, same as period-summary
+      availableMinutes: parseFloat(row.available_minutes) || 0,
+      samOutput: parseFloat(row.sam_output) || 0,
+      efficiency: parseFloat(row.efficiency) || 0,
+    }));
+
+    res.json({
+      success: true,
+      period: { startDate, endDate },
+      days,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching daily production:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
 
 /**
  * GET /api/skyrina/product-breakdown?date=YYYY-MM-DD
@@ -5983,7 +7566,26 @@ app.post("/api/planner/update-sewed/:runId", authenticateToken, requirePlanner, 
     }
 
     await client.query("COMMIT");
-    res.json({ success: true, updatedCount });
+
+    // Mueve el estado de la ORDEN según lo producido (mismo criterio que el
+    // endpoint del líder de línea): producido>0 -> en proceso, producido>=asignado
+    // -> terminada. Solo empuja hacia adelante. Va fuera de la transacción, ya
+    // commiteada, para que lea las piezas recién guardadas.
+    let statusChange = null;
+    try {
+      const runInfo = await client.query(
+        `SELECT work_order_id FROM line_runs WHERE id = $1`,
+        [runId]
+      );
+      const woId = runInfo.rows[0]?.work_order_id;
+      if (woId) {
+        statusChange = await registerWorkOrders.refreshWorkOrderStatusFromProduction(client, woId);
+      }
+    } catch (e) {
+      console.warn("⚠️  recálculo de estado de la orden falló (el guardado sí se realizó):", e.message);
+    }
+
+    res.json({ success: true, updatedCount, statusChange });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ /api/planner/update-sewed error:", err.message);
@@ -6015,36 +7617,40 @@ app.get("/api/master-codes/next-correlativo", authenticateToken, requireMerchant
   const client = await pool.connect();
   try {
     await setSchema(client);
-    
+
     const { type, modelo } = req.query;
-    
+
     if (!type || !modelo) {
-      return res.status(400).json({ 
-        success: false, 
-        error: "type and modelo parameters are required" 
+      return res.status(400).json({
+        success: false,
+        error: "type and modelo parameters are required"
       });
     }
-    
-    // Find the highest correlativo for this type+modelo combination
+
+    // Highest correlativo across BOTH real master codes and pending pre-orders.
     const result = await client.query(
-      `SELECT correlativo 
-       FROM master_codes 
-       WHERE type = $1 AND modelo = $2 
-       ORDER BY correlativo::int DESC 
-       LIMIT 1`,
+      `SELECT COALESCE(MAX(c), 0) AS maxseq
+         FROM (
+           SELECT correlativo::int AS c
+             FROM master_codes
+            WHERE type = $1 AND modelo = $2
+              AND correlativo ~ '^[0-9]+$'
+           UNION ALL
+           SELECT correlativo::int AS c
+             FROM pre_orders
+            WHERE tipo = $1 AND modelo = $2
+              AND status = 'pending'
+              AND correlativo ~ '^[0-9]+$'
+         ) t`,
       [type, modelo]
     );
-    
+
     let nextCorrelativo = "01";
-    
-    if (result.rows.length > 0) {
-      const lastCorrelativo = parseInt(result.rows[0].correlativo, 10);
-      if (!isNaN(lastCorrelativo)) {
-        const next = lastCorrelativo + 1;
-        nextCorrelativo = String(next).padStart(2, '0');
-      }
+    const maxseq = parseInt(result.rows[0]?.maxseq, 10);
+    if (!isNaN(maxseq) && maxseq > 0) {
+      nextCorrelativo = String(maxseq + 1).padStart(2, "0");
     }
-    
+
     res.json({
       success: true,
       nextCorrelativo,
