@@ -617,6 +617,8 @@ console.log("✅ line_assignments consolidated to one planned row per cell (wo+l
 await client.query(`ALTER TABLE line_runs ADD COLUMN IF NOT EXISTS work_order_id BIGINT REFERENCES work_orders(id) ON DELETE SET NULL;`);
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_runs_work_order ON line_runs(work_order_id);");
 // ────
+
+await registerHolidays.initSchema({ pool, setSchema });
 await registerFinishedWarehouseAnalytics.initSchema({ pool, setSchema });
 // ~línea 622, en el bloque async de arranque, junto a los otros initSchema:
 await registerPreOrders.initSchema({ pool, setSchema });
@@ -856,7 +858,8 @@ app.post(
 app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
-
+const registerHolidays = require("./holidays");
+registerHolidays(app, { authenticateToken, pool, setSchema });
 // ~línea 867, junto a registerMerchantPlan:
 const registerPreOrders = require("./pre-orders");
 registerPreOrders(app, { authenticateToken, pool, setSchema });
@@ -5291,22 +5294,38 @@ app.get("/api/planning/available-lines", authenticateToken, async (req, res) => 
         assigned_quantity: Math.round((parseFloat(r.assigned_quantity) || 0) * 100) / 100,
       });
     });
+        // Días festivos / paros close the day for the whole plant (line_no NULL) or
+    // for a single line. A blocked line reports zero available capacity so the
+    // board won't spill work onto it. Best-effort: ignore if the module is absent.
+    let plantHoliday = null;
+    const lineHolidays = new Set();
+    try {
+      const hrows = await registerHolidays.holidaysBetween(client, { from: date, to: date });
+      for (const h of hrows) {
+        if (h.line_no == null) plantHoliday = h;
+        else lineHolidays.add(String(h.line_no));
+      }
+    } catch (e) {
+      console.warn("⚠️  holidays not available for capacity:", e.message);
+    }
 
     const linesWithAvailability = lines.map((line) => {
       const targetPcs = parseFloat(line.target_pcs) || 0;
       const assigned = assignedByLine[line.line_no] || 0;
-      const available = Math.max(0, targetPcs - assigned);
+      const blocked = !!plantHoliday || lineHolidays.has(String(line.line_no));
+      const available = blocked ? 0 : Math.max(0, targetPcs - assigned);
       const utilizationPercentage = targetPcs > 0 ? (assigned / targetPcs) * 100 : 0;
       return {
         ...line,
         assigned_quantity: Math.round(assigned * 100) / 100,
         available_capacity: Math.round(available * 100) / 100,
         utilization_percentage: Math.round(utilizationPercentage * 10) / 10,
-        work_orders: workOrdersByLine[line.line_no] || [],
+        holiday: blocked ? (plantHoliday || { line_no: line.line_no }) : null,
       };
     });
 
-    res.json({ success: true, lines: linesWithAvailability, capacitySource, capacityDate });
+    res.json({ success: true, lines: linesWithAvailability, capacitySource, capacityDate, holiday: plantHoliday || null });
+    
   } catch (err) {
     console.error("❌ Error fetching available lines:", err.message);
     res.status(500).json({ success: false, error: err.message });
@@ -5762,6 +5781,24 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
     if (isWeekendYmd(assignedDate)) {
       await client.query("ROLLBACK");
       return res.status(400).json({ success: false, error: "No se puede asignar en fin de semana (sábado o domingo)." });
+    }
+
+    // No production on non-working days (Días festivos / paros). A plant-wide
+    // holiday blocks every line; a line-specific one blocks just that line.
+    // If the holidays module/table isn't available we don't block assignments.
+    try {
+      const hol = await registerHolidays.isHoliday(client, { date: assignedDate, lineNo });
+      if (hol) {
+        await client.query("ROLLBACK");
+        const scope = hol.line_no ? `la Línea ${hol.line_no}` : "toda la planta";
+        return res.status(400).json({
+          success: false,
+          error: `${assignedDate} es un día no laborable para ${scope}${hol.name ? ` (${hol.name})` : ""}.`,
+          holiday: hol,
+        });
+      }
+    } catch (e) {
+      console.warn("⚠️  holiday check skipped:", e.message);
     }
 
     const woResult = await client.query(
