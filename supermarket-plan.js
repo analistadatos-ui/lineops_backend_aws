@@ -46,6 +46,16 @@
 
 const MAX_SNAPSHOT_BYTES = 6 * 1024 * 1024; // ~6 MB por semana; una semana real ronda 50-300 KB
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+// Cuántas semanas hacia adelante puede publicar el planner. El supermercado
+// surte material del horizonte cercano; enviar semanas lejanas no ayuda (el
+// plan aún va a moverse), enviar semanas pasadas no tiene sentido, y la SEMANA
+// ACTUAL tampoco se envía (ya está en piso: no hay tiempo de surtir contra
+// ella). Se puede sobreescribir desde server.js con `minWeeksAhead` /
+// `maxWeeksAhead`.
+const DEFAULT_MIN_WEEKS_AHEAD = 1; // 1 = excluye la semana actual (0)
+const DEFAULT_MAX_WEEKS_AHEAD = 2;
 
 // --- helpers --------------------------------------------------------------
 
@@ -63,6 +73,16 @@ function mondayOf(ymd) {
 }
 
 const toTxt = (v) => (v == null ? null : String(v).trim() || null);
+
+// Semanas enteras entre dos lunes (ISO YYYY-MM-DD). Negativo = `b` es anterior
+// a `a`. Ambos deben venir ya normalizados por mondayOf().
+function weeksBetweenMondays(a, b) {
+  if (!ISO_DATE.test(String(a || "")) || !ISO_DATE.test(String(b || ""))) return null;
+  const da = new Date(`${a}T00:00:00Z`);
+  const db = new Date(`${b}T00:00:00Z`);
+  if (isNaN(da.getTime()) || isNaN(db.getTime())) return null;
+  return Math.round((db - da) / (7 * MS_PER_DAY));
+}
 
 // --- Startup migration ----------------------------------------------------
 async function initSchema({ pool, setSchema }) {
@@ -120,6 +140,22 @@ function registerSupermarketPlan(app, deps) {
   // server.js. `null` = cualquiera autenticado (util en instalaciones que aun
   // no tienen roles cableados).
   const publisherRoles = deps.publisherRoles || ["admin", "planner", "planeacion", "planning", "supermarcado", "supervisor", "master", "soporte_it", "skyrina"];
+
+  // Horizonte de envío: sólo se pueden publicar las semanas entre
+  // `minWeeksAhead` y `maxWeeksAhead` contando desde la semana actual (0).
+  // Por defecto [1, 2]: excluye la semana actual y publica las dos siguientes.
+  const minWeeksAhead = Number.isFinite(Number(deps.minWeeksAhead))
+    ? Math.max(0, Math.trunc(Number(deps.minWeeksAhead)))
+    : DEFAULT_MIN_WEEKS_AHEAD;
+  const maxWeeksAhead = Number.isFinite(Number(deps.maxWeeksAhead))
+    ? Math.max(minWeeksAhead, Math.trunc(Number(deps.maxWeeksAhead)))
+    : Math.max(minWeeksAhead, DEFAULT_MAX_WEEKS_AHEAD);
+
+  // Las semanas con pre-órdenes (PRE####) NO se pueden enviar al supermercado:
+  // una pre-orden no es un pedido en firme y no hay material que surtir todavía.
+  // El merchant debe convertirla a PO real antes de publicar la semana. Se
+  // puede permitir explícitamente desde server.js con `allowPreOrders: true`.
+  const allowPreOrders = deps.allowPreOrders === true;
 
   const roleOf = (req) =>
     String(req.user?.role || req.user?.rol || "").trim().toLowerCase();
@@ -207,6 +243,7 @@ function registerSupermarketPlan(app, deps) {
     }
 
     // Validacion previa: si una semana viene mal, no publicamos ninguna.
+    const thisMonday = mondayOf(new Date().toISOString().slice(0, 10));
     const prepared = [];
     for (const w of weeksIn) {
       const weekStart = mondayOf(w?.weekStart);
@@ -214,6 +251,27 @@ function registerSupermarketPlan(app, deps) {
         return res.status(400).json({
           success: false,
           error: `Semana invalida: ${w?.weekStart}. Se espera una fecha YYYY-MM-DD.`,
+        });
+      }
+
+      // Regla de horizonte: sólo se puede enviar el plan de las semanas entre
+      // `minWeeksAhead` y `maxWeeksAhead` (0 = semana actual). Ni la semana
+      // actual, ni semanas pasadas, ni semanas más allá del horizonte.
+      const ahead = weeksBetweenMondays(thisMonday, weekStart);
+      if (ahead == null || ahead < minWeeksAhead) {
+        const msg =
+          ahead != null && ahead < 0
+            ? `La semana ${weekStart} ya pasó`
+            : `La semana actual (${weekStart}) no se puede enviar al supermercado`;
+        return res.status(400).json({
+          success: false,
+          error: `${msg}; sólo se pueden enviar las semanas ${minWeeksAhead} a ${maxWeeksAhead} a partir de la actual.`,
+        });
+      }
+      if (ahead > maxWeeksAhead) {
+        return res.status(400).json({
+          success: false,
+          error: `La semana ${weekStart} está fuera del horizonte: sólo se pueden enviar las semanas ${minWeeksAhead} a ${maxWeeksAhead} a partir de la actual.`,
         });
       }
       const snapshot = w?.snapshot;
@@ -238,6 +296,14 @@ function registerSupermarketPlan(app, deps) {
         w?.hasPreOrders === true ||
         holds.some((h) => h && h.pre_order_id != null) ||
         planRows.some((r) => r && (r.pre_order_id != null || r.is_pre_order === true));
+
+      // Bloqueo de pre-órdenes: una semana con PRE#### no se surte todavía.
+      if (hasPre && !allowPreOrders) {
+        return res.status(400).json({
+          success: false,
+          error: `La semana ${weekStart} contiene pre-órdenes (PRE####) y no se puede enviar al supermercado. Convierta las pre-órdenes a PO real y vuelva a intentarlo.`,
+        });
+      }
 
       prepared.push({
         weekStart,
