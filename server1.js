@@ -7401,7 +7401,7 @@ app.get("/api/supervisor/assignments", authenticateToken, requireSupervisor, asy
 // ========== PLANNER: EDIT OPERATION (SEWED QTY) ==========
 
 const requirePlanner = (req, res, next) => {
-  const allowedRoles = ["planner", "engineer", "supervisor", "soporte_it", "skyrina", "master", "inspector"];
+  const allowedRoles = ["planner", "engineer", "supervisor", "soporte_it", "skyrina", "master", "inspector",'verificador'];
   if (!allowedRoles.includes(req.user?.role)) {
     return res.status(403).json({
       success: false,
