@@ -1294,6 +1294,229 @@ app.post(
   }
 );
 
+// ============================================================================
+// VERIFICADOR — corrección de la captura por hora del líder de línea
+// ----------------------------------------------------------------------------
+// Flujo del frontend (VerificadorPage.jsx): el verificador elige FECHA -> LÍNEA
+// -> ESTILO (cada estilo es una corrida / line_run) y luego edita la cuadrícula
+// operación × hora. A diferencia del líder de línea, aquí NO hay bloqueo de
+// celdas: el verificador puede sobrescribir cualquier valor ya guardado.
+//
+// Mismo modelo de datos que /api/lineleader/update-sewed:
+//   line_runs, shift_slots, run_operators, operator_operations,
+//   operation_sewed_entries (unique (operation_id, slot_id)).
+// ============================================================================
+
+// Roles autorizados a verificar/corregir. Debe incluir "verificador".
+const requireVerificador = (req, res, next) => {
+  const allowed = [
+    "verificador", "planner", "engineer", "supervisor",
+    "soporte_it", "skyrina", "master", "inspector",
+    "quality_head", "admin",
+  ];
+  if (!allowed.includes(req.user?.role)) {
+    return res.status(403).json({
+      success: false,
+      error: "Access denied. Verificador role required.",
+    });
+  }
+  next();
+};
+
+/**
+ * GET /api/verificador/dates
+ * Fechas distintas con corridas (para el selector de fecha).
+ */
+app.get("/api/verificador/dates", authenticateToken, requireVerificador, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const result = await client.query(
+      `SELECT DISTINCT to_char(run_date, 'YYYY-MM-DD') AS run_date
+         FROM line_runs
+        WHERE run_date IS NOT NULL
+        ORDER BY run_date DESC`
+    );
+    res.json({ success: true, dates: result.rows.map((r) => r.run_date) });
+  } catch (err) {
+    console.error("❌ /api/verificador/dates error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/verificador/lines?date=YYYY-MM-DD
+ * Líneas (con run id + estilo) que tienen corridas en la fecha dada.
+ */
+app.get("/api/verificador/lines", authenticateToken, requireVerificador, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter required" });
+    }
+    const result = await client.query(
+      `SELECT id AS run_id, line_no, style
+         FROM line_runs
+        WHERE to_char(run_date, 'YYYY-MM-DD') = $1
+        ORDER BY line_no, style`,
+      [date]
+    );
+    res.json({ success: true, lines: result.rows });
+  } catch (err) {
+    console.error("❌ /api/verificador/lines error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/verificador/run/:runId/sewed
+ * Devuelve slots (horas), operaciones y la cantidad cosida actual por slot,
+ * para que el verificador elija operación y edite lo producido.
+ */
+app.get("/api/verificador/run/:runId/sewed", authenticateToken, requireVerificador, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { runId } = req.params;
+
+    const runResult = await client.query(
+      `SELECT id, line_no, to_char(run_date, 'YYYY-MM-DD') AS run_date, style
+         FROM line_runs WHERE id = $1`,
+      [runId]
+    );
+    if (runResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Run not found" });
+    }
+
+    const slotsResult = await client.query(
+      `SELECT id AS slot_id, slot_order, slot_label
+         FROM shift_slots
+        WHERE run_id = $1
+        ORDER BY slot_order`,
+      [runId]
+    );
+
+    const rowsResult = await client.query(
+      `SELECT ro.operator_no,
+              ro.operator_name,
+              oo.id AS operation_id,
+              oo.operation_name,
+              ss.id AS slot_id,
+              ss.slot_label,
+              ss.slot_order,
+              COALESCE(se.sewed_qty, 0) AS sewed_qty
+         FROM run_operators ro
+         JOIN operator_operations oo ON oo.run_operator_id = ro.id
+         CROSS JOIN shift_slots ss
+         LEFT JOIN operation_sewed_entries se
+                ON se.operation_id = oo.id AND se.slot_id = ss.id
+        WHERE ro.run_id = $1 AND oo.run_id = $1 AND ss.run_id = $1
+        ORDER BY ro.operator_no, oo.operation_name, ss.slot_order`,
+      [runId]
+    );
+
+    res.json({
+      success: true,
+      run: runResult.rows[0],
+      slots: slotsResult.rows,
+      rows: rowsResult.rows,
+    });
+  } catch (err) {
+    console.error("❌ /api/verificador/run/sewed error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/verificador/update-sewed/:runId
+ * body: { entries: [{ operatorNo, operationName, slotLabel, sewedQty }] }
+ * Sobrescribe las cantidades cosidas capturadas por el líder de línea.
+ */
+app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerificador, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { runId } = req.params;
+    const { entries } = req.body;
+
+    if (!entries || !Array.isArray(entries)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: "Missing entries array" });
+    }
+
+    let updatedCount = 0;
+
+    for (const entry of entries) {
+      const { operatorNo, operationName, slotLabel, sewedQty } = entry;
+      if (!operatorNo || !operationName || !slotLabel) continue;
+
+      const opResult = await client.query(
+        `SELECT o.id AS op_id
+           FROM operator_operations o
+           JOIN run_operators ro ON o.run_operator_id = ro.id
+          WHERE o.run_id = $1 AND ro.operator_no = $2 AND o.operation_name = $3
+          LIMIT 1`,
+        [runId, parseInt(operatorNo), operationName]
+      );
+      if (opResult.rows.length === 0) continue;
+      const operationId = opResult.rows[0].op_id;
+
+      const slotResult = await client.query(
+        `SELECT id FROM shift_slots WHERE run_id = $1 AND slot_label = $2 LIMIT 1`,
+        [runId, slotLabel]
+      );
+      if (slotResult.rows.length === 0) continue;
+      const slotId = slotResult.rows[0].id;
+
+      await client.query(
+        `INSERT INTO operation_sewed_entries (run_id, operation_id, slot_id, sewed_qty, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, now(), now())
+         ON CONFLICT (operation_id, slot_id)
+         DO UPDATE SET sewed_qty = EXCLUDED.sewed_qty, updated_at = now()`,
+        [runId, operationId, slotId, Number(sewedQty || 0)]
+      );
+      updatedCount++;
+    }
+
+    await client.query("COMMIT");
+
+    // Recalcula el estado de la ORDEN según lo producido (mismo criterio que el
+    // líder de línea). Va fuera de la transacción ya commiteada, para que lea las
+    // piezas recién guardadas. Si falla, el guardado ya se realizó.
+    let statusChange = null;
+    try {
+      const runInfo = await client.query(
+        `SELECT work_order_id FROM line_runs WHERE id = $1`,
+        [runId]
+      );
+      const woId = runInfo.rows[0]?.work_order_id;
+      if (woId) {
+        statusChange = await registerWorkOrders.refreshWorkOrderStatusFromProduction(client, woId);
+      }
+    } catch (e) {
+      console.warn("⚠️  recálculo de estado de la orden falló (el guardado sí se realizó):", e.message);
+    }
+
+    res.json({ success: true, updatedCount, statusChange });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ /api/verificador/update-sewed error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 // ✅ Confirm & save a batch of printed tickets.
 // Called from the line-leader ticket builder when the leader presses
