@@ -100,7 +100,7 @@ async function initSchema({ pool, setSchema }) {
 
 // Quién puede firmar la verificación del corte. Ajusta a los roles reales de
 // tu tabla de usuarios si el nombre difiere.
-const VERIFIER_ROLES = ["supervisor", "master", "admin", "skyrina", "soporte_it"];
+const VERIFIER_ROLES = ["supervisor", "master", "admin", "skyrina", "soporte_it","corte"];
 
 // Nombre que queda sellado en verified_by; el payload del token varía según el
 // login, así que tomamos el primero que exista.
