@@ -157,6 +157,12 @@ function registerSupermarketPlan(app, deps) {
   // puede permitir explícitamente desde server.js con `allowPreOrders: true`.
   const allowPreOrders = deps.allowPreOrders === true;
 
+  // Reenvío: por defecto una semana que YA tiene una publicación activa no se
+  // puede volver a enviar (hay que retirarla primero). Poner `allowResend: true`
+  // en server.js restaura el comportamiento anterior (revoca la viva y sube
+  // revisión al reenviar).
+  const allowResend = deps.allowResend === true;
+
   const roleOf = (req) =>
     String(req.user?.role || req.user?.rol || "").trim().toLowerCase();
 
@@ -311,6 +317,37 @@ function registerSupermarketPlan(app, deps) {
         counts: JSON.stringify(w?.counts && typeof w.counts === "object" ? w.counts : {}),
         hasPre,
       });
+    }
+
+    // Regla de "no reenviar": si alguna de las semanas ya tiene una publicación
+    // activa, se rechaza el lote completo (all-or-nothing, como el resto de las
+    // validaciones). El planner debe retirarla antes de volver a enviarla.
+    if (!allowResend) {
+      const already = await (async () => {
+        const c = await pool.connect();
+        try {
+          await setSchema(c);
+          const r = await c.query(
+            `SELECT to_char(week_start,'YYYY-MM-DD') AS week_start
+               FROM supermarket_publications
+              WHERE status = 'active' AND week_start = ANY($1::date[])
+              ORDER BY week_start`,
+            [prepared.map((p) => p.weekStart)]
+          );
+          return r.rows.map((x) => x.week_start);
+        } finally {
+          c.release();
+        }
+      })();
+      if (already.length) {
+        return res.status(409).json({
+          success: false,
+          error:
+            already.length === 1
+              ? `La semana ${already[0]} ya fue enviada al supermercado y no se puede reenviar. Retírela primero si necesita cambiarla.`
+              : `Estas semanas ya fueron enviadas al supermercado y no se pueden reenviar: ${already.join(", ")}. Retírelas primero si necesita cambiarlas.`,
+        });
+      }
     }
 
     try {
