@@ -2175,15 +2175,25 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     // rule as a pool placement. Weekends, days with no run configured, or days
     // already full are skipped. All-or-nothing: if the whole quantity can't fit
     // within the horizon, roll back and report the shortfall.
-    const MAX_DAYS = 180;
+        const MAX_DAYS = 180;
     let remaining = totalQty;
     let dayStr = assignedDate;
     let scanned = 0;
     const createdRows = [];
 
+    // Registered holidays (días festivos / paros) block a day just like weekends,
+    // so the forward walk hops over them instead of stacking onto a blocked cell.
+    // Plant-wide rows (line_no NULL) block every line. Best-effort: if the module
+    // isn't there we fall back to skipping weekends only.
+    const holidaySet = new Set();
+    try {
+      const hrows = await registerHolidays.holidaysBetween(client, { from: assignedDate, to: addDaysStr(assignedDate, 730) });
+      for (const h of hrows) if (h.line_no == null || String(h.line_no) === String(lineNo)) holidaySet.add(h.holiday_date);
+    } catch (e) { console.warn("⚠️  holidays not available for move:", e.message); }
+
     while (remaining > 0 && scanned < MAX_DAYS) {
       scanned++;
-      if (isWeekend(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend work
+      if (isWeekend(dayStr) || holidaySet.has(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend / holiday work
       const { lines } = await getLineCapacityForDate(client, dayStr);
       const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
       if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no capacity configured -> skip
@@ -2471,8 +2481,18 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
     // Free every selected block first so their old slots can be reused.
     await client.query("DELETE FROM line_assignments WHERE id = ANY($1::int[])", [idList]);
 
-    const MAX_DAYS = 180;
+        const MAX_DAYS = 180;
     const createdRows = [];
+
+    // Registered holidays (días festivos / paros) block a day like weekends, so
+    // the re-pack hops over them instead of stacking onto a blocked cell. Loaded
+    // once for the single target line. Best-effort: fall back to weekends-only if
+    // the module isn't available.
+    const holidaySet = new Set();
+    try {
+      const hrows = await registerHolidays.holidaysBetween(client, { from: assignedDate, to: addDaysStr(assignedDate, 730) });
+      for (const h of hrows) if (h.line_no == null || String(h.line_no) === String(lineNo)) holidaySet.add(h.holiday_date);
+    } catch (e) { console.warn("⚠️  holidays not available for move-batch:", e.message); }
 
     for (const original of cur.rows) {
       const totalQty = parseFloat(original.assigned_quantity) || 0;
@@ -2496,7 +2516,7 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
 
       while (remaining > 0 && scanned < MAX_DAYS) {
         scanned++;
-        if (isWeekend(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; } 
+        if (isWeekend(dayStr) || holidaySet.has(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; } // no weekend / holiday work
         const { lines } = await getLineCapacityForDate(client, dayStr);
         const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
         if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no run -> skip
@@ -2599,7 +2619,7 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
 //    momentarily share a (work_order,line,day,color) slot and trip
 //    uq_line_assign_planned_cell.
 //  - Only status='planned' rows shift; released/completed/cancelled history is
-//    left untouched. Weekends are skipped.
+//    left untouched. Weekends AND registered holidays are skipped.
 // ---------------------------------------------------------------------------
 app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -2614,14 +2634,18 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
     const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
     return dow === 0 || dow === 6;
   };
+  // Days blocked for the target line (registered holidays / line stoppages),
+  // populated once per request below — before any workday hop consults it.
+  const holidaySet = new Set();
+  const isBlocked = (ymdStr) => isWeekend(ymdStr) || holidaySet.has(ymdStr);
   const nextWorkday = (ymdStr) => {
     let d = addDaysStr(ymdStr, 1);
-    while (isWeekend(d)) d = addDaysStr(d, 1);
+    while (isBlocked(d)) d = addDaysStr(d, 1);
     return d;
   };
   const thisOrNextWorkday = (ymdStr) => {
     let d = ymdStr;
-    while (isWeekend(d)) d = addDaysStr(d, 1);
+    while (isBlocked(d)) d = addDaysStr(d, 1);
     return d;
   };
   // Full, timezone-safe snapshot of a row — enough to recreate it verbatim.
@@ -2644,6 +2668,35 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
       return res.status(400).json({ success: false, error: "No se puede insertar en fin de semana. Elija un dia entre semana." });
     }
     const targetLine = String(lineNo);
+
+    // Preload every blocked day for this line across a generous horizon so the
+    // workday hops below skip registered holidays (plant-wide OR line-specific)
+    // just like weekends — both the inserted orders and the rippled tail avoid
+    // them. Best-effort: if the holidays module/table isn't there we fall back
+    // to skipping weekends only.
+    try {
+      const hrows = await registerHolidays.holidaysBetween(client, {
+        from: assignedDate,
+        to: addDaysStr(assignedDate, 730),
+      });
+      for (const h of hrows) {
+        if (h.line_no == null || String(h.line_no) === targetLine) holidaySet.add(h.holiday_date);
+      }
+    } catch (e) {
+      console.warn("⚠️  holidays not available for insert-shift-batch:", e.message);
+    }
+
+    // The destination day itself must be a working day for this line.
+    if (holidaySet.has(assignedDate)) {
+      let hol = null;
+      try { hol = await registerHolidays.isHoliday(client, { date: assignedDate, lineNo: targetLine }); } catch { /* keep generic message */ }
+      const scope = hol?.line_no ? `la Línea ${hol.line_no}` : "toda la planta";
+      return res.status(400).json({
+        success: false,
+        error: `${assignedDate} es un día no laborable para ${scope}${hol?.name ? ` (${hol.name})` : ""}.`,
+        holiday: hol || undefined,
+      });
+    }
 
     await client.query("BEGIN");
 
