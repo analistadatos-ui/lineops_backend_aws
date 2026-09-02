@@ -2572,6 +2572,304 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /api/line-assignments/insert-shift-batch
+//
+// Multi-order version of PATCH /insert-shift. Take one OR several selected
+// assignments and INSERT them as consecutive workday cells starting at
+// (lineNo, assignedDate), pushing the whole PLANNED tail of the target line
+// forward by exactly as many workdays as there are inserted cells. Relative
+// sequence and spacing on the line are preserved — the tail just slides by N
+// workdays (a Friday block lands on the following Monday), same idea as the
+// single-order insert but for N cells at once.
+//
+// The single drag-and-drop insert now routes here too (ids:[oneId]) so BOTH the
+// single and multi insert are reversible through the exact same undo token.
+//
+// Body:    { ids: number[], lineNo, assignedDate }
+// Returns: { success, inserted, shifted, firstDate, lastDate, undo }
+//          `undo` is an opaque snapshot the client posts to /insert-shift-undo
+//          to reverse the entire ripple in one shot.
+//
+// Safety:
+//  - One transaction: any failure rolls the whole ripple back.
+//  - Selected rows are deleted BEFORE the tail is read, so a selected block that
+//    lived on the target line at/after D is not double-counted in the shift.
+//  - The tail shift is applied LATEST-day first so no two planned rows ever
+//    momentarily share a (work_order,line,day,color) slot and trip
+//    uq_line_assign_planned_cell.
+//  - Only status='planned' rows shift; released/completed/cancelled history is
+//    left untouched. Weekends are skipped.
+// ---------------------------------------------------------------------------
+app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  const addDaysStr = (ymdStr, k) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + k);
+    return dt.toISOString().slice(0, 10);
+  };
+  const isWeekend = (ymdStr) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+    return dow === 0 || dow === 6;
+  };
+  const nextWorkday = (ymdStr) => {
+    let d = addDaysStr(ymdStr, 1);
+    while (isWeekend(d)) d = addDaysStr(d, 1);
+    return d;
+  };
+  const thisOrNextWorkday = (ymdStr) => {
+    let d = ymdStr;
+    while (isWeekend(d)) d = addDaysStr(d, 1);
+    return d;
+  };
+  // Full, timezone-safe snapshot of a row — enough to recreate it verbatim.
+  const SNAP_COLS = `id, work_order_id, line_run_id, line_no,
+           to_char(assigned_date, 'YYYY-MM-DD')      AS assigned_date,
+           assigned_quantity, available_minutes, required_production_rate,
+           to_char(planned_start_date, 'YYYY-MM-DD') AS planned_start_date,
+           to_char(planned_end_date, 'YYYY-MM-DD')   AS planned_end_date,
+           priority, status, color`;
+  try {
+    await setSchema(client);
+    const { ids, lineNo, assignedDate } = req.body;
+    const idList = Array.isArray(ids)
+      ? [...new Set(ids.map((n) => parseInt(n)).filter((n) => Number.isInteger(n)))]
+      : [];
+    if (idList.length === 0 || !lineNo || !assignedDate) {
+      return res.status(400).json({ success: false, error: "ids (no vacío), lineNo y assignedDate son obligatorios" });
+    }
+    if (isWeekend(assignedDate)) {
+      return res.status(400).json({ success: false, error: "No se puede insertar en fin de semana. Elija un dia entre semana." });
+    }
+    const targetLine = String(lineNo);
+
+    await client.query("BEGIN");
+
+    // 1) Snapshot the selected rows (for undo) in a deterministic order — their
+    //    current position — then delete them. Deleting first frees their old
+    //    planned cells AND keeps them out of the tail query below.
+    const sel = await client.query(
+      `SELECT ${SNAP_COLS}
+         FROM line_assignments
+        WHERE id = ANY($1::bigint[])
+        ORDER BY assigned_date ASC, id ASC`,
+      [idList]
+    );
+    if (sel.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "No se encontraron las asignaciones" });
+    }
+    const selectedRows = sel.rows;
+    const N = selectedRows.length;
+
+    // Remember every (line, day) the selection came from so we can drop their
+    // now-empty draft runs afterwards.
+    const sourceCells = [
+      ...new Map(
+        selectedRows.map((r) => [`${r.line_no}|${r.assigned_date}`, { lineNo: String(r.line_no), date: r.assigned_date }])
+      ).values(),
+    ];
+
+    await client.query("DELETE FROM line_assignments WHERE id = ANY($1::bigint[])", [idList]);
+
+    // 2) The N consecutive workday slots the newcomers will occupy, from D.
+    const slots = [];
+    let cursor = thisOrNextWorkday(assignedDate);
+    for (let i = 0; i < N; i++) { slots.push(cursor); cursor = nextWorkday(cursor); }
+    const D = slots[0];
+    const lastSlot = slots[N - 1];
+
+    // 3) Push the planned tail of the target line (>= D) forward by N workdays,
+    //    latest-day first. Snapshot it first for undo. Shifting every tail row by
+    //    the same N workdays preserves inter-block spacing and clears slots
+    //    D..lastSlot for the newcomers.
+    const tailRes = await client.query(
+      `SELECT ${SNAP_COLS}
+         FROM line_assignments
+        WHERE line_no = $1 AND assigned_date >= $2 AND status = 'planned'
+        ORDER BY assigned_date DESC, id DESC`,
+      [targetLine, D]
+    );
+    const tailSnapshot = tailRes.rows;
+    for (const row of tailSnapshot) {
+      let nd = row.assigned_date;
+      for (let k = 0; k < N; k++) nd = nextWorkday(nd);   // + N workdays
+      await client.query(
+        `UPDATE line_assignments
+            SET assigned_date = $1, planned_start_date = $1, planned_end_date = $1, updated_at = now()
+          WHERE id = $2`,
+        [nd, row.id]
+      );
+    }
+
+    // 4) Place the N newcomers on slots[0..N-1] in selection order. Recompute the
+    //    informational rate columns from the target line's run for each slot when
+    //    one exists; otherwise keep the block's own values (columns are NOT NULL).
+    const createdIds = [];
+    for (let i = 0; i < N; i++) {
+      const a = selectedRows[i];
+      const day = slots[i];
+      const woRes = await client.query("SELECT sam_minutes FROM work_orders WHERE id = $1", [a.work_order_id]);
+      const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
+      const { lines } = await getLineCapacityForDate(client, day);
+      const lineData = lines.find((l) => String(l.line_no) === targetLine);
+
+      let availableMinutes = parseFloat(a.available_minutes) || 0;
+      let requiredRate = parseFloat(a.required_production_rate) || 0;
+      let lineRunId = a.line_run_id || null;
+      if (lineData) {
+        const operators = parseInt(lineData.operators_count) || 20;
+        const workingHours = parseFloat(lineData.working_hours) || 8;
+        const efficiency = parseFloat(lineData.efficiency) || 0.85;
+        const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
+        availableMinutes = operators * workingHours * 60 * efficiency;
+        requiredRate = samMinutes > 0 ? availableMinutes / samMinutes : 0;
+        lineRunId = lineData.id || null;
+      }
+      const status = ["planned", "released", "completed", "cancelled"].includes(a.status) ? a.status : "planned";
+      const placed = await client.query(
+        `INSERT INTO line_assignments
+            (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+             available_minutes, required_production_rate, planned_start_date, planned_end_date,
+             priority, status, color)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $4, $4, $8, $9, $10)
+          RETURNING id`,
+        [a.work_order_id, lineRunId, targetLine, day, a.assigned_quantity,
+         availableMinutes, requiredRate, a.priority ?? 0, status, a.color || null]
+      );
+      createdIds.push(placed.rows[0].id);
+    }
+
+    // 5) Drop any now-empty source day's orphan draft run.
+    for (const cell of sourceCells) {
+      await cleanupOrphanDraftRuns(client, cell.lineNo, cell.date);
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      inserted: createdIds.length,
+      shifted: tailSnapshot.length,
+      firstDate: D,
+      lastDate: lastSlot,
+      undo: {
+        op: "insert-shift-batch",
+        lineNo: targetLine,
+        createdIds,             // newcomer rows to delete on undo
+        restore: selectedRows,  // original selected rows (recreate verbatim)
+        tail: tailSnapshot,     // original tail rows, pre-shift (recreate verbatim)
+      },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ Error inserting/shifting batch of line assignments:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/line-assignments/insert-shift-undo
+//
+// Reverse a previous /insert-shift-batch. The client passes back the opaque
+// `undo` token it received. We wipe every row the operation produced — the
+// inserted newcomers plus the shifted tail (which kept their ids) — and then
+// re-create the exact pre-operation snapshot, original ids and all. Deleting the
+// whole affected slice BEFORE re-inserting means the restore can never trip the
+// planned-cell unique index.
+//
+// Guarded: if any inserted newcomer is already gone (deleted / confirmed / moved
+// since), or a fresh order now conflicts with a restored slot, the board has
+// diverged — we refuse (409) rather than clobber newer edits.
+//
+// Body: { undo: <token from insert-shift-batch> }
+// ---------------------------------------------------------------------------
+app.post("/api/line-assignments/insert-shift-undo", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  const reinsert = async (r) => {
+    // line_run_id: keep only if the run still exists (matches ON DELETE SET NULL).
+    await client.query(
+      `INSERT INTO line_assignments
+          (id, work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+           available_minutes, required_production_rate, planned_start_date, planned_end_date,
+           priority, status, color)
+        VALUES ($1, $2,
+                (SELECT lr.id FROM line_runs lr WHERE lr.id = $3),
+                $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ON CONFLICT (id) DO NOTHING`,
+      [r.id, r.work_order_id, r.line_run_id, r.line_no, r.assigned_date, r.assigned_quantity,
+       r.available_minutes, r.required_production_rate, r.planned_start_date, r.planned_end_date,
+       r.priority ?? 0, r.status, r.color || null]
+    );
+  };
+  try {
+    await setSchema(client);
+    const undo = req.body?.undo;
+    if (!undo || undo.op !== "insert-shift-batch" || !Array.isArray(undo.createdIds)) {
+      return res.status(400).json({ success: false, error: "Token para deshacer invalido." });
+    }
+    const createdIds = undo.createdIds.map((n) => parseInt(n)).filter(Number.isInteger);
+    const restore = Array.isArray(undo.restore) ? undo.restore : [];
+    const tail = Array.isArray(undo.tail) ? undo.tail : [];
+    const shiftedIds = tail.map((r) => parseInt(r.id)).filter(Number.isInteger);
+
+    await client.query("BEGIN");
+
+    // Guard: every newcomer must still be present. If not, the board changed
+    // after the insert and undoing could wipe out newer work.
+    if (createdIds.length) {
+      const chk = await client.query(
+        "SELECT COUNT(*)::int AS n FROM line_assignments WHERE id = ANY($1::bigint[])",
+        [createdIds]
+      );
+      if (chk.rows[0].n !== createdIds.length) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ success: false, error: "No se puede deshacer: el tablero cambio desde la insercion." });
+      }
+    }
+
+    // Cells the newcomers sat on — tidy their draft runs after we restore.
+    const createdCells = createdIds.length
+      ? (await client.query(
+          `SELECT DISTINCT line_no, to_char(assigned_date, 'YYYY-MM-DD') AS d
+             FROM line_assignments WHERE id = ANY($1::bigint[])`,
+          [createdIds]
+        )).rows
+      : [];
+
+    // 1) Remove everything the op produced: newcomers + the shifted tail rows.
+    //    Afterwards the affected slice is empty, so the restore below can't
+    //    collide with the very rows it is replacing.
+    if (createdIds.length) await client.query("DELETE FROM line_assignments WHERE id = ANY($1::bigint[])", [createdIds]);
+    if (shiftedIds.length) await client.query("DELETE FROM line_assignments WHERE id = ANY($1::bigint[])", [shiftedIds]);
+
+    // 2) Re-create the pre-op snapshot verbatim (original ids, dates, values).
+    for (const r of restore) await reinsert(r);
+    for (const r of tail) await reinsert(r);
+
+    // 3) Drop any orphan draft runs on the cells the newcomers vacated.
+    for (const c of createdCells) await cleanupOrphanDraftRuns(client, String(c.line_no), c.d);
+
+    await client.query("COMMIT");
+    res.json({ success: true, restored: restore.length, unshifted: tail.length });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    // A unique-cell violation means a newer order now sits where a restored block
+    // needs to go — the board diverged, so report it as a conflict, not a crash.
+    if (err.code === "23505") {
+      return res.status(409).json({ success: false, error: "No se puede deshacer: el tablero cambio desde la insercion." });
+    }
+    console.error("❌ Error undoing insert-shift:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/lineleader/latest-run", authenticateToken, allowRoles("line_leader", "engineer", "supervisor"), async (req, res, next) => {
   const client = await pool.connect();
   try {
