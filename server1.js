@@ -921,6 +921,7 @@ app.post(
     body("line").notEmpty().withMessage("Line is required"),
     body("date").isDate().withMessage("Valid date required"),
     body("style").notEmpty().withMessage("Style is required"),
+    body("color").optional({ nullable: true }).isString().withMessage("Color must be a string if provided"),
     body("operators").isInt({ min: 0 }).withMessage("Operators must be a non‑negative integer"),
     body("workingHours").isFloat({ min: 0.1 }).withMessage("Working hours must be positive"),
     body("sam").isFloat({ min: 0.01 }).withMessage("SAM must be positive"),
@@ -930,7 +931,7 @@ app.post(
     body("slots").isArray({ min: 1 }).withMessage("At least one shift slot required"),
     body("slots.*.label").notEmpty().withMessage("Slot label required"),
     body("slots.*.hours").isFloat({ min: 0 }).withMessage("Planned hours must be non‑negative"),
-     body("workOrderId").optional({ nullable: true }).isInt({ min: 1 }).withMessage("workOrderId must be a positive integer"),
+    body("workOrderId").optional({ nullable: true }).isInt({ min: 1 }).withMessage("workOrderId must be a positive integer"),
   ]),
   async (req, res, next) => {
     const client = await pool.connect();
@@ -938,16 +939,20 @@ app.post(
       await setSchema(client);
       await client.query("BEGIN");
 
-      const { line, date, style, operators, workingHours, sam, efficiency, target, targetPerHour, slots , workOrderId } = req.body;
+      const { line, date, style, color, operators, workingHours, sam, efficiency, target, targetPerHour, slots , workOrderId } = req.body;
 
+      // style stays the plain estilo (tipo+modelo+correlativo, e.g. DAMBOD01);
+      // color is stored separately so two colors of the same style coexist as
+      // distinct runs (unique on line_no, run_date, style, color).
       const lineRunResult = await client.query(
-        `INSERT INTO line_runs (line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour, work_order_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+        `INSERT INTO line_runs (line_no, run_date, style, color, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour, work_order_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
          RETURNING id`,
         [
           line,
           date,
           style,
+          (color || "").trim(),
           parseInt(operators, 10) || 0,
           parseFloat(workingHours),
           parseFloat(sam),
@@ -959,7 +964,7 @@ app.post(
       );
 
       const runId = lineRunResult.rows[0].id;
-      logger.info(`Line run created`, { runId, line, date, style });
+      logger.info(`Line run created`, { runId, line, date, style, color: (color || "").trim() });
 
       const slotIds = {};
       for (let i = 0; i < slots.length; i++) {
@@ -977,6 +982,13 @@ app.post(
       res.json({ success: true, message: "Production data saved", lineRunId: runId, slotIds });
     } catch (err) {
       await client.query("ROLLBACK");
+      // Unique (line_no, run_date, style, color) collision -> friendly message.
+      if (err.code === "23505") {
+        return res.status(409).json({
+          success: false,
+          error: "Ya existe una corrida para esa línea, fecha, estilo y color. Elige otro color o fecha.",
+        });
+      }
       next(err);
     } finally {
       client.release();
@@ -1868,7 +1880,7 @@ app.get("/api/line-runs", authenticateToken, async (req, res, next) => {
   try {
     await setSchema(client);
     const result = await client.query(
-      `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes,
+      `SELECT id, line_no, run_date, style,color, operators_count, working_hours, sam_minutes,
               efficiency, target_pcs, target_per_hour, is_draft, created_at
        FROM line_runs
        ORDER BY run_date DESC, line_no`
@@ -3597,150 +3609,164 @@ app.delete("/api/run/:runId", authenticateToken, async (req, res) => {
 // ----------------------------------------------------------------------
 // 14. DUPLICATE RUN ENDPOINT (from server.js)
 // ----------------------------------------------------------------------
-app.post(
-  "/api/duplicate-run/:runId",
-  authenticateToken,
-  validate([
-    param("runId").isInt({ gt: 0 }).withMessage("Valid run ID required"),
-    body("newDate").isDate().withMessage("Valid newDate (YYYY-MM-DD) required"),
-    body("newLineNo").optional().isString().withMessage("newLineNo must be a string if provided"),
-    body("workOrderId").optional({ nullable: true }).isInt({ min: 1 }).withMessage("workOrderId must be a positive integer"),   // ← ADD THIS
+app.post("/api/duplicate-run/:runId", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
 
-  ]),
-  async (req, res, next) => {
-    const client = await pool.connect();
-    try {
-      await setSchema(client);
-      await client.query("BEGIN");
+    const { runId } = req.params;
+    const { newDate } = req.body;            // required: YYYY-MM-DD
+    const newLineNo = req.body.newLineNo;    // optional – if omitted, same line_no is used
+    const workOrderId = req.body.workOrderId; // optional – work order assigned to the line for that day
+    const newStyle = req.body.newStyle;       // optional – tipo+modelo+correlativo of the chosen order
+    const newColor = req.body.newColor;       // optional – color of the chosen order (stored separately)
 
-      const { runId } = req.params;
-      const { newDate } = req.body;            // required: YYYY-MM-DD
-      const newLineNo = req.body.newLineNo;    // optional – if omitted, same line_no is used
-      const workOrderId = req.body.workOrderId; // ← ADD THIS
-
-      // 1. Get source run
-      const sourceRunRes = await client.query(
-        `SELECT line_no, style, operators_count, working_hours,
-                sam_minutes, efficiency, target_pcs, target_per_hour
-         FROM line_runs WHERE id = $1`,
-        [runId]
-      );
-      if (sourceRunRes.rowCount === 0) {
-        return res.status(404).json({ success: false, error: "Source run not found" });
-      }
-      const src = sourceRunRes.rows[0];
-
-      // 2. Insert new line_run
-      const newRunRes = await client.query(
-  `INSERT INTO line_runs
-     (line_no, run_date, style, operators_count, working_hours,
-      sam_minutes, efficiency, target_pcs, target_per_hour, work_order_id, created_at, updated_at)
-   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
-   RETURNING id`,
-  [
-    newLineNo || src.line_no,
-    newDate,
-    src.style,
-    src.operators_count,
-    src.working_hours,
-    src.sam_minutes,
-    src.efficiency,
-    src.target_pcs,
-    src.target_per_hour,
-    workOrderId || null,   // ← ADD THIS (matches new $10)
-  ]
-);
-      const newRunId = newRunRes.rows[0].id;
-
-      // 3. Copy shift_slots – store mapping old slot_id -> new slot_id
-      const slotMap = new Map(); // old slot_id -> new slot_id
-      const slotsRes = await client.query(
-        `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours
-         FROM shift_slots WHERE run_id = $1 ORDER BY slot_order`,
-        [runId]
-      );
-      for (const slot of slotsRes.rows) {
-        const newSlotRes = await client.query(
-          `INSERT INTO shift_slots
-             (run_id, slot_order, slot_label, slot_start, slot_end, planned_hours)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           RETURNING id`,
-          [newRunId, slot.slot_order, slot.slot_label, slot.slot_start, slot.slot_end, slot.planned_hours]
-        );
-        slotMap.set(slot.id, newSlotRes.rows[0].id);
-      }
-
-      // 4. Copy run_operators – store mapping old operator_id -> new operator_id
-      const operatorMap = new Map();
-      const operatorsRes = await client.query(
-        `SELECT id, operator_no, operator_name FROM run_operators WHERE run_id = $1`,
-        [runId]
-      );
-      for (const op of operatorsRes.rows) {
-        const newOpRes = await client.query(
-          `INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
-           VALUES ($1, $2, $3, NOW())
-           RETURNING id`,
-          [newRunId, op.operator_no, op.operator_name]
-        );
-        operatorMap.set(op.id, newOpRes.rows[0].id);
-      }
-
-      // 5. Copy operator_operations (using operatorMap)
-      for (const [oldOpId, newOpId] of operatorMap.entries()) {
-        const opsRes = await client.query(
-          `SELECT operation_name, t1_sec, t2_sec, t3_sec, t4_sec, t5_sec, capacity_per_hour
-           FROM operator_operations WHERE run_operator_id = $1`,
-          [oldOpId]
-        );
-        for (const opData of opsRes.rows) {
-          await client.query(
-            `INSERT INTO operator_operations
-               (run_id, run_operator_id, operation_name, t1_sec, t2_sec, t3_sec, t4_sec, t5_sec,
-                capacity_per_hour, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
-            [
-              newRunId,
-              newOpId,
-              opData.operation_name,
-              opData.t1_sec,
-              opData.t2_sec,
-              opData.t3_sec,
-              opData.t4_sec,
-              opData.t5_sec,
-              opData.capacity_per_hour,
-            ]
-          );
-        }
-      }
-
-      // 6. Copy slot_targets (using slotMap)
-      const targetsRes = await client.query(
-        `SELECT slot_id, slot_target, cumulative_target
-         FROM slot_targets WHERE run_id = $1`,
-        [runId]
-      );
-      for (const tgt of targetsRes.rows) {
-        const newSlotId = slotMap.get(tgt.slot_id);
-        if (newSlotId) {
-          await client.query(
-            `INSERT INTO slot_targets (run_id, slot_id, slot_target, cumulative_target, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, NOW(), NOW())`,
-            [newRunId, newSlotId, tgt.slot_target, tgt.cumulative_target]
-          );
-        }
-      }
-
-      await client.query("COMMIT");
-      res.json({ success: true, newRunId });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      next(err);
-    } finally {
-      client.release();
+    if (!newDate) {
+      return res.status(400).json({ success: false, error: "newDate is required" });
     }
+
+    // 1. Get source run (includes its style + color)
+    const sourceRunRes = await client.query(
+      `SELECT line_no, style, color, operators_count, working_hours,
+              sam_minutes, efficiency, target_pcs, target_per_hour
+       FROM line_runs WHERE id = $1`,
+      [runId]
+    );
+    if (sourceRunRes.rowCount === 0) {
+      return res.status(404).json({ success: false, error: "Source run not found" });
+    }
+    const src = sourceRunRes.rows[0];
+
+    // 2. Insert new line_run.
+    //    When an order is chosen, the run takes that order's style
+    //    (tipo+modelo+correlativo) and color as its own field. Otherwise it keeps
+    //    the source run's style/color. Uniqueness is (line_no, run_date, style, color).
+    const styleToUse =
+      newStyle && String(newStyle).trim() !== "" ? String(newStyle).trim() : src.style;
+    const colorToUse =
+      newColor !== undefined && newColor !== null && String(newColor).trim() !== ""
+        ? String(newColor).trim()
+        : (src.color || "");
+
+    const newRunRes = await client.query(
+      `INSERT INTO line_runs
+         (line_no, run_date, style, color, operators_count, working_hours,
+          sam_minutes, efficiency, target_pcs, target_per_hour, work_order_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+       RETURNING id`,
+      [
+        newLineNo || src.line_no,
+        newDate,
+        styleToUse,
+        colorToUse,
+        src.operators_count,
+        src.working_hours,
+        src.sam_minutes,
+        src.efficiency,
+        src.target_pcs,
+        src.target_per_hour,
+        workOrderId || null,
+      ]
+    );
+    const newRunId = newRunRes.rows[0].id;
+
+    // 3. Copy shift_slots – store mapping old slot_id -> new slot_id
+    const slotMap = new Map(); // old slot_id -> new slot_id
+    const slotsRes = await client.query(
+      `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours
+       FROM shift_slots WHERE run_id = $1 ORDER BY slot_order`,
+      [runId]
+    );
+    for (const slot of slotsRes.rows) {
+      const newSlotRes = await client.query(
+        `INSERT INTO shift_slots
+           (run_id, slot_order, slot_label, slot_start, slot_end, planned_hours)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id`,
+        [newRunId, slot.slot_order, slot.slot_label, slot.slot_start, slot.slot_end, slot.planned_hours]
+      );
+      slotMap.set(slot.id, newSlotRes.rows[0].id);
+    }
+
+    // 4. Copy run_operators – store mapping old operator_id -> new operator_id
+    const operatorMap = new Map();
+    const operatorsRes = await client.query(
+      `SELECT id, operator_no, operator_name FROM run_operators WHERE run_id = $1`,
+      [runId]
+    );
+    for (const op of operatorsRes.rows) {
+      const newOpRes = await client.query(
+        `INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
+         VALUES ($1, $2, $3, NOW())
+         RETURNING id`,
+        [newRunId, op.operator_no, op.operator_name]
+      );
+      operatorMap.set(op.id, newOpRes.rows[0].id);
+    }
+
+    // 5. Copy operator_operations (using operatorMap)
+    for (const [oldOpId, newOpId] of operatorMap.entries()) {
+      const opsRes = await client.query(
+        `SELECT operation_name, t1_sec, t2_sec, t3_sec, t4_sec, t5_sec, capacity_per_hour
+         FROM operator_operations WHERE run_operator_id = $1`,
+        [oldOpId]
+      );
+      for (const opData of opsRes.rows) {
+        await client.query(
+          `INSERT INTO operator_operations
+             (run_id, run_operator_id, operation_name, t1_sec, t2_sec, t3_sec, t4_sec, t5_sec,
+              capacity_per_hour, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+          [
+            newRunId,
+            newOpId,
+            opData.operation_name,
+            opData.t1_sec,
+            opData.t2_sec,
+            opData.t3_sec,
+            opData.t4_sec,
+            opData.t5_sec,
+            opData.capacity_per_hour,
+          ]
+        );
+      }
+    }
+
+    // 6. Copy slot_targets (using slotMap)
+    const targetsRes = await client.query(
+      `SELECT slot_id, slot_target, cumulative_target
+       FROM slot_targets WHERE run_id = $1`,
+      [runId]
+    );
+    for (const tgt of targetsRes.rows) {
+      const newSlotId = slotMap.get(tgt.slot_id);
+      if (newSlotId) {
+        await client.query(
+          `INSERT INTO slot_targets (run_id, slot_id, slot_target, cumulative_target, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, NOW(), NOW())`,
+          [newRunId, newSlotId, tgt.slot_target, tgt.cumulative_target]
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, newRunId });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    // Unique (line_no, run_date, style, color) collision -> friendly message.
+    if (err.code === "23505") {
+      return res.status(409).json({
+        success: false,
+        error: "Ya existe una corrida para esa línea, fecha, estilo y color. Elige otro color o fecha.",
+      });
+    }
+    console.error("❌ Error duplicating run:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
   }
-);
+});
 // ----------------------------------------------------------------------
 // 14.5 OPERATOR MANAGEMENT ENDPOINTS (add/delete operators)
 // ----------------------------------------------------------------------
@@ -5252,11 +5278,12 @@ app.get("/api/supervisor/summary", authenticateToken, requireSupervisor, async (
 
     // 1) Total target – direct sum
     const targetResult = await client.query(
-      `SELECT COALESCE(SUM(target_pcs), 0) as total_target
-       FROM line_runs
-       WHERE run_date = $1`,
-      [date]
-    );
+  `SELECT COALESCE(SUM(t), 0) AS total_target
+     FROM (SELECT line_no, style, MAX(target_pcs) AS t
+             FROM line_runs WHERE run_date = $1
+            GROUP BY line_no, style) s`,
+  [date]
+);
     const totalTarget = parseFloat(targetResult.rows[0].total_target) || 0;
 
   // 2) Total sewed (finished garments) – sum of packing operation outputs
@@ -5289,13 +5316,18 @@ console.log(`[DEBUG] Summary for ${date}: totalSewed = ${totalSewed}`);
 const efficiencyResult = await client.query(
   `
   WITH run_available_minutes AS (
+    -- Capacity once per (line, style): a color split shares one crew, so
+    -- 12 operators for BLA + 12 for NEG of the same style counts as 12, not 24.
     SELECT
-      id AS run_id,
-      (working_hours * operators_count * 60) AS available_minutes
+      line_no,
+      style,
+      MAX(working_hours * operators_count * 60) AS available_minutes
     FROM line_runs
     WHERE run_date = $1
+    GROUP BY line_no, style
   ),
   run_packing_totals AS (
+    -- Production still sums across every run/color.
     SELECT
       lr.id AS run_id,
       lr.sam_minutes,
@@ -5309,10 +5341,8 @@ const efficiencyResult = await client.query(
     GROUP BY lr.id, lr.sam_minutes
   )
   SELECT
-    COALESCE(SUM(ram.available_minutes), 0) AS total_available_minutes,
-    COALESCE(SUM(rpt.packing_total * rpt.sam_minutes), 0) AS total_sam_output
-  FROM run_available_minutes ram
-  LEFT JOIN run_packing_totals rpt ON ram.run_id = rpt.run_id;
+    COALESCE((SELECT SUM(available_minutes) FROM run_available_minutes), 0) AS total_available_minutes,
+    COALESCE((SELECT SUM(packing_total * sam_minutes) FROM run_packing_totals), 0) AS total_sam_output;
 `,
   [date]
 );
@@ -5945,9 +5975,18 @@ app.get("/api/planning/line-work-orders", authenticateToken, async (req, res) =>
         wo.total_to_produce,
         wo.commitment_date,
         wo.sam_minutes     AS sam,
-        wo.status          AS work_order_status
+        wo.status          AS work_order_status,
+        mc.type            AS tipo,
+        mc.modelo          AS modelo,
+        mc.correlativo     AS correlativo,
+        mc.color           AS mc_color,
+        -- style = tipo‖modelo‖correlativo (e.g. DAM+BOD+01 = DAMBOD01); falls back
+        -- to the client estilo / style_code when there is no master code linked.
+        COALESCE(NULLIF(TRIM(CONCAT(mc.type, mc.modelo, mc.correlativo)), ''), wo.estilo, wo.style_code, '') AS style_from_code,
+        COALESCE(NULLIF(mc.color, ''), wo.color, '') AS order_color
       FROM line_assignments la
       JOIN work_orders wo ON wo.id = la.work_order_id
+      LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
       WHERE la.line_no = $1
         AND la.status <> 'cancelled'
     `;
@@ -7590,7 +7629,7 @@ app.post(
       for (const lineNo of lines) {
         // Get runs for this line
         const runsResult = await client.query(
-          `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes,
+          `SELECT id, line_no, run_date, style, color, operators_count, working_hours, sam_minutes,
                   efficiency, target_pcs, target_per_hour, created_at
            FROM line_runs
            WHERE line_no = $1 AND run_date = $2
