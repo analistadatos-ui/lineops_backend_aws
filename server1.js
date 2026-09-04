@@ -6641,6 +6641,10 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
  * GET /api/skyrina/style-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
  * Returns style performance with SAM-based efficiency (most accurate)
  */
+/**
+ * GET /api/skyrina/style-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Returns style performance with SAM-based efficiency (most accurate)
+ */
 app.get("/api/skyrina/style-performance", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -6662,6 +6666,7 @@ app.get("/api/skyrina/style-performance", authenticateToken, async (req, res) =>
       WITH style_packing_data AS (
         SELECT 
           lr.style,
+          lr.run_date,
           lr.sam_minutes,
           lr.operators_count,
           lr.working_hours,
@@ -6690,28 +6695,60 @@ app.get("/api/skyrina/style-performance", authenticateToken, async (req, res) =>
     }
     
     query += `
-        GROUP BY lr.id, lr.style, lr.sam_minutes, lr.operators_count, lr.working_hours, lr.target_pcs, lr.line_no
+        GROUP BY lr.id, lr.style, lr.run_date, lr.sam_minutes, lr.operators_count, lr.working_hours, lr.target_pcs, lr.line_no
+      ),
+      -- ONE CREW per (day, line, style). A colour split (same style, BLA + NEG)
+      -- is the same operators for the same hours, so its target and its capacity
+      -- are counted ONCE — taking MAX across the colour rows, not SUM. MAX (and
+      -- not MIN/AVG) guards against a stray 0 or half-filled colour row.
+      style_crews AS (
+        SELECT
+          style,
+          run_date,
+          line_no,
+          MAX(target_pcs)                           AS crew_target,
+          MAX(operators_count * working_hours * 60) AS crew_available_minutes
+        FROM style_packing_data
+        GROUP BY style, run_date, line_no
+      ),
+      style_capacity AS (
+        SELECT
+          style,
+          SUM(crew_target)            AS total_target,
+          SUM(crew_available_minutes) AS total_available_minutes
+        FROM style_crews
+        GROUP BY style
+      ),
+      -- Output still SUMS across every run/colour: each colour really does sew
+      -- and pack its own pieces.
+      style_output AS (
+        SELECT
+          style,
+          SUM(total_sewed)               AS total_produced,
+          SUM(total_sewed * sam_minutes) AS total_sam_output
+        FROM style_packing_data
+        GROUP BY style
       )
       SELECT 
-        style,
-        SUM(total_sewed) as total_produced,
-        SUM(target_pcs) as total_target,
-        SUM(total_sewed * sam_minutes) as total_sam_output,
-        SUM(operators_count * working_hours * 60) as total_available_minutes,
-        -- SAM-based efficiency (most accurate)
+        o.style,
+        o.total_produced,
+        c.total_target,
+        o.total_sam_output,
+        c.total_available_minutes,
+        -- SAM-based efficiency (most accurate): per-colour output over one crew's capacity
         CASE 
-          WHEN SUM(operators_count * working_hours * 60) > 0 
-          THEN (SUM(total_sewed * sam_minutes) / SUM(operators_count * working_hours * 60)) * 100
+          WHEN c.total_available_minutes > 0 
+          THEN (o.total_sam_output / c.total_available_minutes) * 100
           ELSE 0
         END as efficiency,
         -- Production compliance (for reference only)
         CASE 
-          WHEN SUM(target_pcs) > 0 
-          THEN (SUM(total_sewed) / SUM(target_pcs)) * 100 
+          WHEN c.total_target > 0 
+          THEN (o.total_produced / c.total_target) * 100 
           ELSE 0 
         END as compliance
-      FROM style_packing_data
-      GROUP BY style
+      FROM style_output o
+      JOIN style_capacity c ON c.style IS NOT DISTINCT FROM o.style
       ORDER BY efficiency DESC
     `;
     
@@ -6766,6 +6803,7 @@ app.get("/api/skyrina/line-performance-detail", authenticateToken, async (req, r
         SELECT 
           lr.style,
           lr.line_no,
+          lr.run_date,
           lr.sam_minutes,
           lr.operators_count,
           lr.working_hours,
@@ -6793,18 +6831,51 @@ app.get("/api/skyrina/line-performance-detail", authenticateToken, async (req, r
     }
     
     query += `
-        GROUP BY lr.id, lr.style, lr.line_no, lr.sam_minutes, lr.operators_count, lr.working_hours, lr.target_pcs
+        GROUP BY lr.id, lr.style, lr.line_no, lr.run_date, lr.sam_minutes, lr.operators_count, lr.working_hours, lr.target_pcs
       ),
-      line_aggregates AS (
+      -- ONE CREW per (day, line, style): a colour split shares the crew, so its
+      -- target/capacity is counted once (MAX across colours), never summed.
+      line_crews AS (
         SELECT
           style,
           line_no,
-          SUM(total_sewed) as total_produced,
-          SUM(target_pcs) as total_target,
-          SUM(total_sewed * sam_minutes) as total_sam_output,
-          SUM(operators_count * working_hours * 60) as total_available_minutes
+          run_date,
+          MAX(target_pcs)                           AS crew_target,
+          MAX(operators_count * working_hours * 60) AS crew_available_minutes
+        FROM line_packing_data
+        GROUP BY style, line_no, run_date
+      ),
+      line_capacity AS (
+        SELECT
+          style,
+          line_no,
+          SUM(crew_target)            AS total_target,
+          SUM(crew_available_minutes) AS total_available_minutes
+        FROM line_crews
+        GROUP BY style, line_no
+      ),
+      -- Produced/SAM output still sums across every colour.
+      line_output AS (
+        SELECT
+          style,
+          line_no,
+          SUM(total_sewed)               AS total_produced,
+          SUM(total_sewed * sam_minutes) AS total_sam_output
         FROM line_packing_data
         GROUP BY style, line_no
+      ),
+      line_aggregates AS (
+        SELECT
+          o.style,
+          o.line_no,
+          o.total_produced,
+          c.total_target,
+          o.total_sam_output,
+          c.total_available_minutes
+        FROM line_output o
+        JOIN line_capacity c
+          ON c.line_no = o.line_no
+         AND c.style IS NOT DISTINCT FROM o.style
       )
       SELECT 
         style,
@@ -6934,6 +7005,11 @@ app.get("/api/skyrina/available-lines", authenticateToken, async (req, res) => {
  * Returns aggregated summary for a date range with CORRECT efficiency calculation
  * Uses weighted average based on total SAM output vs total available minutes
  */
+/**
+ * GET /api/skyrina/period-summary?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Returns aggregated summary for a date range with CORRECT efficiency calculation
+ * Uses weighted average based on total SAM output vs total available minutes
+ */
 app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -6975,6 +7051,8 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
         SELECT
           lr.id            AS run_id,
           lr.line_no       AS line_no,
+          lr.style         AS style,
+          lr.run_date      AS run_date,
           lr.target_pcs    AS target_pcs,
           lr.operators_count,
           lr.working_hours,
@@ -6982,6 +7060,21 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
           (lr.working_hours * lr.operators_count * 60) AS available_minutes
         FROM line_runs lr
         WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
+      ),
+      -- ONE CREW per (day, line, style). Same style / different colour = the same
+      -- operators working the same hours, so Meta and available minutes are
+      -- counted once per crew (MAX across colours) instead of once per colour.
+      -- Without this, a two-colour split doubles both the target and the
+      -- efficiency denominator.
+      crew_capacity AS (
+        SELECT
+          run_date,
+          line_no,
+          style,
+          MAX(target_pcs)        AS crew_target,
+          MAX(available_minutes) AS crew_available_minutes
+        FROM filtered_runs
+        GROUP BY run_date, line_no, style
       ),
       run_packing_totals AS (
         SELECT
@@ -6999,12 +7092,12 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
         (SELECT COUNT(*) FROM filtered_runs)                             AS total_runs,
         (SELECT COUNT(DISTINCT line_no) FROM filtered_runs)             AS lines_used,
         COALESCE((SELECT SUM(packing_total) FROM run_packing_totals),0) AS total_sewed,
-        COALESCE((SELECT SUM(target_pcs) FROM filtered_runs),0)         AS total_target,
+        COALESCE((SELECT SUM(crew_target) FROM crew_capacity),0)        AS total_target,
         CASE
-          WHEN (SELECT SUM(available_minutes) FROM filtered_runs) > 0
+          WHEN (SELECT SUM(crew_available_minutes) FROM crew_capacity) > 0
           THEN (
                  COALESCE((SELECT SUM(packing_total * sam_minutes) FROM run_packing_totals),0)
-                 / (SELECT SUM(available_minutes) FROM filtered_runs)
+                 / (SELECT SUM(crew_available_minutes) FROM crew_capacity)
                ) * 100
           ELSE 0
         END                                                             AS avg_efficiency
@@ -7055,6 +7148,21 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
  * Overview.jsx works without this — it falls back to one period-summary call per
  * day. This route turns 30 round trips into 1.
  */
+/**
+ * Paste into server1.js next to the other /api/skyrina routes.
+ *
+ * GET /api/skyrina/daily-production?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ *
+ * Returns one row per calendar day in the range (days with no runs come back as
+ * zeros, so the chart keeps its gaps instead of silently closing them).
+ *
+ * Produced = packing/empaque sewed quantities, matching /api/skyrina/period-summary.
+ * Meta     = target_pcs summed once per CREW (day, line, style) — a same-style
+ *            colour split shares one crew, so its target counts once, not twice.
+ *
+ * Overview.jsx works without this — it falls back to one period-summary call per
+ * day. This route turns 30 round trips into 1.
+ */
 app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -7093,23 +7201,37 @@ app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => 
         SELECT
           lr.id          AS run_id,
           lr.run_date    AS run_date,
+          lr.line_no     AS line_no,
+          lr.style       AS style,
           lr.target_pcs  AS target_pcs,
           lr.sam_minutes AS sam_minutes,
           (lr.working_hours * lr.operators_count * 60) AS available_minutes
         FROM line_runs lr
         WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
       ),
-      -- Denominator: available minutes are summed over EVERY run on the day,
+      -- ONE CREW per (day, line, style): same style / different colour is the
+      -- same crew, so Meta and capacity count once (MAX across colours).
+      daily_crews AS (
+        SELECT
+          run_date,
+          line_no,
+          style,
+          MAX(target_pcs)        AS crew_target,
+          MAX(available_minutes) AS crew_available_minutes
+        FROM filtered_runs
+        GROUP BY run_date, line_no, style
+      ),
+      -- Denominator: available minutes are summed over EVERY crew on the day,
       -- not only over runs that happen to contain a packing operation. This is
       -- the same rule /api/skyrina/period-summary applies to the whole range.
       daily_target AS (
         SELECT
-          run_date,
-          COUNT(*)                                AS runs,
-          COALESCE(SUM(target_pcs), 0)            AS target,
-          COALESCE(SUM(available_minutes), 0)     AS available_minutes
-        FROM filtered_runs
-        GROUP BY run_date
+          dc.run_date,
+          (SELECT COUNT(*) FROM filtered_runs fr WHERE fr.run_date = dc.run_date) AS runs,
+          COALESCE(SUM(dc.crew_target), 0)            AS target,
+          COALESCE(SUM(dc.crew_available_minutes), 0) AS available_minutes
+        FROM daily_crews dc
+        GROUP BY dc.run_date
       ),
       run_packing_totals AS (
         SELECT
@@ -7458,12 +7580,16 @@ app.get("/api/skyrina/style-efficiency-sam", authenticateToken, async (req, res)
  * GET /api/skyrina/line-performance-detail?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
  * Returns line performance with style, target, produced, and compliance
  */
+/**
+ * GET /api/skyrina/line-performance-detail?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Returns line performance with SAM-based efficiency
+ */
 app.get("/api/skyrina/line-performance-detail", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
     
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, style, lineNo } = req.query;
     if (!startDate || !endDate) {
       return res.status(400).json({ 
         success: false, 
@@ -7471,50 +7597,119 @@ app.get("/api/skyrina/line-performance-detail", authenticateToken, async (req, r
       });
     }
     
-    // Check if user has access
-    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
+    if (!['skyrina', 'engineer', 'supervisor', 'soporte_it', 'master'].includes(req.user.role)) {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
     
-    const query = `
-      WITH line_data AS (
+    let query = `
+      WITH line_packing_data AS (
         SELECT 
           lr.style,
           lr.line_no,
-          lr.target_pcs as target,
-          COALESCE(SUM(se.sewed_qty), 0) as produced,
-          lr.run_date
+          lr.run_date,
+          lr.sam_minutes,
+          lr.operators_count,
+          lr.working_hours,
+          lr.target_pcs,
+          COALESCE(SUM(se.sewed_qty), 0) as total_sewed
         FROM line_runs lr
         JOIN run_operators ro ON lr.id = ro.run_id
         JOIN operator_operations oo ON ro.id = oo.run_operator_id
         LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
         WHERE lr.run_date BETWEEN $1 AND $2
-          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%' OR oo.operation_name IS NULL)
-        GROUP BY lr.id, lr.style, lr.line_no, lr.target_pcs, lr.run_date
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+    `;
+    
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    
+    if (style && style !== 'all') {
+      query += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+    
+    if (lineNo && lineNo !== 'all') {
+      query += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+    
+    query += `
+        GROUP BY lr.id, lr.style, lr.line_no, lr.run_date, lr.sam_minutes, lr.operators_count, lr.working_hours, lr.target_pcs
+      ),
+      -- ONE CREW per (day, line, style): a colour split shares the crew, so its
+      -- target/capacity is counted once (MAX across colours), never summed.
+      line_crews AS (
+        SELECT
+          style,
+          line_no,
+          run_date,
+          MAX(target_pcs)                           AS crew_target,
+          MAX(operators_count * working_hours * 60) AS crew_available_minutes
+        FROM line_packing_data
+        GROUP BY style, line_no, run_date
+      ),
+      line_capacity AS (
+        SELECT
+          style,
+          line_no,
+          SUM(crew_target)            AS total_target,
+          SUM(crew_available_minutes) AS total_available_minutes
+        FROM line_crews
+        GROUP BY style, line_no
+      ),
+      -- Produced/SAM output still sums across every colour.
+      line_output AS (
+        SELECT
+          style,
+          line_no,
+          SUM(total_sewed)               AS total_produced,
+          SUM(total_sewed * sam_minutes) AS total_sam_output
+        FROM line_packing_data
+        GROUP BY style, line_no
+      ),
+      line_aggregates AS (
+        SELECT
+          o.style,
+          o.line_no,
+          o.total_produced,
+          c.total_target,
+          o.total_sam_output,
+          c.total_available_minutes
+        FROM line_output o
+        JOIN line_capacity c
+          ON c.line_no = o.line_no
+         AND c.style IS NOT DISTINCT FROM o.style
       )
       SELECT 
         style,
         line_no,
-        SUM(target) as total_target,
-        SUM(produced) as total_produced,
+        total_target as target,
+        total_produced as produced,
+        -- SAM-based efficiency
         CASE 
-          WHEN SUM(target) > 0 
-          THEN (SUM(produced) / SUM(target)) * 100 
+          WHEN total_available_minutes > 0 
+          THEN (total_sam_output / total_available_minutes) * 100
+          ELSE 0
+        END as efficiency,
+        -- Production compliance (for reference)
+        CASE 
+          WHEN total_target > 0 
+          THEN (total_produced / total_target) * 100 
           ELSE 0 
         END as compliance
-      FROM line_data
-      GROUP BY style, line_no
-      ORDER BY line_no::int, total_produced DESC
+      FROM line_aggregates
+      ORDER BY line_no::int, efficiency DESC
     `;
     
-    const result = await client.query(query, [startDate, endDate]);
+    const result = await client.query(query, params);
     
     const lines = result.rows.map(row => ({
-      style: row.style || 'Sin Estilo',
+      style: row.style || 'No Style',
       lineNo: row.line_no,
-      target: Math.round(parseFloat(row.total_target) * 100) / 100,
-      produced: Math.round(parseFloat(row.total_produced) * 100) / 100,
-      compliance: Math.min(Math.round(parseFloat(row.compliance) * 100) / 100, 100)
+      target: Math.round(parseFloat(row.target) * 100) / 100,
+      produced: Math.round(parseFloat(row.produced) * 100) / 100,
+      efficiency: parseFloat(row.efficiency) || 0,  // SAM-based efficiency
+      compliance: parseFloat(row.compliance) || 0   // Production compliance
     }));
     
     res.json({
