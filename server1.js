@@ -6354,13 +6354,32 @@ async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderI
     );
   }
  
-  // Inherit the operator roster from the template (operations aren't copied).
+    // Inherit the operator roster from the template, then the operations each
+  // operator runs (time studies + capacity), so line engineers see the full plan
+  // in the draft instead of an empty operations panel. Operations are matched to
+  // the freshly-copied roster by operator_no.
   if (templateRunId) {
     await client.query(
       `INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
        SELECT $1, operator_no, operator_name, NOW()
          FROM run_operators WHERE run_id = $2
        ON CONFLICT (run_id, operator_no) DO NOTHING`,
+      [runId, templateRunId]
+    );
+
+    await client.query(
+      `INSERT INTO operator_operations
+         (run_id, run_operator_id, operation_name,
+          t1_sec, t2_sec, t3_sec, t4_sec, t5_sec, capacity_per_hour, created_at)
+       SELECT $1, dst_ro.id, oo.operation_name,
+              oo.t1_sec, oo.t2_sec, oo.t3_sec, oo.t4_sec, oo.t5_sec,
+              oo.capacity_per_hour, NOW()
+         FROM operator_operations oo
+         JOIN run_operators src_ro
+           ON src_ro.id = oo.run_operator_id AND src_ro.run_id = $2
+         JOIN run_operators dst_ro
+           ON dst_ro.run_id = $1 AND dst_ro.operator_no = src_ro.operator_no
+       ON CONFLICT (run_operator_id, operation_name) DO NOTHING`,
       [runId, templateRunId]
     );
   }
