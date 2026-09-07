@@ -6157,6 +6157,75 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
   }
 });
 
+
+// Server-side port of the frontend utils/timeSlots.js `buildShiftSlots`. A draft
+// run needs the same hourly distribution the engineering save produces, so the
+// line engineers see it the moment the planner sends the order — instead of a
+// single lumped "Turno" slot. Keep the defaults in sync with the frontend util.
+function buildDraftShiftSlots({
+  workingHours,
+  startHour = 9,
+  endHour = 17,
+  lunchHour = 13,
+  firstSlotHours = 0.75,
+  lunchSlotHours = 0.5,
+  lastSlotHours = 0.6,
+  lastSlotLabelMinutes = 36,
+}) {
+  const wh = Number(workingHours);
+  if (!Number.isFinite(wh) || wh <= 0) return [];
+
+  const pad = (n) => String(n).padStart(2, "0");
+  const lastLabel = `${endHour}:${pad(lastSlotLabelMinutes)}`;
+
+  const labels = [];
+  for (let h = startHour; h <= endHour; h++) labels.push(`${h}`);
+  labels.push(lastLabel);
+
+  const base = labels.map((lab) => {
+    const hourOnly = Number(lab.split(":")[0]);
+    if (lab === lastLabel) return lastSlotHours;
+    if (hourOnly === startHour) return firstSlotHours;
+    if (hourOnly === lunchHour) return lunchSlotHours;
+    return 1;
+  });
+
+  const baseSum = base.reduce((a, b) => a + b, 0) || 1;
+  const scale = wh / baseSum;
+
+  const slots = [];
+  let currentTime = new Date();
+  currentTime.setHours(startHour, 0, 0, 0);
+
+  for (let i = 0; i < labels.length; i++) {
+    const hours = Number((base[i] * scale).toFixed(2));
+    const endTime = new Date(currentTime.getTime() + hours * 60 * 60 * 1000);
+    const startStr = `${pad(currentTime.getHours())}:${pad(currentTime.getMinutes())}:${pad(currentTime.getSeconds())}`;
+    const endStr = `${pad(endTime.getHours())}:${pad(endTime.getMinutes())}:${pad(endTime.getSeconds())}`;
+    slots.push({ label: labels[i], hours, startTime: startStr, endTime: endStr });
+    currentTime = endTime;
+  }
+
+  // Correct tiny rounding drift so the slot hours sum to the working hours exactly.
+  const sum = slots.reduce((a, s) => a + s.hours, 0);
+  const diff = Number((wh - sum).toFixed(2));
+  if (Math.abs(diff) >= 0.01 && slots.length > 0) {
+    const last = slots[slots.length - 1];
+    last.hours = Number((last.hours + diff).toFixed(2));
+    const prevEnd = new Date();
+    if (slots.length > 1) {
+      const [ph, pm, ps] = slots[slots.length - 2].endTime.split(":").map(Number);
+      prevEnd.setHours(ph, pm, ps || 0);
+    } else {
+      prevEnd.setHours(startHour, 0, 0, 0);
+    }
+    const newEnd = new Date(prevEnd.getTime() + last.hours * 60 * 60 * 1000);
+    last.endTime = `${pad(newEnd.getHours())}:${pad(newEnd.getMinutes())}:${pad(newEnd.getSeconds())}`;
+  }
+
+  return slots;
+}
+
 async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderId, style }) {
   const line = String(lineNo);
   if (!runDate) return { runId: null, created: false };
@@ -6264,11 +6333,26 @@ async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderI
   const runId = ins.rows[0].id;
   console.log(`   ↳ created run ${runId}`);
  
-  await client.query(
-    `INSERT INTO shift_slots (run_id, slot_order, slot_label, slot_start, slot_end, planned_hours)
-     VALUES ($1, 1, $2, NULL, NULL, $3)`,
-    [runId, "Turno", hours]
-  );
+    // Give the draft the full hourly time-slot distribution (the same breakdown the
+  // engineering save produces), so line engineers see it as soon as the planner
+  // sends the order. Fall back to a single "Turno" slot only if hours are unbuildable.
+  const draftSlots = buildDraftShiftSlots({ workingHours: hours });
+  if (draftSlots.length > 0) {
+    for (let i = 0; i < draftSlots.length; i++) {
+      const s = draftSlots[i];
+      await client.query(
+        `INSERT INTO shift_slots (run_id, slot_order, slot_label, slot_start, slot_end, planned_hours)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [runId, i + 1, s.label, s.startTime || null, s.endTime || null, s.hours]
+      );
+    }
+  } else {
+    await client.query(
+      `INSERT INTO shift_slots (run_id, slot_order, slot_label, slot_start, slot_end, planned_hours)
+       VALUES ($1, 1, $2, NULL, NULL, $3)`,
+      [runId, "Turno", hours]
+    );
+  }
  
   // Inherit the operator roster from the template (operations aren't copied).
   if (templateRunId) {
