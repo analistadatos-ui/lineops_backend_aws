@@ -1893,6 +1893,38 @@ app.get("/api/line-runs", authenticateToken, async (req, res, next) => {
   }
 });
 
+// Resolve the real style SAM (minutes/piece) for a line_run about to be CREATED,
+// taken from the OWNING order rather than a template/most-recent run.
+async function resolveOrderSam(client, { workOrderId = null, lineNo = null, runDate = null, style = null }) {
+  try {
+    if (workOrderId != null) {
+      const r = await client.query("SELECT sam_minutes FROM work_orders WHERE id = $1", [workOrderId]);
+      const s = parseFloat(r.rows[0]?.sam_minutes) || 0;
+      if (s > 0) return s;
+    }
+    if (lineNo != null && runDate != null && style != null && String(style).trim() !== "") {
+      const r = await client.query(
+        `SELECT wo.sam_minutes
+           FROM line_assignments la
+           JOIN work_orders wo ON wo.id = la.work_order_id
+          WHERE la.line_no = $1
+            AND la.assigned_date = $2::date
+            AND la.status NOT IN ('cancelled', 'rejected')
+            AND UPPER(TRIM(COALESCE(wo.style_code, wo.estilo, ''))) = UPPER(TRIM($3))
+          ORDER BY la.created_at DESC
+          LIMIT 1`,
+        [String(lineNo), runDate, String(style)]
+      );
+      const s = parseFloat(r.rows[0]?.sam_minutes) || 0;
+      if (s > 0) return s;
+    }
+  } catch (e) {
+    console.warn("⚠️  resolveOrderSam failed:", e.message);
+  }
+  return 0;
+}
+
+
 // PATCH /api/line-runs/operators  —  add to server.js (near the other
 // /api/line-runs routes). Changing the number of sewers (operators) on a line
 // recomputes its daily capacity:
@@ -1956,7 +1988,8 @@ app.patch("/api/line-runs/operators", authenticateToken, async (req, res) => {
     for (const r of runs.rows) {
       const wh = parseFloat(r.working_hours) || 0;
       const eff = parseFloat(r.efficiency) || 0;
-      const sam = parseFloat(r.sam_minutes) || 0;
+      const orderSam = await resolveOrderSam(client, { lineNo: String(lineNo), runDate: anchor, style: styleStr });
+      const sam = orderSam || parseFloat(tmpl.rows[0].sam_minutes) || 0;
       const { targetPcs, targetPerHour } = calc(wh, eff, sam);
       await client.query(
         `UPDATE line_runs
@@ -6194,7 +6227,8 @@ async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderI
   let eff = parseFloat(src?.efficiency) || 0.85;
   if (eff > 1) eff = eff / 100;   // tolerate 85 meaning 0.85
   if (eff > 1) eff = 1;           // chk_efficiency_range: 0 < eff <= 1
-  const sam = parseFloat(src?.sam_minutes) || 3.5;
+  const orderSam = await resolveOrderSam(client, { workOrderId, lineNo: line, runDate, style: runStyle });
+  const sam = orderSam || parseFloat(src?.sam_minutes) || 3.5;
   const targetPcs = Math.round((operators * hours * 60 * eff) / sam);
   const targetPerHour = hours > 0 ? Math.round(targetPcs / hours) : 0;
  
