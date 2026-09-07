@@ -7960,12 +7960,22 @@ app.post(
       
       for (const lineNo of lines) {
         // Get runs for this line
+                // Get runs for this line, joined to their work order via the canonical
+        // link (line_runs.work_order_id -> work_orders.id). LEFT JOIN so runs
+        // with no linked order still return (work_order_no just null).
         const runsResult = await client.query(
-          `SELECT id, line_no, run_date, style, color, operators_count, working_hours, sam_minutes,
-                  efficiency, target_pcs, target_per_hour, created_at
-           FROM line_runs
-           WHERE line_no = $1 AND run_date = $2
-           ORDER BY run_date DESC`,
+          `SELECT lr.id, lr.line_no, lr.run_date, lr.style, lr.color,
+                  lr.operators_count, lr.working_hours, lr.sam_minutes,
+                  lr.efficiency, lr.target_pcs, lr.target_per_hour, lr.created_at,
+                  lr.work_order_id,
+                  wo.work_order_no,
+                  wo.style_description AS work_order_style,
+                  wo.customer_name     AS work_order_customer,
+                  wo.color             AS work_order_color
+           FROM line_runs lr
+           LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
+           WHERE lr.line_no = $1 AND lr.run_date = $2
+           ORDER BY lr.run_date DESC`,
           [lineNo, date]
         );
         
