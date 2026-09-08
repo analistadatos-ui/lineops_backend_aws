@@ -617,6 +617,7 @@ console.log("✅ line_assignments consolidated to one planned row per cell (wo+l
 await client.query(`ALTER TABLE line_runs ADD COLUMN IF NOT EXISTS work_order_id BIGINT REFERENCES work_orders(id) ON DELETE SET NULL;`);
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_runs_work_order ON line_runs(work_order_id);");
 // ────
+await registerEfficiencyPermissions.initSchema({ pool, setSchema });
 await registerSupermarketPlan.initSchema({ pool, setSchema });   // ← nueva
 await registerHolidays.initSchema({ pool, setSchema });
 await registerFinishedWarehouseAnalytics.initSchema({ pool, setSchema });
@@ -905,6 +906,9 @@ registerSupermarketPlan(app, {
   setSchema,
   publisherRoles: ["planner", "supervisor", "master", "soporte_it", "skyrina", "admin","supermarcado"],
 });
+
+const registerEfficiencyPermissions = require("./efficiency-permissions");
+registerEfficiencyPermissions(app, { authenticateToken, pool, setSchema });
 
 app.post("/api/logout", (req, res) => {
   res.json({ success: true, message: "Logged out successfully" });
@@ -5744,12 +5748,40 @@ async function getLineCapacityForDate(client, date) {
       target_per_hour: r.target_per_hour,
     }));
 
-  const allLines = extra.length ? [...lines, ...extra] : lines;
+    const allLines = extra.length ? [...lines, ...extra] : lines;
+
+  // Apply CEO-approved per-style efficiency overrides for the Plan Board ONLY.
+  // These recompute the line's capacity (efficiency + target_pcs) in memory for
+  // this date's calculation. The stored line_runs / slot_targets (production
+  // targets) are never modified — this is the "plan-board-only" behavior.
+  try {
+    const ov = await client.query(
+      "SELECT UPPER(TRIM(style)) AS k, efficiency FROM style_efficiency_overrides"
+    );
+    if (ov.rows.length) {
+      const overrideByStyle = new Map(ov.rows.map((r) => [r.k, parseFloat(r.efficiency)]));
+      for (const l of allLines) {
+        const key = String(l.style || "").trim().toUpperCase();
+        const eff = key ? overrideByStyle.get(key) : null;
+        if (eff != null && eff > 0) {
+          const ops = parseInt(l.operators_count, 10) || 0;
+          const wh = parseFloat(l.working_hours) || 0;
+          const sam = parseFloat(l.sam_minutes) || 0;
+          const piecesAt100 = sam > 0 ? (ops * wh * 60) / sam : 0;
+          l.efficiency = eff;
+          l.target_pcs = piecesAt100 * eff;
+          l.target_per_hour = wh > 0 ? l.target_pcs / wh : 0;
+        }
+      }
+    }
+  } catch { /* overrides are best-effort; never block capacity */ }
+
   return {
     lines: allLines,
     capacitySource: lines.length ? "per-line" : (allLines.length ? "planner" : "none"),
     capacityDate: date,
   };
+
 }
 
 // GET /api/planning/lines — planner-defined lines (engineering hasn't
