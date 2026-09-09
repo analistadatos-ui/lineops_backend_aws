@@ -120,6 +120,25 @@ function markerDone(marker, spByTalla, stage) {
   });
 }
 
+// Eficiencia de marcada (%) que el planner captura en CutPlanning. Cada marcada
+// puede traer `efficiency` (número) o no traerla (marcadas viejas). Resumimos la
+// eficiencia de una orden con el promedio simple de sus marcadas con dato, más
+// el rango (min–max) para un tooltip. `sum`/`count` se usan para el promedio
+// global exacto sin arrastrar el redondeo del promedio por orden.
+function markerEfficiencyStats(markers) {
+  const vals = [];
+  for (const m of markers) {
+    const e = m == null ? null : m.efficiency;
+    if (e === null || e === undefined || e === '') continue;
+    const n = num(e);
+    if (n > 0) vals.push(n);
+  }
+  if (!vals.length) return { avg: null, min: null, max: null, count: 0, sum: 0 };
+  const sum = vals.reduce((s, v) => s + v, 0);
+  const r1 = (x) => Math.round(x * 10) / 10;
+  return { avg: r1(sum / vals.length), min: r1(Math.min(...vals)), max: r1(Math.max(...vals)), count: vals.length, sum };
+}
+
 // Where in the flow this corte actually sits. Cutting being finished is NOT the
 // same as the corte being done — that needs the verification sign-off.
 //
@@ -258,6 +277,8 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         verification_quantity: 0,
         total_marcadas: 0,
         completed_marcadas: 0,
+        // Promedio de eficiencia de marcada (%) sobre las marcadas con dato.
+        avg_efficiency: null,
         tallas: 0,
         fabrics_count: 0,
         verification_enabled: verified,
@@ -271,6 +292,9 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       const tallaSet = new Set();
       const fabricSet = new Set();
       const detail = [];
+      // Acumuladores para el promedio global de eficiencia de marcada.
+      let effSum = 0;
+      let effCount = 0;
 
       for (const { row, sp, markers, planned, cut, remaining, status, stage } of rows) {
         summary.total_quantity += planned;
@@ -343,6 +367,11 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         summary.total_marcadas += markers.length;
         summary.completed_marcadas += marcadasDone;
 
+        // Eficiencia de marcada de esta orden (promedio + rango).
+        const eff = markerEfficiencyStats(markers);
+        effSum += eff.sum;
+        effCount += eff.count;
+
         // Per-fabric (representative tela name + código). Group by name+código so
         // two códigos of the same tela stay as separate rows.
         const fabricName = (row.fabric || 'Sin tela').toString();
@@ -380,6 +409,10 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
             panels: row.panels != null ? num(row.panels) : null,
             marcadas: markers.length,
             marcadas_done: marcadasDone,
+            efficiency_avg: eff.avg,
+            efficiency_min: eff.min,
+            efficiency_max: eff.max,
+            efficiency_count: eff.count,
             tallas: orderTallas,
             progress: planned > 0 ? Math.min(Math.round((cut / planned) * 100), 100) : (cut > 0 ? 100 : 0),
           });
@@ -388,6 +421,8 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
 
       summary.tallas = tallaSet.size;
       summary.fabrics_count = fabricSet.size;
+      // Promedio global de eficiencia de marcada (null si ninguna marcada trae dato).
+      summary.avg_efficiency = effCount > 0 ? Math.round((effSum / effCount) * 10) / 10 : null;
       // Piezas cortadas contra lo planeado (avance del corte).
       summary.progress = summary.total_quantity > 0
         ? Math.min(Math.round((summary.total_cut / summary.total_quantity) * 100), 100)
