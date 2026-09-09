@@ -628,6 +628,7 @@ await registerMerchantPlan.initSchema({ pool, setSchema });
 await registerPreOrderHolds.initSchema({ pool, setSchema });   // ← add
 await registerCutOrders.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
+await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
 await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
 
     // Create index for faster queries
@@ -885,6 +886,9 @@ registerFinishedWarehouse(app, { authenticateToken, pool, setSchema });
 
 const registerCutOrders = require("./cut-orders");
 registerCutOrders(app, { authenticateToken, pool, setSchema });
+
+const registerOrderSets = require("./order-sets");
+registerOrderSets(app, { authenticateToken, pool, setSchema });
 
 const registerWorkOrders = require("./work-orders");
 registerWorkOrders(app, {

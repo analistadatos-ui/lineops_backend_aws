@@ -51,6 +51,11 @@
 // GET /api/work-orders ya regresa created_by y created_by_name.
 // ==========================================================================
 
+// CONJUNTOS (chamarra + pantalon vendidos como uno solo). Solo se usa el helper
+// que inserta la cabecera; el esquema lo crea order-sets.initSchema, que DEBE
+// correr antes que este (ver el orden en server1.js).
+const { createSetInTx } = require("./order-sets");
+
 // --- Startup migration: both breakdown tables ----------------------------
 async function initSchema({ pool, setSchema }) {
   const client = await pool.connect();
@@ -443,6 +448,10 @@ function registerWorkOrders(app, deps) {
           wo.fabric_name, wo.fabric_code, wo.yield_per_piece,
           wo.created_at, wo.updated_at,wo.season,wo.status,
           wo.created_by,
+          -- CONJUNTO: NULL en una PO suelta. La tabla lo usa solo para pintar
+          -- la insignia; produccion sigue viendo una PO normal.
+          wo.set_id, wo.set_component, wo.set_ratio,
+          (SELECT os.set_no FROM order_sets os WHERE os.id = wo.set_id) AS set_no,
           (SELECT COALESCE(NULLIF(TRIM(u.full_name), ''), u.username)
              FROM users u WHERE u.id = wo.created_by) AS created_by_name,
           ${COLORS_SUBQUERY},
@@ -525,6 +534,7 @@ function registerWorkOrders(app, deps) {
           wo.*,
           ${COLORS_SUBQUERY},
           ${PRODUCED_SUBQUERY},
+          (SELECT os.set_no FROM order_sets os WHERE os.id = wo.set_id) AS set_no,
           mc.code as master_code,
           mc.photo_filename as master_code_photo_filename,
           json_agg(
@@ -1028,21 +1038,51 @@ function registerWorkOrders(app, deps) {
         // PO-header fabric/yield (legacy single-PO payload; per-order values
         // inside `orders` win when present).
         fabricName: bodyFabricName, fabricCode: bodyFabricCode, yield: bodyYield,
+        // ---- CONJUNTOS (chamarra + pantalon vendidos como una unidad) ------
+        // components[] = una PRENDA por elemento, cada una con su propio estilo
+        // (tipo/modelo/correlativo), su SAM, su descripcion, su foto y su ratio
+        // (piezas por conjunto). Sin components[] el cuerpo es el de siempre y
+        // todo se comporta exactamente igual que antes: UNA prenda.
+        components,
+        // { label, notes, setNo } — solo se usa cuando hay 2+ componentes.
+        set: setMeta,
       } = req.body;
 
-      const T = up(tipo, 3), M = up(modelo, 3), C = up(correlativo, 2);
       const CLI = up(clienteCode, 3), EST = up(estilo, 6); // fallback default only
-      const styleCode = `${T}${M}${C}`;
-      const multi = Array.isArray(orders) && orders.length > 0;
 
       const txt = (v) => (v == null ? null : String(v).trim() || null);
       const num = (v) =>
         v === "" || v == null || isNaN(parseFloat(v)) ? null : parseFloat(v);
+      const ratioOf = (v) => {
+        const n = parseFloat(v);
+        return !isFinite(n) || n <= 0 ? 1 : n;
+      };
+
+      // Una prenda suelta es "un conjunto de un solo componente": asi el resto
+      // del handler tiene UN solo camino en vez de dos.
+      const rawComponents = Array.isArray(components) && components.length > 0
+        ? components
+        : [{ tipo, modelo, correlativo, estilo, description, sam, photoKey: incomingPhotoKey,
+             orders, lines, warehouseStock, extraQuantity }];
+      const isSet = rawComponents.length > 1;
+
+      // El estilo del primer componente sigue siendo el "estilo de la orden"
+      // para todo lo que espera un solo styleCode (numero de PO, respuestas).
+      const T = up(rawComponents[0].tipo ?? tipo, 3);
+      const M = up(rawComponents[0].modelo ?? modelo, 3);
+      const C = up(rawComponents[0].correlativo ?? correlativo, 2);
+      const styleCode = `${T}${M}${C}`;
+      const multi = Array.isArray(orders) && orders.length > 0;
 
       // Each line carries its own customer PO, delivery date, fabric, fabric
       // code and yield (entered per color+estilo row in step 2). The order-level
       // values are used as a fallback for lines that leave them blank.
-      const parseCells = (arr, fb = {}) =>
+      // defEst  = estilo cliente por defecto de ESTE componente
+      // scale   = piezas por conjunto (ratio). Solo se aplica cuando el
+      //           componente HEREDA la rejilla compartida del conjunto: si el
+      //           cliente mando las cantidades propias del componente, ya vienen
+      //           multiplicadas y scale = 1.
+      const parseCells = (arr, fb = {}, defEst = EST, scale = 1) =>
         (Array.isArray(arr) ? arr : [])
           .map((l) => {
             // Each line may carry several telas, each with its own code and yield.
@@ -1051,7 +1091,7 @@ function registerWorkOrders(app, deps) {
             return {
               talla: up(l.talla, 3),
               color: up(l.color, 3),
-              estilo: up(l.estilo, 6) || EST,
+              estilo: up(l.estilo, 6) || defEst,
               customerPo: txt(l.customerPo),
               commitmentDate: (l.commitmentDate || fb.commitmentDate || "").toString().slice(0, 10) || null,
               fabrics,
@@ -1062,44 +1102,91 @@ function registerWorkOrders(app, deps) {
               // Cantidad por talla en dos partes (piezas): packing + SKU.
               // El servidor recalcula quantity = packing + sku (autoritativo);
               // si no vienen, cae al quantity enviado por compatibilidad.
-              packingQty: Math.max(parseFloat(l.packingQty) || 0, 0),
-              skuQty: Math.max(parseFloat(l.skuQty) || 0, 0),
+              packingQty: Math.max(parseFloat(l.packingQty) || 0, 0) * scale,
+              skuQty: Math.max(parseFloat(l.skuQty) || 0, 0) * scale,
               quantity: (() => {
                 const p = Math.max(parseFloat(l.packingQty) || 0, 0);
                 const s = Math.max(parseFloat(l.skuQty) || 0, 0);
                 const sum = p + s;
-                return sum > 0 ? sum : parseFloat(l.quantity);
+                return (sum > 0 ? sum : parseFloat(l.quantity)) * scale;
               })(),
             };
           })
           .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0);
 
-      // Normalise into a list of PO specs.
-      const rawOrders = multi
-        ? orders
-        : [{ lines, commitmentDate, fabricName: bodyFabricName, fabricCode: bodyFabricCode, yield: bodyYield }];
-      const orderSpecs = rawOrders
-        .map((o) => {
-          const fb = {
-            commitmentDate: (o.commitmentDate || commitmentDate || "").toString().slice(0, 10) || null,
-            fabricName: txt(o.fabricName ?? bodyFabricName),
-            fabricCode: txt(o.fabricCode ?? bodyFabricCode),
-            yieldPerPiece: num(o.yield ?? bodyYield),
-          };
-          return { cells: parseCells(o.lines, fb), ...fb };
-        })
-        .filter((o) => o.cells.length > 0);
+      // ------------------------------------------------------------------
+      // UN COMPONENTE = UNA PRENDA (chamarra, pantalon...). Cada uno trae su
+      // propio estilo, SAM, descripcion, foto y ratio. Sin conjunto hay uno
+      // solo y todo esto se reduce al comportamiento de siempre.
+      //
+      // Las CANTIDADES pueden venir de dos formas:
+      //   • component.orders  -> el cliente ya calculo la rejilla del componente
+      //     (telas propias, cantidades ya multiplicadas). scale = 1.
+      //   • heredadas         -> se reusa la rejilla compartida del conjunto y
+      //     se multiplica por el ratio del componente.
+      // ------------------------------------------------------------------
+      const compSpecs = rawComponents.map((c, ci) => {
+        const cT = up(c.tipo ?? tipo, 3), cM = up(c.modelo ?? modelo, 3), cC = up(c.correlativo ?? correlativo, 2);
+        const own = Array.isArray(c.orders) && c.orders.length > 0;
+        const ratio = ratioOf(c.ratio);
+        const rawOrders = own
+          ? c.orders
+          : (multi ? orders : [{ lines: c.lines ?? lines, commitmentDate,
+                                 fabricName: bodyFabricName, fabricCode: bodyFabricCode, yield: bodyYield }]);
+        const defEst = up(c.estilo ?? estilo, 6);
+        const orderSpecs = (Array.isArray(rawOrders) ? rawOrders : [])
+          .map((o) => {
+            const fb = {
+              commitmentDate: (o.commitmentDate || commitmentDate || "").toString().slice(0, 10) || null,
+              fabricName: txt(o.fabricName ?? bodyFabricName),
+              fabricCode: txt(o.fabricCode ?? bodyFabricCode),
+              yieldPerPiece: num(o.yield ?? bodyYield),
+            };
+            // Solo se escala lo HEREDADO: lo propio ya viene en piezas reales.
+            return { cells: parseCells(o.lines, fb, defEst, own ? 1 : ratio), ...fb };
+          })
+          .filter((o) => o.cells.length > 0);
+        return {
+          index: ci,
+          T: cT, M: cM, C: cC,
+          styleCode: `${cT}${cM}${cC}`,
+          // Etiqueta del componente dentro del conjunto: CHAMARRA, PANTALON...
+          // Sin conjunto queda en NULL y la PO es una PO suelta de siempre.
+          component: isSet
+            ? (String(c.label || c.component || `PARTE${ci + 1}`).trim().toUpperCase().slice(0, 20) || `PARTE${ci + 1}`)
+            : null,
+          ratio,
+          description: txt(c.description ?? description),
+          sam: c.sam ?? sam,
+          photoKey: c.photoKey ?? (ci === 0 ? incomingPhotoKey : null),
+          // Stock y extras son POR PRENDA: el stock de chamarras no descuenta
+          // pantalones. Sin components[] se conserva el comportamiento previo.
+          warehouseStock: parseFloat(c.warehouseStock ?? (ci === 0 ? warehouseStock : 0)) || 0,
+          extraQuantity: parseFloat(c.extraQuantity ?? (ci === 0 ? extraQuantity : 0)) || 0,
+          orderSpecs,
+        };
+      });
 
-      if (!T || !M || !C || !CLI || !description || !sam) {
-        return res.status(400).json({ success: false, error: "Missing style fields: tipo, modelo, correlativo, clienteCode, description, sam" });
-      }
+      if (!CLI) return res.status(400).json({ success: false, error: "clienteCode is required" });
       if (!customerId) return res.status(400).json({ success: false, error: "customerId is required" });
-      if (orderSpecs.length === 0) return res.status(400).json({ success: false, error: "Enter at least one size/color quantity" });
-
-      // Every cell needs a 6-char estilo (per-color estilo cliente).
-      for (const o of orderSpecs) {
-        const bad = o.cells.find((c) => !c.estilo || c.estilo.length !== 6);
-        if (bad) return res.status(400).json({ success: false, error: `Falta el estilo cliente (6 caracteres) para el color ${bad.color || "?"}` });
+      for (const cs of compSpecs) {
+        const who = isSet ? ` (${cs.component})` : "";
+        if (!cs.T || !cs.M || !cs.C || !cs.description || !cs.sam) {
+          return res.status(400).json({ success: false, error: `Missing style fields: tipo, modelo, correlativo, description, sam${who}` });
+        }
+        if (cs.orderSpecs.length === 0) {
+          return res.status(400).json({ success: false, error: `Enter at least one size/color quantity${who}` });
+        }
+        // Every cell needs a 6-char estilo (per-color estilo cliente).
+        for (const o of cs.orderSpecs) {
+          const bad = o.cells.find((x) => !x.estilo || x.estilo.length !== 6);
+          if (bad) return res.status(400).json({ success: false, error: `Falta el estilo cliente (6 caracteres) para el color ${bad.color || "?"}${who}` });
+        }
+      }
+      // Un conjunto necesita etiquetas DISTINTAS: son las que FWH usa para
+      // saber que pieza le falta para armar la caja.
+      if (isSet && new Set(compSpecs.map((c) => c.component)).size !== compSpecs.length) {
+        return res.status(400).json({ success: false, error: "Cada prenda del conjunto necesita un nombre distinto (ej. CHAMARRA / PANTALON)" });
       }
 
       // ------------------------------------------------------------------
@@ -1114,8 +1201,13 @@ function registerWorkOrders(app, deps) {
       // bucket has its quantity summed and its telas unioned, because the
       // (work_order_id, talla, color, estilo) unique index allows only one line
       // per size in a PO.
+      //
+      // El styleCode entra en la llave: en un conjunto la chamarra y el
+      // pantalon comparten color, estilo cliente, PO y fecha, asi que sin el
+      // se fusionarian en UNA sola PO y despues chocarian contra el indice
+      // unico (work_order_id, talla, color, estilo).
       const bucketKey = (c) =>
-        [c.color, c.estilo, c.customerPo || "", c.commitmentDate || ""].join("\u0001");
+        [c.styleCode || "", c.color, c.estilo, c.customerPo || "", c.commitmentDate || ""].join("\u0001");
       const unionFabrics = (a = [], b = []) => {
         const out = [];
         const seen = new Set();
@@ -1131,14 +1223,19 @@ function registerWorkOrders(app, deps) {
         return out;
       };
       const poSpecs = [];
-      for (const spec of orderSpecs) {
+      for (const cs of compSpecs) {
+      for (const spec of cs.orderSpecs) {
         const byKey = new Map();
-        for (const cell of spec.cells) {
+        for (const cell0 of spec.cells) {
+          // La celda arrastra a que prenda pertenece para que el bucket no
+          // mezcle componentes y la PO nazca ya etiquetada.
+          const cell = { ...cell0, styleCode: cs.styleCode };
           const key = bucketKey(cell);
           let bucket = byKey.get(key);
           if (!bucket) {
             bucket = {
               cells: [],
+              styleCode: cs.styleCode,
               commitmentDate: cell.commitmentDate ?? spec.commitmentDate ?? null,
               fabricName: spec.fabricName ?? null,
               fabricCode: spec.fabricCode ?? null,
@@ -1161,14 +1258,16 @@ function registerWorkOrders(app, deps) {
             bucket.cells.push({ ...cell });
           }
         }
-        for (const bucket of byKey.values()) poSpecs.push(bucket);
+        for (const bucket of byKey.values()) poSpecs.push({ ...bucket, comp: cs });
+      }
       }
       if (poSpecs.length === 0) return res.status(400).json({ success: false, error: "Enter at least one size/color quantity" });
 
       // Auto-number whenever more than one PO results (the split created extras)
       // or the caller is already in multi mode. A lone legacy PO keeps using the
       // caller-provided workOrderNo.
-      const autoNumber = multi || poSpecs.length > 1;
+      // Un conjunto SIEMPRE se autonumera: son varias POs por definicion.
+      const autoNumber = multi || isSet || poSpecs.length > 1;
 
       await client.query("BEGIN");
 
@@ -1180,13 +1279,36 @@ function registerWorkOrders(app, deps) {
       const customerName = cust.rows[0].name;
 
       // Photo was uploaded straight to S3 by the browser (presigned PUT); the
-      // request carries only its key. Shared across every PO in this submission.
+      // request carries only its key. Cada prenda puede traer la suya: la
+      // chamarra y el pantalon no son la misma foto.
       if (incomingPhotoKey) {
         photoKey = incomingPhotoKey;
         photoUrl = generatePresignedGetUrl(photoKey, 3600);
       }
+      for (const cs of compSpecs) {
+        cs.photoUrl = cs.photoKey ? generatePresignedGetUrl(cs.photoKey, 3600) : null;
+      }
 
-      const samNum = parseFloat(sam) || 0;
+      // ---- CABECERA DEL CONJUNTO ---------------------------------------
+      // Se crea DENTRO de esta transaccion: si una sola PO falla, el conjunto
+      // tampoco queda. La fecha del conjunto es la MAS TARDIA de sus prendas:
+      // el conjunto no sale hasta que sale su ultima pieza.
+      let orderSet = null;
+      if (isSet) {
+        const allDates = poSpecs.map((p) => p.commitmentDate).filter(Boolean).sort();
+        const allPos = [...new Set(poSpecs.flatMap((p) => p.cells.map((c) => c.customerPo)).filter(Boolean))];
+        orderSet = await createSetInTx(client, {
+          setNo: setMeta?.setNo,
+          clienteCode: CLI,
+          label: setMeta?.label || compSpecs.map((c) => c.component).join(" + "),
+          customerId, customerName,
+          customerPo: setMeta?.customerPo || customerPo || allPos[0] || null,
+          season: season || null,
+          commitmentDate: allDates.length ? allDates[allDates.length - 1] : null,
+          notes: setMeta?.notes || null,
+          userId: req.user?.id ?? null,
+        });
+      }
 
       // For auto-numbered submissions we assign sequential SKM#### numbers ourselves.
       let seq = 0;
@@ -1202,9 +1324,21 @@ function registerWorkOrders(app, deps) {
       let created = 0, reused = 0;
       const createdOrders = [];
 
+      // Cuantas POs lleva ya cada prenda: el stock de almacen y los extras se
+      // aplican a la PRIMERA PO de SU prenda, no a la primera del envio.
+      const posPerComponent = new Map();
+
       for (let i = 0; i < poSpecs.length; i++) {
         const { cells, commitmentDate: specDate, fabricName: specFabricName,
-                fabricCode: specFabricCode, yieldPerPiece: specYield } = poSpecs[i];
+                fabricCode: specFabricCode, yieldPerPiece: specYield, comp } = poSpecs[i];
+        // Datos de la prenda a la que pertenece esta PO.
+        const { T, M, C } = comp;
+        const description = comp.description;
+        const samNum = parseFloat(comp.sam) || 0;
+        const photoKey = comp.photoKey || null;
+        const photoUrl = comp.photoUrl || null;
+        const nthOfComponent = (posPerComponent.get(comp.index) || 0);
+        posPerComponent.set(comp.index, nthOfComponent + 1);
         // A PO may carry several customer POs (one per line). Store a distinct,
         // comma-joined summary on the header for display/search; the authoritative
         // per-line values live in work_order_lines.customer_po.
@@ -1245,7 +1379,7 @@ function registerWorkOrders(app, deps) {
         let woNo;
         if (autoNumber) {
           seq += 1;
-          woNo = `SKM${String(seq).padStart(4, "0")}-${CLI}-${styleCode}`;
+          woNo = `SKM${String(seq).padStart(4, "0")}-${CLI}-${comp.styleCode}`;
         } else {
           woNo = workOrderNo;
           if (!woNo) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "workOrderNo is required" }); }
@@ -1255,9 +1389,10 @@ function registerWorkOrders(app, deps) {
         if (dup.rows.length > 0) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: `PO number already exists: ${woNo}` }); }
 
         const orderedQty = cells.reduce((s, c) => s + c.quantity, 0);
-        // Warehouse stock / extras apply to the first PO only.
-        const wStock = i === 0 ? (parseFloat(warehouseStock) || 0) : 0;
-        const xtra = i === 0 ? (parseFloat(extraQuantity) || 0) : 0;
+        // Warehouse stock / extras apply to the first PO OF EACH GARMENT: el
+        // stock de chamarras no puede descontar pantalones.
+        const wStock = nthOfComponent === 0 ? comp.warehouseStock : 0;
+        const xtra = nthOfComponent === 0 ? comp.extraQuantity : 0;
         const totalToProduce = Math.max(orderedQty - wStock + xtra, 0);
         const colorSummary = [...new Set(cells.map((c) => c.color))].join(", ");
         const estiloSummary = [...new Set(cells.map((c) => c.estilo))].join(", ");
@@ -1271,18 +1406,22 @@ function registerWorkOrders(app, deps) {
               color, fabric_supplier, style_code, estilo, fabrics, warehouse_stock,
               extra_quantity, total_to_produce, commitment_date, master_code_id,
               sam_minutes, season, customer_po, fabric_name, fabric_code,
-              yield_per_piece, created_by, created_at, updated_at, status
+              yield_per_piece, created_by, set_id, set_component, set_ratio,
+              created_at, updated_at, status
            )
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW(),NOW(),'pending')
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,NOW(),NOW(),'pending')
            RETURNING *`,
           [
             woNo, orderedQty, parseInt(customerId), customerName, description,
-            colorSummary, fabricSupplier, styleCode, primaryEstilo,
+            colorSummary, fabricSupplier, comp.styleCode, primaryEstilo,
             fabricNamesArr.length ? fabricNamesArr : (Array.isArray(fabrics) ? fabrics : []),
             wStock, xtra, totalToProduce,
             headerDate, primaryMasterCodeId, samNum, season || null, cPo || null,
             hFabricName, hFabricCode, hYield,
             req.user?.id ?? null,                     // created_by: el merchant que la capturo
+            // Etiqueta del conjunto. NULL en una PO suelta: produccion no ve
+            // ninguna diferencia, solo FWH y el tablero del merchant.
+            orderSet?.id ?? null, comp.component, comp.ratio,
           ]
         );
         const workOrder = woResult.rows[0];
@@ -1305,8 +1444,22 @@ function registerWorkOrders(app, deps) {
 
         workOrder.lines = cells;
         workOrder.estilos = estiloSummary;
+        workOrder.set_no = orderSet?.set_no ?? null;
         if (photoKey) workOrder.master_code_photo_url = generatePresignedGetUrl(photoKey, 3600);
         createdOrders.push(workOrder);
+      }
+
+      // El tablero del merchant pinta juntas las filas del mismo conjunto.
+      // Las POs nuevas todavia no estan en el tablero; esto cubre el caso de
+      // reconvertir una pre-orden que ya tenia semana asignada.
+      if (orderSet) {
+        await client.query(
+          `UPDATE merchant_week_plan p
+              SET set_id = wo.set_id, set_component = wo.set_component
+             FROM work_orders wo
+            WHERE p.work_order_id = wo.id AND wo.set_id = $1`,
+          [orderSet.id]
+        );
       }
 
       await client.query("COMMIT");
@@ -1316,6 +1469,8 @@ function registerWorkOrders(app, deps) {
         message: createdOrders.length > 1 ? `${createdOrders.length} production orders created` : "Production order created",
         workOrder: createdOrders[0],      // backward-compat: first PO
         workOrders: createdOrders,        // all POs created in this request
+        // Presente solo cuando se capturo un conjunto (2+ prendas).
+        set: orderSet,
         masterCodes: { created, reused, total: Object.keys(codeToId).length },
       });
     } catch (err) {
