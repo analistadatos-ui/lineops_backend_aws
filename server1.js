@@ -627,6 +627,7 @@ await registerMerchantAnalytics.initSchema({ pool, setSchema });
 await registerMerchantPlan.initSchema({ pool, setSchema });
 await registerPreOrderHolds.initSchema({ pool, setSchema });   // ← add
 await registerCutOrders.initSchema({ pool, setSchema });
+await registerBom.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
 await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
 await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
@@ -860,6 +861,11 @@ app.post(
 app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
+
+const registerBom = require("./bom");
+registerBom(app, { authenticateToken, pool, setSchema, generatePresignedGetUrl });
+
+
 const registerHolidays = require("./holidays");
 registerHolidays(app, { authenticateToken, pool, setSchema });
 // ~línea 867, junto a registerMerchantPlan:
