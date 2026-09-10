@@ -862,8 +862,7 @@ app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
-const registerBom = require("./bom");
-registerBom(app, { authenticateToken, pool, setSchema, generatePresignedGetUrl });
+
 
 
 const registerHolidays = require("./holidays");
@@ -883,6 +882,9 @@ registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema });
 
 const registerMerchantAnalytics = require("./merchant-analytics");
 registerMerchantAnalytics(app, { authenticateToken, pool, setSchema });
+
+const registerBom = require("./bom");
+registerBom(app, { authenticateToken, pool, setSchema, generatePresignedGetUrl });
 
 const registerMerchantPlan = require("./merchant-plan");
 registerMerchantPlan(app, { authenticateToken, pool, setSchema });
