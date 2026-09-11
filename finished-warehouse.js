@@ -687,6 +687,17 @@ async function initSchema({ pool, setSchema }) {
     await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS customer_name VARCHAR(150);");
     await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_folio ON scanned_tickets(folio) WHERE folio IS NOT NULL;");
 
+    // Entrada a inventario ("check-in"): al escanear, el ticket queda PENDIENTE.
+    // Cuando el operador confirma la entrada, se suman sus piezas a
+    // finished_inventory y aquí se marca checked_in_at + inventory_id para no
+    // contarlo dos veces. Un ticket sin checked_in_at está pendiente de entrada.
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMPTZ;");
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS checked_in_by BIGINT;");
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS inventory_id BIGINT;");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_scan_checkedin ON scanned_tickets(checked_in_at);");
+    // Traza del movimiento hacia el ticket que lo originó (además de list_id/box_id).
+    await client.query("ALTER TABLE finished_inventory_movements ADD COLUMN IF NOT EXISTS ticket_id BIGINT;");
+
     // Contador de folios por prefijo (p. ej. 'SKM'), incremento atómico para que
     // dos escaneos simultáneos nunca tomen el mismo número.
     await client.query(`
@@ -1003,8 +1014,14 @@ function registerFinishedWarehouse(app, deps) {
       `SELECT * FROM scanned_tickets ${where} ORDER BY scanned_at DESC LIMIT $${params.length}`, params
     );
     const totals = rows.reduce(
-      (t, r) => { t.tickets += 1; t.pieces += Number(r.pieces) || 0; return t; },
-      { tickets: 0, pieces: 0 }
+      (t, r) => {
+        t.tickets += 1;
+        t.pieces += Number(r.pieces) || 0;
+        if (r.checked_in_at) { t.checkedIn += 1; }
+        else { t.pending += 1; t.pendingPieces += Number(r.pieces) || 0; }
+        return t;
+      },
+      { tickets: 0, pieces: 0, pending: 0, pendingPieces: 0, checkedIn: 0 }
     );
     res.json({ success: true, tickets: rows, totals });
   }));
@@ -1012,9 +1029,150 @@ function registerFinishedWarehouse(app, deps) {
   // Deshacer un escaneo (p. ej. un ticket escaneado por error).
   app.delete("/api/finished-warehouse/scanned-tickets/:id", authenticateToken, withClient(async (req, res, client) => {
     const id = parseInt(req.params.id, 10);
-    const del = await client.query(`DELETE FROM scanned_tickets WHERE id = $1 RETURNING id`, [id]);
+    const del = await client.query(`DELETE FROM scanned_tickets WHERE id = $1 RETURNING id, checked_in_at`, [id]);
     if (del.rows.length === 0) return res.status(404).json({ success: false, error: "Ticket no encontrado" });
     res.json({ success: true });
+  }));
+
+  // ── Check-in: mover un ticket escaneado al inventario. ───────────────────
+  // Suma las piezas del ticket a finished_inventory (por SKU), registra el
+  // movimiento y marca el ticket como ingresado. Idempotente: si el ticket ya
+  // entró, se devuelve tal cual sin volver a sumar.
+  app.post("/api/finished-warehouse/scanned-tickets/:id/check-in", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ success: false, error: "Ticket inválido" });
+
+    await client.query("BEGIN");
+
+    const tRes = await client.query(`SELECT * FROM scanned_tickets WHERE id = $1 FOR UPDATE`, [id]);
+    if (tRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Ticket no encontrado" });
+    }
+    const t = tRes.rows[0];
+
+    // Ya ingresado: no se vuelve a contar.
+    if (t.checked_in_at) {
+      await client.query("ROLLBACK");
+      return res.json({ success: true, alreadyCheckedIn: true, ticket: t });
+    }
+
+    const qty = Number(t.pieces) || 0;
+
+    // SKU del ticket, consistente con el que arma el pre-empaque.
+    //   po = No. de orden (work_order_no)   ·   mo = PO del cliente (customer_po)
+    const box = {
+      customer_code: t.customer_code || null,
+      po: t.work_order_no || null,
+      style: t.style || null,
+      color_code: colorCodeOf(t.color, t.size_code),
+      size_code: t.size_code || null,
+      sex: null,
+      fabric_code: null,
+    };
+    const sku_key = skuKeyOf(box);
+
+    // Los tickets ingresan piezas sueltas (aún sin encajar): box_count no cambia.
+    const invRes = await client.query(
+      `INSERT INTO finished_inventory
+         (sku_key, customer_id, customer_code, customer_name, po, mo, style, fabric_code,
+          sex, size_code, color_name, color_code, quantity, box_count)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0)
+       ON CONFLICT (sku_key) DO UPDATE SET
+         quantity   = finished_inventory.quantity + EXCLUDED.quantity,
+         updated_at = now()
+       RETURNING id`,
+      [
+        sku_key, t.customer_id, t.customer_code, t.customer_name,
+        t.work_order_no, t.customer_po, t.style, null,
+        null, t.size_code, t.color, colorCodeOf(t.color, t.size_code), qty,
+      ]
+    );
+    const inventoryId = invRes.rows[0].id;
+
+    await client.query(
+      `INSERT INTO finished_inventory_movements (inventory_id, list_id, box_id, ticket_id, direction, quantity, created_by)
+       VALUES ($1, NULL, NULL, $2, 'in', $3, $4)`,
+      [inventoryId, t.id, qty, req.user?.id ?? null]
+    );
+
+    const upd = await client.query(
+      `UPDATE scanned_tickets
+          SET checked_in_at = now(), checked_in_by = $2, inventory_id = $3
+        WHERE id = $1
+        RETURNING *`,
+      [t.id, req.user?.id ?? null, inventoryId]
+    );
+
+    await client.query("COMMIT");
+    res.json({ success: true, ticket: upd.rows[0], inventoryId, piecesAdded: qty });
+  }));
+
+  // ── Deshacer check-in: regresar un ticket a "pendiente". ─────────────────
+  // Resta las piezas del ticket del inventario, registra el movimiento de salida
+  // y limpia checked_in_at/inventory_id. Idempotente: si el ticket ya está
+  // pendiente, no hace nada.
+  app.post("/api/finished-warehouse/scanned-tickets/:id/undo-check-in", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ success: false, error: "Ticket inválido" });
+
+    await client.query("BEGIN");
+
+    const tRes = await client.query(`SELECT * FROM scanned_tickets WHERE id = $1 FOR UPDATE`, [id]);
+    if (tRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Ticket no encontrado" });
+    }
+    const t = tRes.rows[0];
+
+    // Ya está pendiente: nada que deshacer.
+    if (!t.checked_in_at) {
+      await client.query("ROLLBACK");
+      return res.json({ success: true, alreadyPending: true, ticket: t });
+    }
+
+    const qty = Number(t.pieces) || 0;
+
+    // Fila de inventario: la guardada al ingresar, o por SKU si faltara.
+    let inventoryId = t.inventory_id || null;
+    if (!inventoryId) {
+      const sku_key = skuKeyOf({
+        customer_code: t.customer_code || null,
+        po: t.work_order_no || null,
+        style: t.style || null,
+        color_code: colorCodeOf(t.color, t.size_code),
+        size_code: t.size_code || null,
+        sex: null,
+        fabric_code: null,
+      });
+      const invLookup = await client.query(`SELECT id FROM finished_inventory WHERE sku_key = $1`, [sku_key]);
+      inventoryId = invLookup.rows[0]?.id || null;
+    }
+
+    if (inventoryId) {
+      await client.query(
+        `UPDATE finished_inventory
+            SET quantity = GREATEST(0, quantity - $2), updated_at = now()
+          WHERE id = $1`,
+        [inventoryId, qty]
+      );
+      await client.query(
+        `INSERT INTO finished_inventory_movements (inventory_id, list_id, box_id, ticket_id, direction, quantity, created_by)
+         VALUES ($1, NULL, NULL, $2, 'out', $3, $4)`,
+        [inventoryId, t.id, qty, req.user?.id ?? null]
+      );
+    }
+
+    const upd = await client.query(
+      `UPDATE scanned_tickets
+          SET checked_in_at = NULL, checked_in_by = NULL, inventory_id = NULL
+        WHERE id = $1
+        RETURNING *`,
+      [t.id]
+    );
+
+    await client.query("COMMIT");
+    res.json({ success: true, ticket: upd.rows[0], piecesRemoved: qty });
   }));
 
   // ======================================================================
