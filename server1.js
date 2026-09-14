@@ -7298,18 +7298,32 @@ app.get("/api/skyrina/available-customers", authenticateToken, async (req, res) 
 /**
  * GET /api/skyrina/realtime-summary?date=YYYY-MM-DD&style=xxx&lineNo=xxx&customer=xxx
  *
- * Server-side twin of the META RT / EFF RT tiles in SkyrinaDashboard.jsx, so the
- * Overview "Hoy · Tiempo real" card can show the same live figures WITHOUT the
- * client re-deriving efficiency (see the note at the top of Overview.jsx).
+ * Server-side twin of the META RT / DIARIO tiles in SkyrinaDashboard.jsx, so the
+ * Overview "Hoy · Tiempo real" card can show the SAME live figures without the
+ * client re-deriving anything (see the note at the top of Overview.jsx).
  *
- * Shift window: 08:00 -> the latest slot_end of the day's runs (fallback 17:36).
- *   - realtimeTarget    : each crew's Meta pro-rated by how far into the shift we
- *                         are (capped at the full Meta), deduped per (line, style)
- *   - realtimeEfficiency: live SAM efficiency, weighted by realtime target; null
- *                         once the shift has ended
- *   - dailyEfficiency   : settled SAM efficiency (SUM(sewed*sam)/SUM(available))
- *   - productionEnded   : true for any past/future date, or once now is past the
- *                         latest slot end for today
+ * ── Timezone (this is the part that was wrong before) ────────────────────────
+ * SkyrinaDashboard runs its RT math in the BROWSER, where `new Date()` and the
+ * `${date}T08:00:00` / slot-end anchors are all in the viewer's local = plant
+ * clock (America/Mexico_City, UTC-6). Doing the same with `new Date(...)` on the
+ * server instead anchors 08:00 to the *server's* midnight: on a UTC host "now"
+ * ran ~6 h ahead of an 08:00 pinned at UTC, so the elapsed fraction — and thus
+ * Meta RT — blew up (e.g. 96% / 8,503 instead of 34.8% / 3,100 at 11:10).
+ * We therefore compute everything in PLANT-LOCAL minutes-of-day, independent of
+ * the server's timezone, which reproduces the browser's numbers exactly.
+ *
+ * Shift window: 08:00 -> the run's latest slot_end (fallback 17:36).
+ *   - realtimeTarget    : each crew's Meta pro-rated by the elapsed fraction of
+ *                         its shift (capped at the full Meta), deduped per
+ *                         (line, style) — identical to computeRealtimeTarget +
+ *                         sumTargetByStyle in SkyrinaDashboard.
+ *   - dailyEfficiency   : settled SAM efficiency SUM(sewed*sam)/SUM(available),
+ *                         the same figure /api/supervisor/summary returns as
+ *                         overallEfficiency (SkyrinaDashboard's DIARIO tile).
+ *   - realtimeEfficiency: kept for parity; null once the shift ends. (The
+ *                         Overview card shows Diario, not this.)
+ *   - productionEnded   : true for any past/future date, or once plant-local now
+ *                         is past the latest slot end for today.
  *
  * Dedup rule matches the other skyrina routes: same style / different colour is
  * ONE crew, so Meta and capacity count once (MAX across colours); production
@@ -7387,27 +7401,46 @@ app.get("/api/skyrina/realtime-summary", authenticateToken, async (req, res) => 
 
     const { rows } = await client.query(query, params);
 
-    // ---- replicate SkyrinaDashboard's RT math, once, on the server ----
-    const PROD_START = '08:00:00';
+    // ---- RT math in PLANT-LOCAL minutes-of-day (see header note) ----
+    const PLANT_TZ = 'America/Mexico_City';   // UTC-6, no DST — single-factory app
+    const PROD_START_MIN = 8 * 60;            // 08:00
     const DEFAULT_END = '17:36:00';
-    const now = new Date();
 
-    const d = new Date();
-    const todayStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    const isToday = date === todayStr;               // past/future date => settled
+    const hmsToMin = (hms) => {
+      const [h, m, s] = String(hms).split(':').map(Number);
+      return (h || 0) * 60 + (m || 0) + (s || 0) / 60;
+    };
 
-    const startAt = new Date(`${date}T${PROD_START}`);
+    // "now" as { date, minutesOfDay } in the plant timezone, regardless of the
+    // server's own timezone.
+    const nowParts = Object.fromEntries(
+      new Intl.DateTimeFormat('en-CA', {
+        timeZone: PLANT_TZ,
+        hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+      })
+        .formatToParts(new Date())
+        .map((p) => [p.type, p.value])
+    );
+    const plantToday = `${nowParts.year}-${nowParts.month}-${nowParts.day}`;
+    const nowMin =
+      (parseInt(nowParts.hour, 10) % 24) * 60 +
+      parseInt(nowParts.minute, 10) +
+      parseInt(nowParts.second, 10) / 60;
+
+    const isToday = date === plantToday; // any past/future date is settled
 
     // All deduped by (line, style): a colour split shares one crew.
     const crewTarget = new Map();     // full-day Meta
     const crewRtTarget = new Map();   // pro-rated RT Meta
     const crewAvailMin = new Map();   // available minutes (daily-eff denominator)
-    const rtWeightTarget = new Map(); // RT-eff denominator
+    const rtWeightTarget = new Map(); // RT-eff denominator (parity only)
     let totalProduced = 0;
     let totalSamOutput = 0;
     let weightedRtEff = 0;
     let anyLive = false;
-    let latestEnd = new Date(`${date}T${DEFAULT_END}`);
+    let latestEndMin = hmsToMin(DEFAULT_END);
 
     for (const r of rows) {
       const key = `${r.line_no}||${r.style ?? ''}`;
@@ -7423,29 +7456,29 @@ app.get("/api/skyrina/realtime-summary", authenticateToken, async (req, res) => 
       crewTarget.set(key, Math.max(crewTarget.get(key) || 0, target));
       crewAvailMin.set(key, Math.max(crewAvailMin.get(key) || 0, availMin));
 
-      const endAt = new Date(`${date}T${r.last_slot_end || DEFAULT_END}`);
-      if (endAt > latestEnd) latestEnd = endAt;
-      const runEnded = !isToday || now >= endAt;
+      const endMin = hmsToMin(r.last_slot_end || DEFAULT_END);
+      if (endMin > latestEndMin) latestEndMin = endMin;
+      const runEnded = !isToday || nowMin >= endMin;
 
-      // computeRealtimeTarget
+      // computeRealtimeTarget — Meta pro-rated by elapsed fraction of the shift
       let rtTarget;
       if (runEnded) rtTarget = target;
-      else if (now < startAt) rtTarget = 0;
+      else if (nowMin < PROD_START_MIN) rtTarget = 0;
       else {
-        const totalMs = endAt - startAt;
-        const ratio = totalMs > 0 ? (now - startAt) / totalMs : 0;
+        const total = endMin - PROD_START_MIN;
+        const ratio = total > 0 ? (nowMin - PROD_START_MIN) / total : 0;
         rtTarget = Math.min(target * ratio, target);
       }
       crewRtTarget.set(key, Math.max(crewRtTarget.get(key) || 0, rtTarget));
 
-      // calculateRealtimeEfficiency (only while the run is live)
-      if (!runEnded && now >= startAt && rtTarget > 0) {
-        const totalMs = endAt - startAt;
-        const elapsedMin = Math.min((now - startAt) / 60000, totalMs / 60000);
+      // calculateRealtimeEfficiency (parity only; the card shows Diario)
+      if (!runEnded && nowMin >= PROD_START_MIN && rtTarget > 0) {
+        const total = endMin - PROD_START_MIN;
+        const elapsedMin = Math.min(nowMin - PROD_START_MIN, total);
         const availSoFar = ops * elapsedMin;
         const rtEff = availSoFar > 0 ? ((sewed * sam) / availSoFar) * 100 : 0;
-        weightedRtEff += rtEff * rtTarget;                                   // per-run numerator
-        rtWeightTarget.set(key, Math.max(rtWeightTarget.get(key) || 0, rtTarget)); // deduped denom
+        weightedRtEff += rtEff * rtTarget;
+        rtWeightTarget.set(key, Math.max(rtWeightTarget.get(key) || 0, rtTarget));
         anyLive = true;
       }
     }
@@ -7456,8 +7489,7 @@ app.get("/api/skyrina/realtime-summary", authenticateToken, async (req, res) => 
     const availMinutes = sum(crewAvailMin);
     const rtDenom = sum(rtWeightTarget);
 
-    const productionEnded = !isToday || now >= latestEnd;
-
+    const productionEnded = !isToday || nowMin >= latestEndMin;
     const dailyEfficiency = availMinutes > 0 ? (totalSamOutput / availMinutes) * 100 : 0;
     const realtimeEfficiency =
       !productionEnded && anyLive && rtDenom > 0 ? weightedRtEff / rtDenom : null;
@@ -7485,7 +7517,6 @@ app.get("/api/skyrina/realtime-summary", authenticateToken, async (req, res) => 
     client.release();
   }
 });
-
 
 /**
  * GET /api/skyrina/period-summary?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
