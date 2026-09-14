@@ -7251,6 +7251,242 @@ app.get("/api/skyrina/available-lines", authenticateToken, async (req, res) => {
   }
 });
 
+
+/**
+ * GET /api/skyrina/available-customers?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+ * Distinct customers that have runs in the range, resolved through the run's
+ * work order: line_runs.work_order_id -> work_orders.customer_name.
+ * (Runs with no linked work order contribute no customer, and are excluded once
+ * a specific customer is chosen elsewhere — same as the style/line dropdowns.)
+ */
+app.get("/api/skyrina/available-customers", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        error: "startDate and endDate parameters required",
+      });
+    }
+
+    const result = await client.query(
+      `SELECT DISTINCT wo.customer_name AS customer
+         FROM line_runs lr
+         JOIN work_orders wo ON wo.id = lr.work_order_id
+        WHERE lr.run_date BETWEEN $1 AND $2
+          AND wo.customer_name IS NOT NULL
+          AND wo.customer_name <> ''
+        ORDER BY wo.customer_name`,
+      [startDate, endDate]
+    );
+
+    res.json({
+      success: true,
+      customers: result.rows.map((r) => r.customer),
+    });
+  } catch (err) {
+    console.error("❌ Error fetching available customers:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/skyrina/realtime-summary?date=YYYY-MM-DD&style=xxx&lineNo=xxx&customer=xxx
+ *
+ * Server-side twin of the META RT / EFF RT tiles in SkyrinaDashboard.jsx, so the
+ * Overview "Hoy · Tiempo real" card can show the same live figures WITHOUT the
+ * client re-deriving efficiency (see the note at the top of Overview.jsx).
+ *
+ * Shift window: 08:00 -> the latest slot_end of the day's runs (fallback 17:36).
+ *   - realtimeTarget    : each crew's Meta pro-rated by how far into the shift we
+ *                         are (capped at the full Meta), deduped per (line, style)
+ *   - realtimeEfficiency: live SAM efficiency, weighted by realtime target; null
+ *                         once the shift has ended
+ *   - dailyEfficiency   : settled SAM efficiency (SUM(sewed*sam)/SUM(available))
+ *   - productionEnded   : true for any past/future date, or once now is past the
+ *                         latest slot end for today
+ *
+ * Dedup rule matches the other skyrina routes: same style / different colour is
+ * ONE crew, so Meta and capacity count once (MAX across colours); production
+ * (sewed pieces, SAM output) still sums across every colour.
+ */
+app.get("/api/skyrina/realtime-summary", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { date, style, lineNo, customer } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter required" });
+    }
+    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+
+    const params = [date];
+    let paramIndex = 2;
+    let runFilters = "";
+    if (style && style !== 'all') {
+      runFilters += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+    if (lineNo && lineNo !== 'all') {
+      runFilters += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+    if (customer && customer !== 'all') {
+      runFilters += ` AND wo.customer_name = $${paramIndex++}`;
+      params.push(customer);
+    }
+
+    const query = `
+      WITH filtered_runs AS (
+        SELECT
+          lr.id                       AS run_id,
+          lr.line_no                  AS line_no,
+          lr.style                    AS style,
+          lr.target_pcs::float8       AS target_pcs,
+          lr.sam_minutes::float8      AS sam_minutes,
+          lr.operators_count::float8  AS operators_count,
+          lr.working_hours::float8    AS working_hours,
+          (lr.working_hours * lr.operators_count * 60)::float8 AS available_minutes
+        FROM line_runs lr
+        LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
+        WHERE lr.run_date = $1${runFilters}
+      ),
+      slot_ends AS (
+        SELECT ss.run_id, to_char(MAX(ss.slot_end), 'HH24:MI:SS') AS last_slot_end
+        FROM shift_slots ss
+        JOIN filtered_runs fr ON fr.run_id = ss.run_id
+        WHERE ss.slot_end IS NOT NULL
+        GROUP BY ss.run_id
+      ),
+      run_packing AS (
+        SELECT fr.run_id, COALESCE(SUM(se.sewed_qty), 0)::float8 AS packing_total
+        FROM filtered_runs fr
+        JOIN run_operators ro          ON fr.run_id = ro.run_id
+        JOIN operator_operations oo    ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+        GROUP BY fr.run_id
+      )
+      SELECT
+        fr.run_id, fr.line_no, fr.style, fr.target_pcs, fr.sam_minutes,
+        fr.operators_count, fr.working_hours, fr.available_minutes,
+        COALESCE(rp.packing_total, 0) AS packing_total,
+        se.last_slot_end
+      FROM filtered_runs fr
+      LEFT JOIN run_packing rp ON rp.run_id = fr.run_id
+      LEFT JOIN slot_ends   se ON se.run_id = fr.run_id
+    `;
+
+    const { rows } = await client.query(query, params);
+
+    // ---- replicate SkyrinaDashboard's RT math, once, on the server ----
+    const PROD_START = '08:00:00';
+    const DEFAULT_END = '17:36:00';
+    const now = new Date();
+
+    const d = new Date();
+    const todayStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const isToday = date === todayStr;               // past/future date => settled
+
+    const startAt = new Date(`${date}T${PROD_START}`);
+
+    // All deduped by (line, style): a colour split shares one crew.
+    const crewTarget = new Map();     // full-day Meta
+    const crewRtTarget = new Map();   // pro-rated RT Meta
+    const crewAvailMin = new Map();   // available minutes (daily-eff denominator)
+    const rtWeightTarget = new Map(); // RT-eff denominator
+    let totalProduced = 0;
+    let totalSamOutput = 0;
+    let weightedRtEff = 0;
+    let anyLive = false;
+    let latestEnd = new Date(`${date}T${DEFAULT_END}`);
+
+    for (const r of rows) {
+      const key = `${r.line_no}||${r.style ?? ''}`;
+      const target = Number(r.target_pcs) || 0;
+      const sam = Number(r.sam_minutes) || 0;
+      const ops = Number(r.operators_count) || 0;
+      const availMin = Number(r.available_minutes) || 0;
+      const sewed = Number(r.packing_total) || 0;
+
+      totalProduced += sewed;
+      totalSamOutput += sewed * sam;
+
+      crewTarget.set(key, Math.max(crewTarget.get(key) || 0, target));
+      crewAvailMin.set(key, Math.max(crewAvailMin.get(key) || 0, availMin));
+
+      const endAt = new Date(`${date}T${r.last_slot_end || DEFAULT_END}`);
+      if (endAt > latestEnd) latestEnd = endAt;
+      const runEnded = !isToday || now >= endAt;
+
+      // computeRealtimeTarget
+      let rtTarget;
+      if (runEnded) rtTarget = target;
+      else if (now < startAt) rtTarget = 0;
+      else {
+        const totalMs = endAt - startAt;
+        const ratio = totalMs > 0 ? (now - startAt) / totalMs : 0;
+        rtTarget = Math.min(target * ratio, target);
+      }
+      crewRtTarget.set(key, Math.max(crewRtTarget.get(key) || 0, rtTarget));
+
+      // calculateRealtimeEfficiency (only while the run is live)
+      if (!runEnded && now >= startAt && rtTarget > 0) {
+        const totalMs = endAt - startAt;
+        const elapsedMin = Math.min((now - startAt) / 60000, totalMs / 60000);
+        const availSoFar = ops * elapsedMin;
+        const rtEff = availSoFar > 0 ? ((sewed * sam) / availSoFar) * 100 : 0;
+        weightedRtEff += rtEff * rtTarget;                                   // per-run numerator
+        rtWeightTarget.set(key, Math.max(rtWeightTarget.get(key) || 0, rtTarget)); // deduped denom
+        anyLive = true;
+      }
+    }
+
+    const sum = (m) => [...m.values()].reduce((a, b) => a + b, 0);
+    const totalTarget = sum(crewTarget);
+    const realtimeTarget = sum(crewRtTarget);
+    const availMinutes = sum(crewAvailMin);
+    const rtDenom = sum(rtWeightTarget);
+
+    const productionEnded = !isToday || now >= latestEnd;
+
+    const dailyEfficiency = availMinutes > 0 ? (totalSamOutput / availMinutes) * 100 : 0;
+    const realtimeEfficiency =
+      !productionEnded && anyLive && rtDenom > 0 ? weightedRtEff / rtDenom : null;
+
+    const r2 = (v) => (v == null ? null : Math.round(v * 100) / 100);
+
+    res.json({
+      success: true,
+      date,
+      productionEnded,
+      summary: {
+        totalTarget: r2(totalTarget),
+        realtimeTarget: r2(realtimeTarget),
+        totalProduced: r2(totalProduced),
+        dailyEfficiency: r2(dailyEfficiency),
+        realtimeEfficiency: r2(realtimeEfficiency),
+        targetAchievement: totalTarget > 0 ? r2((totalProduced / totalTarget) * 100) : 0,
+        targetAchievementRt: realtimeTarget > 0 ? r2((totalProduced / realtimeTarget) * 100) : 0,
+      },
+    });
+  } catch (err) {
+    console.error("❌ Error fetching realtime summary:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
 /**
  * GET /api/skyrina/period-summary?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
  * Returns aggregated summary for a date range with CORRECT efficiency calculation
