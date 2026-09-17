@@ -6892,16 +6892,15 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
  * GET /api/skyrina/style-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
  * Returns style performance with SAM-based efficiency (most accurate)
  */
-/**
- * GET /api/skyrina/style-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
- * Returns style performance with SAM-based efficiency (most accurate)
- */
+// ============================================================
+// style-performance
+// ============================================================
 app.get("/api/skyrina/style-performance", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
     
-    const { startDate, endDate, style, lineNo } = req.query;
+    const { startDate, endDate, style, lineNo, customer } = req.query;
     if (!startDate || !endDate) {
       return res.status(400).json({ 
         success: false, 
@@ -6925,6 +6924,7 @@ app.get("/api/skyrina/style-performance", authenticateToken, async (req, res) =>
           lr.line_no,
           COALESCE(SUM(se.sewed_qty), 0) as total_sewed
         FROM line_runs lr
+        LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
         JOIN run_operators ro ON lr.id = ro.run_id
         JOIN operator_operations oo ON ro.id = oo.run_operator_id
         LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
@@ -6943,6 +6943,11 @@ app.get("/api/skyrina/style-performance", authenticateToken, async (req, res) =>
     if (lineNo && lineNo !== 'all') {
       query += ` AND lr.line_no = $${paramIndex++}`;
       params.push(lineNo);
+    }
+    
+    if (customer && customer !== 'all') {
+      query += ` AND wo.customer_name = $${paramIndex++}`;
+      params.push(customer);
     }
     
     query += `
@@ -7027,17 +7032,19 @@ app.get("/api/skyrina/style-performance", authenticateToken, async (req, res) =>
     client.release();
   }
 });
-
 /**
- * GET /api/skyrina/line-performance-detail?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
- * Returns line performance with SAM-based efficiency
+ * GET /api/skyrina/style-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Returns style performance with SAM-based efficiency (most accurate)
  */
+// ============================================================
+// line-performance-detail (ACTIVE — first definition)
+// ============================================================
 app.get("/api/skyrina/line-performance-detail", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
     
-    const { startDate, endDate, style, lineNo } = req.query;
+    const { startDate, endDate, style, lineNo, customer } = req.query;
     if (!startDate || !endDate) {
       return res.status(400).json({ 
         success: false, 
@@ -7061,6 +7068,7 @@ app.get("/api/skyrina/line-performance-detail", authenticateToken, async (req, r
           lr.target_pcs,
           COALESCE(SUM(se.sewed_qty), 0) as total_sewed
         FROM line_runs lr
+        LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
         JOIN run_operators ro ON lr.id = ro.run_id
         JOIN operator_operations oo ON ro.id = oo.run_operator_id
         LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
@@ -7079,6 +7087,11 @@ app.get("/api/skyrina/line-performance-detail", authenticateToken, async (req, r
     if (lineNo && lineNo !== 'all') {
       query += ` AND lr.line_no = $${paramIndex++}`;
       params.push(lineNo);
+    }
+    
+    if (customer && customer !== 'all') {
+      query += ` AND wo.customer_name = $${paramIndex++}`;
+      params.push(customer);
     }
     
     query += `
@@ -7528,12 +7541,15 @@ app.get("/api/skyrina/realtime-summary", authenticateToken, async (req, res) => 
  * Returns aggregated summary for a date range with CORRECT efficiency calculation
  * Uses weighted average based on total SAM output vs total available minutes
  */
+// ============================================================
+// period-summary
+// ============================================================
 app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
     
-    const { startDate, endDate, style, lineNo } = req.query;
+    const { startDate, endDate, style, lineNo, customer } = req.query;
     if (!startDate || !endDate) {
       return res.status(400).json({ 
         success: false, 
@@ -7550,17 +7566,21 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
     const params = [startDate, endDate];
     let paramIndex = 3;
     let runFilters = "";
-
+ 
     if (style && style !== 'all') {
       runFilters += ` AND lr.style = $${paramIndex++}`;
       params.push(style);
     }
-
+ 
     if (lineNo && lineNo !== 'all') {
       runFilters += ` AND lr.line_no = $${paramIndex++}`;
       params.push(lineNo);
     }
-
+    if (customer && customer !== 'all') {
+      runFilters += ` AND wo.customer_name = $${paramIndex++}`;
+      params.push(customer);
+    }
+ 
     // CORRECT global (diario) efficiency:
     //   available minutes are summed over EVERY run on the date (matching the working query),
     //   NOT only over runs that happen to contain a packing operation.
@@ -7577,6 +7597,7 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
           lr.sam_minutes,
           (lr.working_hours * lr.operators_count * 60) AS available_minutes
         FROM line_runs lr
+        LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
         WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
       ),
       -- ONE CREW per (day, line, style). Same style / different colour = the same
@@ -7651,6 +7672,7 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
     client.release();
   }
 });
+ 
 
 /**
  * Paste into server1.js next to the other /api/skyrina routes.
@@ -7681,27 +7703,30 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
  * Overview.jsx works without this — it falls back to one period-summary call per
  * day. This route turns 30 round trips into 1.
  */
+// ============================================================
+// daily-production
+// ============================================================
 app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
-
-    const { startDate, endDate, style, lineNo } = req.query;
+ 
+    const { startDate, endDate, style, lineNo, customer } = req.query;
     if (!startDate || !endDate) {
       return res.status(400).json({
         success: false,
         error: "startDate and endDate parameters required",
       });
     }
-
+ 
     if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
-
+ 
     const params = [startDate, endDate];
     let paramIndex = 3;
     let runFilters = "";
-
+ 
     if (style && style !== 'all') {
       runFilters += ` AND lr.style = $${paramIndex++}`;
       params.push(style);
@@ -7710,7 +7735,11 @@ app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => 
       runFilters += ` AND lr.line_no = $${paramIndex++}`;
       params.push(lineNo);
     }
-
+    if (customer && customer !== 'all') {
+      runFilters += ` AND wo.customer_name = $${paramIndex++}`;
+      params.push(customer);
+    }
+ 
     const query = `
       WITH calendar AS (
         SELECT generate_series($1::date, $2::date, '1 day')::date AS day
@@ -7725,6 +7754,7 @@ app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => 
           lr.sam_minutes AS sam_minutes,
           (lr.working_hours * lr.operators_count * 60) AS available_minutes
         FROM line_runs lr
+        LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
         WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
       ),
       -- ONE CREW per (day, line, style): same style / different colour is the
@@ -7790,9 +7820,9 @@ app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => 
       LEFT JOIN daily_target   dt ON dt.run_date = c.day
       ORDER BY c.day ASC
     `;
-
+ 
     const result = await client.query(query, params);
-
+ 
     const days = result.rows.map((row) => ({
       // send a plain YYYY-MM-DD string so the client never re-parses in UTC
       date: row.date instanceof Date
@@ -7806,7 +7836,7 @@ app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => 
       samOutput: parseFloat(row.sam_output) || 0,
       efficiency: parseFloat(row.efficiency) || 0,
     }));
-
+ 
     res.json({
       success: true,
       period: { startDate, endDate },
