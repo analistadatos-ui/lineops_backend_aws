@@ -9,9 +9,33 @@
 // a normal CommonJS module that the Express app can `require`.
 // ==========================================================================
 
+// ---------------------------------------------------------------------------
+// pdfjs-dist v4 calls Promise.withResolvers(), which only exists on Node 22+.
+// The Lambda runs Node 20, so we polyfill it. It is defined here AND invoked
+// again right before the dynamic import() below, so it is guaranteed to run
+// before pdfjs loads even if a bundler reorders/hoists the module.
+// ---------------------------------------------------------------------------
+function ensurePromiseWithResolvers() {
+  if (typeof Promise.withResolvers !== "function") {
+    Promise.withResolvers = function withResolvers() {
+      let resolve, reject;
+      const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    };
+  }
+}
+ensurePromiseWithResolvers(); // at module load
+
 async function extractRows(buffer) {
+  ensurePromiseWithResolvers(); // again, immediately before pdfjs is loaded
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  const data = new Uint8Array(buffer.buffer ? buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) : buffer);
+
+  const data = new Uint8Array(
+    buffer.buffer ? buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) : buffer
+  );
   const doc = await pdfjs.getDocument({ data, useSystemFonts: true }).promise;
 
   const pages = [];
