@@ -54,6 +54,16 @@ function parseByFormat(pages) {
 // uploads. The PDF is read back by fetching a short-lived presigned GET URL.
 const techpackBucket = () => process.env.TECHPACK_BUCKET;
 
+// Quality-control photos (evidencia de calidad) live in their OWN bucket
+// (QUALITY_BUCKET) and nowhere else — no fallback to the tech-pack bucket, so a
+// missing env var fails loudly instead of silently writing photos to the wrong
+// place. Keyed under a `quality/` prefix. Same s3-raw signer.
+const qualityBucket = () => process.env.QUALITY_BUCKET;
+
+// Only allow a small set of image content-types for QC photos.
+const PHOTO_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif", "image/gif"]);
+const photoExt = (ct) => ({ "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/heic": "heic", "image/heif": "heif", "image/gif": "gif" }[ct] || "jpg");
+
 // ---- coercion helpers -----------------------------------------------------
 const txt = (v, n) => (v == null ? null : String(v).trim().slice(0, n || 200) || null);
 const idOr = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null; };
@@ -169,6 +179,48 @@ function registerStyleOrders(app, deps) {
     }
   });
 
+  // ---- QC photos: presigned PUT so the browser uploads straight to S3 ------
+  // Body: { filename, contentType }. Returns { url, key }. The React wizard
+  // stores the returned `key` in order.data.qualityPhotos[] (with its comment);
+  // the bytes never travel through the API.
+  app.post("/api/style-orders/photo-upload-url", authenticateToken, async (req, res) => {
+    try {
+      const bucket = qualityBucket();
+      if (!bucket) return res.status(500).json({ success: false, error: "Falta la variable de entorno QUALITY_BUCKET." });
+      if (!generatePresignedPutUrl) return res.status(500).json({ success: false, error: "Falta inyectar generatePresignedPutUrl (s3-raw) en server1.js." });
+      const ct = String(req.body?.contentType || "image/jpeg").toLowerCase();
+      if (!PHOTO_TYPES.has(ct)) return res.status(400).json({ success: false, error: "Tipo de imagen no permitido (usa JPG, PNG, WEBP o HEIC)." });
+      const safe = String(req.body?.filename || `foto.${photoExt(ct)}`).replace(/[^\w.\-]/g, "_").slice(-80);
+      const key = `quality/${Date.now()}-${Math.random().toString(36).slice(2)}-${safe}`;
+      const url = generatePresignedPutUrl(key, 300, bucket); // browser PUTs here
+      res.json({ success: true, url, key });
+    } catch (err) {
+      console.error("\u274c photo-upload-url:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // ---- QC photos: presigned GET(s) so the browser can display them ---------
+  // Body: { keys: ["quality/…", …] }. Returns { urls: { key: signedUrl } }.
+  // The QC bucket is private, so thumbnails need short-lived signed GET URLs;
+  // they're generated on demand and never persisted.
+  app.post("/api/style-orders/photo-view-urls", authenticateToken, async (req, res) => {
+    try {
+      const bucket = qualityBucket();
+      if (!bucket) return res.status(500).json({ success: false, error: "Falta la variable de entorno QUALITY_BUCKET." });
+      if (!generatePresignedGetUrl) return res.status(500).json({ success: false, error: "Falta inyectar generatePresignedGetUrl (s3-raw) en server1.js." });
+      const keys = Array.isArray(req.body?.keys) ? req.body.keys : [];
+      const urls = {};
+      for (const k of keys.slice(0, 100)) {
+        if (typeof k === "string" && k.startsWith("quality/")) urls[k] = generatePresignedGetUrl(k, 900, bucket);
+      }
+      res.json({ success: true, urls });
+    } catch (err) {
+      console.error("\u274c photo-view-urls:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // ---- PARSE a tech-pack PDF (read from S3 by key) -> structured order -----
   app.post("/api/style-orders/parse-techpack", authenticateToken, async (req, res) => {
     try {
@@ -233,7 +285,7 @@ function registerStyleOrders(app, deps) {
     } finally { client.release(); }
   });
 
-  const SECTIONS = ["header", "fabrics", "trimMaterials", "spec", "workmanship", "sam", "colorways", "garmentTrims", "packingTrims", "skus", "packing"];
+  const SECTIONS = ["header", "fabrics", "trimMaterials", "spec", "workmanship", "sam", "colorways", "garmentTrims", "packingTrims", "skus", "packing", "qualityPhotos"];
   const dataBlob = (body) => {
     const d = {};
     SECTIONS.forEach((k) => { if (body[k] !== undefined) d[k] = body[k]; });
