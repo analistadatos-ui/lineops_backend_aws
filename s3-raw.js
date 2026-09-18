@@ -175,8 +175,9 @@ function makeStylePhotoKey(originalName = "") {
  * Generates a temporary signed GET URL for a private S3 object using
  * AWS SigV4 query-string signing (no request is made — this just builds a URL).
  */
-function generatePresignedGetUrl(key, expiresInSeconds = 3600) {
+function generatePresignedGetUrl(key, expiresInSeconds = 3600, bucket) {
   if (!key) return null;
+  const host = bucket ? `${bucket}.s3.${REGION}.amazonaws.com` : HOST;
 
   const { accessKey, secretKey, sessionToken } = getCredentials();
   const now = new Date();
@@ -199,7 +200,7 @@ function generatePresignedGetUrl(key, expiresInSeconds = 3600) {
     .map((k) => `${awsUriEncode(k, true)}=${awsUriEncode(queryParams[k], true)}`)
     .join("&");
 
-  const canonicalHeaders = `host:${HOST}\n`;
+  const canonicalHeaders = `host:${host}\n`;
   const signedHeaders = "host";
   const payloadHash = "UNSIGNED-PAYLOAD";
 
@@ -225,7 +226,7 @@ function generatePresignedGetUrl(key, expiresInSeconds = 3600) {
   const kSigning = hmac(kService, "aws4_request");
   const signature = crypto.createHmac("sha256", kSigning).update(stringToSign, "utf8").digest("hex");
 
-  return `https://${HOST}${canonicalPath(key)}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
+  return `https://${host}${canonicalPath(key)}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
 }
 
 /**
@@ -233,8 +234,9 @@ function generatePresignedGetUrl(key, expiresInSeconds = 3600) {
  * directly to S3. Only `host` is signed, so the client may send any
  * Content-Type. No request is made here — this just builds the URL.
  */
-function generatePresignedPutUrl(key, expiresInSeconds = 300) {
+function generatePresignedPutUrl(key, expiresInSeconds = 300, bucket) {
   if (!key) return null;
+  const host = bucket ? `${bucket}.s3.${REGION}.amazonaws.com` : HOST;
 
   const { accessKey, secretKey, sessionToken } = getCredentials();
   const now = new Date();
@@ -258,7 +260,7 @@ function generatePresignedPutUrl(key, expiresInSeconds = 300) {
     .map((k) => `${awsUriEncode(k, true)}=${awsUriEncode(queryParams[k], true)}`)
     .join("&");
 
-  const canonicalHeaders = `host:${HOST}\n`;
+  const canonicalHeaders = `host:${host}\n`;
   const signedHeaders = "host";
   const payloadHash = "UNSIGNED-PAYLOAD";
 
@@ -284,7 +286,7 @@ function generatePresignedPutUrl(key, expiresInSeconds = 300) {
   const kSigning = hmac(kService, "aws4_request");
   const signature = crypto.createHmac("sha256", kSigning).update(stringToSign, "utf8").digest("hex");
 
-  return `https://${HOST}${canonicalPath(key)}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
+  return `https://${host}${canonicalPath(key)}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
 }
 
 module.exports = { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl,generatePresignedPutUrl };

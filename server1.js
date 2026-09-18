@@ -865,7 +865,7 @@ app.get("/api/me", authenticateToken, (req, res) => {
 
 
 const registerStyleOrders = require("./style-orders");
-registerStyleOrders(app, { authenticateToken, pool, setSchema });
+registerStyleOrders(app, { authenticateToken, pool, setSchema, generatePresignedGetUrl, generatePresignedPutUrl });
 
 const registerHolidays = require("./holidays");
 registerHolidays(app, { authenticateToken, pool, setSchema });
