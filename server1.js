@@ -618,6 +618,7 @@ await client.query(`ALTER TABLE line_runs ADD COLUMN IF NOT EXISTS work_order_id
 await client.query("CREATE INDEX IF NOT EXISTS idx_line_runs_work_order ON line_runs(work_order_id);");
 // ────
 await registerEfficiencyPermissions.initSchema({ pool, setSchema });
+await registerStyleOrders.initSchema({ pool, setSchema });
 await registerSupermarketPlan.initSchema({ pool, setSchema });   // ← nueva
 await registerHolidays.initSchema({ pool, setSchema });
 await registerFinishedWarehouseAnalytics.initSchema({ pool, setSchema });
@@ -863,7 +864,8 @@ app.get("/api/me", authenticateToken, (req, res) => {
 });
 
 
-
+const registerStyleOrders = require("./style-orders");
+registerStyleOrders(app, { authenticateToken, pool, setSchema });
 
 const registerHolidays = require("./holidays");
 registerHolidays(app, { authenticateToken, pool, setSchema });
