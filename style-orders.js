@@ -285,7 +285,7 @@ function registerStyleOrders(app, deps) {
     } finally { client.release(); }
   });
 
-  const SECTIONS = ["header", "fabrics", "trimMaterials", "spec", "workmanship", "sam", "colorways", "garmentTrims", "packingTrims", "skus", "packing", "qualityPhotos"];
+  const SECTIONS = ["header", "fabrics", "trimMaterials", "spec", "workmanship", "sam", "colorways", "garmentTrims", "packingTrims", "skus", "packing", "qualityPhotos", "costing"];
   const dataBlob = (body) => {
     const d = {};
     SECTIONS.forEach((k) => { if (body[k] !== undefined) d[k] = body[k]; });
