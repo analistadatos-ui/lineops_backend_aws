@@ -12,7 +12,7 @@ const { body, validationResult, param, query } = require("express-validator");
 const winston = require("winston");
 const fs = require("fs");
 const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl, generatePresignedPutUrl } = require("./s3-raw");
-
+const planWeekLocks = require("./plan-week-locks"); // 🔒 bloqueo de semanas del Plan Board (CEO)
 // ----------------------------------------------------------------------
 // 1. LOGGER (Winston)
 // ----------------------------------------------------------------------
@@ -632,6 +632,7 @@ await registerBom.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
 await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
 await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
+await planWeekLocks.initSchema({ pool, setSchema });   // 🔒 después de line_assignments
 
     // Create index for faster queries
     await client.query("CREATE INDEX IF NOT EXISTS idx_capacity_history_operation ON operator_capacity_history(operation_id);");
@@ -923,6 +924,9 @@ registerSupermarketPlan(app, {
 
 const registerEfficiencyPermissions = require("./efficiency-permissions");
 registerEfficiencyPermissions(app, { authenticateToken, pool, setSchema });
+
+// 🔒 Bloqueo de semanas del Plan Board. lockerRoles = roles que pueden bloquear.
+planWeekLocks(app, { authenticateToken, pool, setSchema, lockerRoles: ["ceo", "skyrina", "master"] });
 
 app.post("/api/logout", (req, res) => {
   res.json({ success: true, message: "Logged out successfully" });
@@ -2391,13 +2395,14 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     await setSchema(client);
     const id = parseInt(req.params.id);
     const { lineNo, assignedDate } = req.body;
-
+ 
     if (!lineNo || !assignedDate) {
       return res.status(400).json({ success: false, error: "lineNo y assignedDate son obligatorios" });
     }
-
+ 
     await client.query("BEGIN");
-
+    await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
+ 
     const cur = await client.query(
       "SELECT id, work_order_id, assigned_quantity, color, status, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str FROM line_assignments WHERE id = $1",
       [id]
@@ -2411,26 +2416,26 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     // the day ends up empty after the move.
     const sourceLineNo = String(original.line_no);
     const sourceDate = original.assigned_date_str;
-
+ 
     const totalQty = parseFloat(original.assigned_quantity) || 0;
     const workOrderId = original.work_order_id;
     const color = original.color || null;
     const status = ["planned", "released", "completed", "cancelled"].includes(original.status)
       ? original.status
       : "planned";
-
+ 
     // Prefer the work order's own SAM for the informational rate columns.
     const woRes = await client.query(
       "SELECT sam_minutes FROM work_orders WHERE id = $1",
       [workOrderId]
     );
     const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
-
+ 
     // Free the original's capacity first so the re-flow can reuse its old slot.
     // Everything happens in one transaction, so a shortfall rolls this back and
     // leaves the assignment exactly where it was.
     await client.query("DELETE FROM line_assignments WHERE id = $1", [id]);
-
+ 
     // Walk the target line day by day from assignedDate, filling each day's
     // remaining capacity and carrying the remainder forward — the same packing
     // rule as a pool placement. Weekends, days with no run configured, or days
@@ -2441,7 +2446,7 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     let dayStr = assignedDate;
     let scanned = 0;
     const createdRows = [];
-
+ 
     // Registered holidays (días festivos / paros) block a day just like weekends,
     // so the forward walk hops over them instead of stacking onto a blocked cell.
     // Plant-wide rows (line_no NULL) block every line. Best-effort: if the module
@@ -2451,14 +2456,14 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       const hrows = await registerHolidays.holidaysBetween(client, { from: assignedDate, to: addDaysStr(assignedDate, 730) });
       for (const h of hrows) if (h.line_no == null || String(h.line_no) === String(lineNo)) holidaySet.add(h.holiday_date);
     } catch (e) { console.warn("⚠️  holidays not available for move:", e.message); }
-
+ 
     while (remaining > 0 && scanned < MAX_DAYS) {
       scanned++;
       if (isWeekend(dayStr) || holidaySet.has(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend / holiday work
       const { lines } = await getLineCapacityForDate(client, dayStr);
       const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
       if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no capacity configured -> skip
-
+ 
       const usedRes = await client.query(
         `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
            FROM line_assignments
@@ -2469,16 +2474,16 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       const capacity = parseFloat(lineData.target_pcs) || 0;
       const available = Math.max(0, capacity - used);
       if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
-
+ 
       const chunk = Math.min(remaining, available);
-
+ 
       const operators = parseInt(lineData.operators_count) || 20;
       const workingHours = parseFloat(lineData.working_hours) || 8;
       const efficiency = parseFloat(lineData.efficiency) || 0.85;
       const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
       const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
       const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
-
+ 
       const ins = await client.query(
         `INSERT INTO line_assignments
            (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
@@ -2494,7 +2499,7 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       remaining -= chunk;
       dayStr = addDaysStr(dayStr, 1);
     }
-
+ 
     if (remaining > 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -2502,12 +2507,12 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
         error: `La línea ${lineNo} no tiene capacidad suficiente para mover ${Math.round(totalQty)} pzas desde el ${assignedDate} (faltan ${Math.round(remaining)}).`,
       });
     }
-
+ 
     // The source day may now be empty. If it only had an unconfirmed draft run
     // (created before the planner confirmed), drop it so line leaders don't keep
     // seeing a draft for a day the order was moved away from.
     await cleanupOrphanDraftRuns(client, sourceLineNo, sourceDate);
-
+ 
     await client.query("COMMIT");
     res.json({
       success: true,
@@ -2517,6 +2522,7 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
+    if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
     console.error("❌ Error moving line assignment:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
@@ -2577,9 +2583,10 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
     if (isWeekend(assignedDate)) {
       return res.status(400).json({ success: false, error: "No se puede insertar en fin de semana. Elija un dia entre semana." });
     }
-
+ 
     await client.query("BEGIN");
-
+    await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
+ 
     const cur = await client.query(
       "SELECT id, work_order_id, assigned_quantity, available_minutes, required_production_rate, color, status, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str FROM line_assignments WHERE id = $1",
       [id]
@@ -2593,14 +2600,14 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
     const sourceDate = a.assigned_date_str;
     const targetLine = String(lineNo);
     const D = assignedDate;
-
+ 
     // 1) Remove the moved block up front (we re-insert it at the target below).
     //    Deleting first — rather than excluding it by id — means a same-order
     //    sibling slice on the previous workday can shift into this block's old
     //    day without tripping uq_line_assign_planned_cell. Same delete-then-
     //    reinsert shape the /move route uses.
     await client.query("DELETE FROM line_assignments WHERE id = $1", [id]);
-
+ 
     // 2) Push the whole tail of the target line forward one workday, latest
     //    first, so each block lands on a slot the next block already vacated.
     //    The occupant of D itself is part of the tail, so D ends up empty.
@@ -2622,7 +2629,7 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
         [nd, row.id]
       );
     }
-
+ 
     // 3) Re-insert the moved order on the now-vacated target cell. Recompute the
     //    informational rate columns from the target line's run for D when one
     //    exists; otherwise keep the block's own values (columns are NOT NULL).
@@ -2630,7 +2637,7 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
     const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
     const { lines } = await getLineCapacityForDate(client, D);
     const lineData = lines.find((l) => String(l.line_no) === targetLine);
-
+ 
     let availableMinutes = parseFloat(a.available_minutes) || 0;
     let requiredRate = parseFloat(a.required_production_rate) || 0;
     let lineRunId = null;
@@ -2643,7 +2650,7 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
       requiredRate = samMinutes > 0 ? availableMinutes / samMinutes : 0;
       lineRunId = lineData.id || null;
     }
-
+ 
     const status = ["planned", "released", "completed", "cancelled"].includes(a.status) ? a.status : "planned";
     const placed = await client.query(
       `INSERT INTO line_assignments
@@ -2654,12 +2661,12 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
       [a.work_order_id, lineRunId, targetLine, D, a.assigned_quantity,
        availableMinutes, requiredRate, D, D, status, a.color || null]
     );
-
+ 
     // 4) The block's old cell may now be empty — drop any orphan draft run there.
     if (!(sourceLineNo === targetLine && sourceDate === D)) {
       await cleanupOrphanDraftRuns(client, sourceLineNo, sourceDate);
     }
-
+ 
     await client.query("COMMIT");
     res.json({
       success: true,
@@ -2668,6 +2675,7 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
     });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
+    if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
     console.error("❌ Error inserting/shifting line assignment:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
@@ -2706,16 +2714,17 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
     const idList = Array.isArray(ids)
       ? [...new Set(ids.map((n) => parseInt(n)).filter((n) => Number.isInteger(n)))]
       : [];
-
+ 
     if (idList.length === 0 || !lineNo || !assignedDate) {
       return res.status(400).json({
         success: false,
         error: "ids (no vacío), lineNo y assignedDate son obligatorios",
       });
     }
-
+ 
     await client.query("BEGIN");
-
+    await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
+ 
     // Load the selected assignments. Order them by their current position so the
     // re-pack is deterministic (earliest day first, then id).
     const cur = await client.query(
@@ -2730,7 +2739,7 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, error: "No se encontraron las asignaciones" });
     }
-
+ 
     // Remember every (line, day) these blocks came from so we can drop their
     // stale draft runs afterwards if the source day ends up empty.
     const sourceCells = [
@@ -2738,13 +2747,13 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
         cur.rows.map((r) => [`${r.line_no}|${r.assigned_date_str}`, { lineNo: String(r.line_no), date: r.assigned_date_str }])
       ).values(),
     ];
-
+ 
     // Free every selected block first so their old slots can be reused.
     await client.query("DELETE FROM line_assignments WHERE id = ANY($1::int[])", [idList]);
-
+ 
         const MAX_DAYS = 180;
     const createdRows = [];
-
+ 
     // Registered holidays (días festivos / paros) block a day like weekends, so
     // the re-pack hops over them instead of stacking onto a blocked cell. Loaded
     // once for the single target line. Best-effort: fall back to weekends-only if
@@ -2754,7 +2763,7 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
       const hrows = await registerHolidays.holidaysBetween(client, { from: assignedDate, to: addDaysStr(assignedDate, 730) });
       for (const h of hrows) if (h.line_no == null || String(h.line_no) === String(lineNo)) holidaySet.add(h.holiday_date);
     } catch (e) { console.warn("⚠️  holidays not available for move-batch:", e.message); }
-
+ 
     for (const original of cur.rows) {
       const totalQty = parseFloat(original.assigned_quantity) || 0;
       if (totalQty <= 0) continue;
@@ -2763,25 +2772,25 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
       const status = ["planned", "released", "completed", "cancelled"].includes(original.status)
         ? original.status
         : "planned";
-
+ 
       // Prefer the work order's own SAM for the informational rate columns.
       const woRes = await client.query(
         "SELECT sam_minutes FROM work_orders WHERE id = $1",
         [workOrderId]
       );
       const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
-
+ 
       let remaining = totalQty;
       let dayStr = assignedDate;
       let scanned = 0;
-
+ 
       while (remaining > 0 && scanned < MAX_DAYS) {
         scanned++;
         if (isWeekend(dayStr) || holidaySet.has(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; } // no weekend / holiday work
         const { lines } = await getLineCapacityForDate(client, dayStr);
         const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
         if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no run -> skip
-
+ 
         const usedRes = await client.query(
           `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
              FROM line_assignments
@@ -2792,16 +2801,16 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
         const capacity = parseFloat(lineData.target_pcs) || 0;
         const available = Math.max(0, capacity - used);
         if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
-
+ 
         const chunk = Math.min(remaining, available);
-
+ 
         const operators = parseInt(lineData.operators_count) || 20;
         const workingHours = parseFloat(lineData.working_hours) || 8;
         const efficiency = parseFloat(lineData.efficiency) || 0.85;
         const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
         const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
         const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
-
+ 
         const row = await mergeOrInsertAssignment(client, {
           workOrderId,
           lineRunId: lineData.id || null,
@@ -2821,7 +2830,7 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
         remaining -= chunk;
         dayStr = addDaysStr(dayStr, 1);
       }
-
+ 
       if (remaining > 0) {
         await client.query("ROLLBACK");
         return res.status(400).json({
@@ -2830,13 +2839,13 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
         });
       }
     }
-
+ 
     // Drop any now-empty source day's unconfirmed draft run so line leaders stop
     // seeing drafts for days these blocks were moved away from.
     for (const cell of sourceCells) {
       await cleanupOrphanDraftRuns(client, cell.lineNo, cell.date);
     }
-
+ 
     await client.query("COMMIT");
     res.json({
       success: true,
@@ -2846,6 +2855,7 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
     });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
+    if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
     console.error("❌ Error moving batch of line assignments:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
@@ -2929,7 +2939,7 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
       return res.status(400).json({ success: false, error: "No se puede insertar en fin de semana. Elija un dia entre semana." });
     }
     const targetLine = String(lineNo);
-
+ 
     // Preload every blocked day for this line across a generous horizon so the
     // workday hops below skip registered holidays (plant-wide OR line-specific)
     // just like weekends — both the inserted orders and the rippled tail avoid
@@ -2946,7 +2956,7 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
     } catch (e) {
       console.warn("⚠️  holidays not available for insert-shift-batch:", e.message);
     }
-
+ 
     // The destination day itself must be a working day for this line.
     if (holidaySet.has(assignedDate)) {
       let hol = null;
@@ -2958,9 +2968,10 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
         holiday: hol || undefined,
       });
     }
-
+ 
     await client.query("BEGIN");
-
+    await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
+ 
     // 1) Snapshot the selected rows (for undo) in a deterministic order — their
     //    current position — then delete them. Deleting first frees their old
     //    planned cells AND keeps them out of the tail query below.
@@ -2977,7 +2988,7 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
     }
     const selectedRows = sel.rows;
     const N = selectedRows.length;
-
+ 
     // Remember every (line, day) the selection came from so we can drop their
     // now-empty draft runs afterwards.
     const sourceCells = [
@@ -2985,16 +2996,16 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
         selectedRows.map((r) => [`${r.line_no}|${r.assigned_date}`, { lineNo: String(r.line_no), date: r.assigned_date }])
       ).values(),
     ];
-
+ 
     await client.query("DELETE FROM line_assignments WHERE id = ANY($1::bigint[])", [idList]);
-
+ 
     // 2) The N consecutive workday slots the newcomers will occupy, from D.
     const slots = [];
     let cursor = thisOrNextWorkday(assignedDate);
     for (let i = 0; i < N; i++) { slots.push(cursor); cursor = nextWorkday(cursor); }
     const D = slots[0];
     const lastSlot = slots[N - 1];
-
+ 
     // 3) Push the planned tail of the target line (>= D) forward by N workdays,
     //    latest-day first. Snapshot it first for undo. Shifting every tail row by
     //    the same N workdays preserves inter-block spacing and clears slots
@@ -3017,7 +3028,7 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
         [nd, row.id]
       );
     }
-
+ 
     // 4) Place the N newcomers on slots[0..N-1] in selection order. Recompute the
     //    informational rate columns from the target line's run for each slot when
     //    one exists; otherwise keep the block's own values (columns are NOT NULL).
@@ -3029,7 +3040,7 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
       const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
       const { lines } = await getLineCapacityForDate(client, day);
       const lineData = lines.find((l) => String(l.line_no) === targetLine);
-
+ 
       let availableMinutes = parseFloat(a.available_minutes) || 0;
       let requiredRate = parseFloat(a.required_production_rate) || 0;
       let lineRunId = a.line_run_id || null;
@@ -3055,14 +3066,14 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
       );
       createdIds.push(placed.rows[0].id);
     }
-
+ 
     // 5) Drop any now-empty source day's orphan draft run.
     for (const cell of sourceCells) {
       await cleanupOrphanDraftRuns(client, cell.lineNo, cell.date);
     }
-
+ 
     await client.query("COMMIT");
-
+ 
     res.json({
       success: true,
       inserted: createdIds.length,
@@ -3079,6 +3090,7 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
     });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
+    if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
     console.error("❌ Error inserting/shifting batch of line assignments:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
@@ -3130,9 +3142,10 @@ app.post("/api/line-assignments/insert-shift-undo", authenticateToken, async (re
     const restore = Array.isArray(undo.restore) ? undo.restore : [];
     const tail = Array.isArray(undo.tail) ? undo.tail : [];
     const shiftedIds = tail.map((r) => parseInt(r.id)).filter(Number.isInteger);
-
+ 
     await client.query("BEGIN");
-
+    await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
+ 
     // Guard: every newcomer must still be present. If not, the board changed
     // after the insert and undoing could wipe out newer work.
     if (createdIds.length) {
@@ -3145,7 +3158,7 @@ app.post("/api/line-assignments/insert-shift-undo", authenticateToken, async (re
         return res.status(409).json({ success: false, error: "No se puede deshacer: el tablero cambio desde la insercion." });
       }
     }
-
+ 
     // Cells the newcomers sat on — tidy their draft runs after we restore.
     const createdCells = createdIds.length
       ? (await client.query(
@@ -3154,24 +3167,25 @@ app.post("/api/line-assignments/insert-shift-undo", authenticateToken, async (re
           [createdIds]
         )).rows
       : [];
-
+ 
     // 1) Remove everything the op produced: newcomers + the shifted tail rows.
     //    Afterwards the affected slice is empty, so the restore below can't
     //    collide with the very rows it is replacing.
     if (createdIds.length) await client.query("DELETE FROM line_assignments WHERE id = ANY($1::bigint[])", [createdIds]);
     if (shiftedIds.length) await client.query("DELETE FROM line_assignments WHERE id = ANY($1::bigint[])", [shiftedIds]);
-
+ 
     // 2) Re-create the pre-op snapshot verbatim (original ids, dates, values).
     for (const r of restore) await reinsert(r);
     for (const r of tail) await reinsert(r);
-
+ 
     // 3) Drop any orphan draft runs on the cells the newcomers vacated.
     for (const c of createdCells) await cleanupOrphanDraftRuns(client, String(c.line_no), c.d);
-
+ 
     await client.query("COMMIT");
     res.json({ success: true, restored: restore.length, unshifted: tail.length });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
+    if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
     // A unique-cell violation means a newer order now sits where a restored block
     // needs to go — the board diverged, so report it as a conflict, not a crash.
     if (err.code === "23505") {
@@ -6760,19 +6774,21 @@ app.post("/api/line-assignments/confirm", authenticateToken, async (req, res) =>
   }
 });
 
+
 app.post("/api/line-assignments", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
     await client.query("BEGIN");
-
+    await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
+ 
     const { workOrderId, lineNo, assignedDate, quantity, plannedStartDate,color  } = req.body;
-
+ 
     if (!workOrderId || !lineNo || !assignedDate || !quantity || parseFloat(quantity) <= 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({ success: false, error: "workOrderId, lineNo, assignedDate and a positive quantity are required" });
     }
-
+ 
     // No production on weekends: reject Sat/Sun assignment dates outright.
     const isWeekendYmd = (ymdStr) => {
       const [y, m, d] = String(ymdStr).split("-").map(Number);
@@ -6783,7 +6799,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ success: false, error: "No se puede asignar en fin de semana (sábado o domingo)." });
     }
-
+ 
     // No production on non-working days (Días festivos / paros). A plant-wide
     // holiday blocks every line; a line-specific one blocks just that line.
     // If the holidays module/table isn't available we don't block assignments.
@@ -6801,7 +6817,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
     } catch (e) {
       console.warn("⚠️  holiday check skipped:", e.message);
     }
-
+ 
     const woResult = await client.query(
       "SELECT id, total_to_produce, sam_minutes FROM work_orders WHERE id = $1",
       [parseInt(workOrderId)]
@@ -6811,33 +6827,33 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       return res.status(404).json({ success: false, error: "Work order not found" });
     }
     const workOrder = woResult.rows[0];
-
+ 
     const { lines } = await getLineCapacityForDate(client, assignedDate);
     const lineData = lines.find((l) => l.line_no === lineNo);
     if (!lineData) {
       await client.query("ROLLBACK");
       return res.status(400).json({ success: false, error: `No capacity configuration found for line ${lineNo}` });
     }
-
+ 
     // Prefer the work order's own SAM (from its master code) over the line's generic SAM
     const samMinutes = parseFloat(workOrder.sam_minutes) || parseFloat(lineData.sam_minutes) || 3.5;
     const operators = parseInt(lineData.operators_count) || 20;
     const workingHours = parseFloat(lineData.working_hours) || 8;
     const efficiency = parseFloat(lineData.efficiency) || 0.85;
-
+ 
     const dailyAvailableMinutes = operators * workingHours * 60;
     const effectiveDailyMinutes = dailyAvailableMinutes * efficiency;
     const piecesPerDay = effectiveDailyMinutes / samMinutes;
-
+ 
     const qty = parseFloat(quantity);
     const totalMinutesNeeded = qty * samMinutes;
     const daysNeeded = Math.ceil(totalMinutesNeeded / effectiveDailyMinutes);
-
+ 
     const startDate = plannedStartDate || assignedDate;
     const endDateObj = new Date(startDate);
     endDateObj.setDate(endDateObj.getDate() + daysNeeded);
     const plannedEndDate = endDateObj.toISOString().slice(0, 10);
-
+ 
     // Guard against double-booking beyond the line's daily target for that date
     const alreadyAssignedResult = await client.query(
       `SELECT COALESCE(SUM(assigned_quantity), 0) as total FROM line_assignments
@@ -6845,7 +6861,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       [lineNo, assignedDate]
     );
     const alreadyAssigned = parseFloat(alreadyAssignedResult.rows[0].total) || 0;
-
+ 
     // ── add: holds on this line/day also occupy capacity ──
     let heldOnCell = 0;
     try {
@@ -6858,10 +6874,10 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
     } catch (e) {
       heldOnCell = 0;
     }
-
+ 
     // change this line to also subtract heldOnCell:
     const availableCapacity = Math.max(0, parseFloat(lineData.target_pcs) - alreadyAssigned - heldOnCell);
-
+ 
     if (qty > availableCapacity) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -6869,7 +6885,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
         error: `Line ${lineNo} only has capacity for ${Math.floor(availableCapacity)} pieces on ${assignedDate}`,
       });
     }
-
+ 
     
     // One planned row per (work_order, line, day, color): if this cell already
     // holds pieces of the same order+color, add to that row instead of stacking
@@ -6888,20 +6904,21 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       status: "planned",
       color: color || null,
     });
-
+ 
     // Move the work order out of 'pending' now that it has at least one assignment
     await client.query(
       "UPDATE work_orders SET status = CASE WHEN status = 'pending' THEN 'assigned' ELSE status END, updated_at = NOW() WHERE id = $1",
       [parseInt(workOrderId)]
     );
-
+ 
     
-
+ 
     await client.query("COMMIT");
-
+ 
     res.json({ success: true, message: "Line assignment created", assignment });
   } catch (err) {
     await client.query("ROLLBACK");
+    if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
     console.error("❌ Error creating line assignment:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
@@ -6910,15 +6927,15 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
 });
 
 
-
 app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
     await client.query("BEGIN");
-
+    await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
+ 
     const { id } = req.params;
-
+ 
     const existing = await client.query(
       "SELECT work_order_id, assigned_date, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str, (assigned_date < CURRENT_DATE) AS is_past FROM line_assignments WHERE id = $1",
       [parseInt(id)]
@@ -6939,7 +6956,7 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
     }
     const workOrderId = existing.rows[0].work_order_id;
     const row = existing.rows[0];
-
+ 
     // A cell that already has production behind it must never be hard-deleted:
     // SUM(assigned_quantity) would silently lose pieces that were really sewn,
     // and the board would re-assign work the floor already did.
@@ -6955,7 +6972,7 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
               [String(row.line_no), row.assigned_date]
             )
           ).rows[0].produced;
-
+ 
     if (Number(cellProduced) > 0 && !req.query.force) {
       await client.query("ROLLBACK");
       return res.status(409).json({
@@ -6968,7 +6985,7 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
         assigned: Number(row.assigned_quantity) || 0,
       });
     }
-
+ 
     if (Number(cellProduced) > 0) {
       // Forced: cancel, never delete. Cancelled rows are excluded from every
       // assigned SUM, so the pool frees up exactly as a delete would, but the
@@ -6980,13 +6997,13 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
     } else {
       await client.query("DELETE FROM line_assignments WHERE id = $1", [parseInt(id)]);
     }
-
+ 
     // Whether the cell was hard-deleted or soft-cancelled, the day may now have
     // no active assignment. Drop its unconfirmed draft run so line leaders don't
     // keep seeing a draft for an emptied cell. (Cancelled rows count as inactive,
     // and a cell with real production has a confirmed run, which is never touched.)
     await cleanupOrphanDraftRuns(client, delLineNo, delDate);
-
+ 
     // If no active assignments remain, return the work order to 'pending'
     // (mirror of the POST, which moves 'pending' -> 'assigned').
     const remainingActive = await client.query(
@@ -7002,11 +7019,12 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
         [workOrderId]
       );
     }
-
+ 
     await client.query("COMMIT");
     res.json({ success: true, message: "Line assignment removed", workOrderId });
   } catch (err) {
     await client.query("ROLLBACK");
+    if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
     console.error("❌ Error deleting line assignment:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {

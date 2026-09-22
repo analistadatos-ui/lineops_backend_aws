@@ -55,6 +55,8 @@
 // que inserta la cabecera; el esquema lo crea order-sets.initSchema, que DEBE
 // correr antes que este (ver el orden en server1.js).
 const { createSetInTx } = require("./order-sets");
+// Bloqueo de semanas del Plan Board por el CEO (ver plan-week-locks.js).
+const planWeekLocks = require("./plan-week-locks");
 
 // --- Startup migration: both breakdown tables ----------------------------
 async function initSchema({ pool, setSchema }) {
@@ -767,6 +769,7 @@ function registerWorkOrders(app, deps) {
       }
 
       await client.query("BEGIN");
+      await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
 
       // Bloquear las filas para que dos planeadores no liquiden el mismo dia al
       // mismo tiempo y el saldo salga reasignado dos veces.
@@ -871,6 +874,7 @@ function registerWorkOrders(app, deps) {
       });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
+      if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
       console.error("\u274c Error en settle-day:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
