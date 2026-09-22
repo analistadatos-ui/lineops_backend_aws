@@ -8153,6 +8153,106 @@ app.get("/api/skyrina/line-efficiency", authenticateToken, async (req, res) => {
     client.release();
   }
 });
+
+/**
+ * GET /api/skyrina/line-efficiency-history?lineNo=X&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+ * Per-DAY SAM-based efficiency for a single line, for the line performance
+ * history chart. Uses the SAME packing/SAM formula as /line-efficiency so the
+ * daily trend is consistent with the overview bars, in a single query.
+ */
+app.get("/api/skyrina/line-efficiency-history", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { startDate, endDate, lineNo } = req.query;
+    if (!startDate || !endDate || !lineNo) {
+      return res.status(400).json({
+        success: false,
+        error: "startDate, endDate and lineNo parameters required"
+      });
+    }
+
+    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+
+    const query = `
+      WITH packing_sewed AS (
+        SELECT
+          lr.id AS run_id,
+          lr.run_date,
+          lr.style,
+          lr.operators_count,
+          lr.working_hours,
+          lr.sam_minutes,
+          lr.target_pcs,
+          COALESCE(SUM(se.sewed_qty), 0) AS total_sewed
+        FROM line_runs lr
+        LEFT JOIN run_operators ro ON lr.id = ro.run_id
+        LEFT JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date BETWEEN $1 AND $2
+          AND lr.line_no = $3
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%' OR oo.operation_name IS NULL)
+        GROUP BY lr.id, lr.run_date, lr.style, lr.operators_count, lr.working_hours, lr.sam_minutes, lr.target_pcs
+      ),
+      day_aggregates AS (
+        SELECT
+          run_date,
+          SUM(total_sewed) AS total_sewed,
+          SUM(target_pcs) AS total_target,
+          SUM(operators_count * working_hours * 60) AS total_available_minutes,
+          SUM(total_sewed * sam_minutes) AS total_sam_output,
+          STRING_AGG(DISTINCT style, ', ') AS styles
+        FROM packing_sewed
+        GROUP BY run_date
+      )
+      SELECT
+        to_char(run_date, 'YYYY-MM-DD') AS date,
+        total_sewed AS produced,
+        total_target AS target,
+        total_available_minutes AS available_minutes,
+        total_sam_output AS sam_output,
+        styles AS style,
+        CASE
+          WHEN total_available_minutes > 0
+          THEN (total_sam_output / total_available_minutes) * 100
+          ELSE 0
+        END AS efficiency
+      FROM day_aggregates
+      ORDER BY run_date ASC
+    `;
+
+    const result = await client.query(query, [startDate, endDate, String(lineNo)]);
+
+    const history = result.rows.map(row => ({
+      date: row.date,
+      produced: parseFloat(row.produced) || 0,
+      target: parseFloat(row.target) || 0,
+      availableMinutes: parseFloat(row.available_minutes) || 0,
+      samOutput: parseFloat(row.sam_output) || 0,
+      style: row.style || '',
+      efficiency: parseFloat(row.efficiency) || 0
+    }));
+
+    res.json({
+      success: true,
+      lineNo: String(lineNo),
+      period: { startDate, endDate },
+      history
+    });
+  } catch (err) {
+    console.error("❌ Error fetching line efficiency history:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
 /**
  * GET /api/skyrina/style-efficiency-sam?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
  * Returns style efficiency calculated using SAM (standard allowed minutes)
