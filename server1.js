@@ -1324,6 +1324,134 @@ app.post(
   }
 );
 
+// Códigos válidos (deben coincidir con EFFICIENCY_REASONS en LineLeaderPage.jsx)
+const EFFICIENCY_REASON_CODES = [
+  "materials_missing", "trims_missing", "absents",
+  "machine_no_function", "change_style", "others",
+];
+
+// GET: ¿ya hay un motivo guardado para esta corrida?
+app.get(
+  "/api/lineleader/efficiency-reason/:runId",
+  authenticateToken,
+  allowRoles("line_leader", "engineer", "supervisor", "skyrina", "master", "soporte_it"),
+  validate([param("runId").isInt({ gt: 0 }).withMessage("Valid run ID required")]),
+  async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const r = await client.query(
+        `SELECT id, run_id, line_no, to_char(run_date, 'YYYY-MM-DD') AS run_date,
+                jefe_linea_id, jefe_linea_name, efficiency, reasons, note,
+                created_at, updated_at
+           FROM efficiency_reasons
+          WHERE run_id = $1`,
+        [req.params.runId]
+      );
+      res.json({ success: true, reason: r.rows[0] || null });
+    } catch (err) { next(err); } finally { client.release(); }
+  }
+);
+
+// POST: guardar / actualizar el motivo de baja eficiencia de una corrida.
+app.post(
+  "/api/lineleader/efficiency-reason/:runId",
+  authenticateToken,
+  allowRoles("line_leader", "engineer", "supervisor"),
+  validate([
+    param("runId").isInt({ gt: 0 }).withMessage("Valid run ID required"),
+    body("reasons").isArray({ min: 1 }).withMessage("Selecciona al menos un motivo"),
+  ]),
+  async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { runId } = req.params;
+      const { reasons, note, efficiency } = req.body;
+
+      const runRes = await client.query(
+        `SELECT line_no, to_char(run_date, 'YYYY-MM-DD') AS run_date
+           FROM line_runs WHERE id = $1`,
+        [runId]
+      );
+      if (runRes.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "Run not found" });
+      }
+      const run = runRes.rows[0];
+
+      if (req.user.role === "line_leader" &&
+          String(run.line_no) !== String(req.user.line_number)) {
+        return res.status(403).json({ success: false, error: "You can only update your own line" });
+      }
+
+      const cleanReasons = [...new Set((reasons || []).map(String))].filter((code) =>
+        EFFICIENCY_REASON_CODES.includes(code)
+      );
+      if (cleanReasons.length === 0) {
+        return res.status(400).json({ success: false, error: "Motivos inválidos" });
+      }
+
+      const effNum =
+        efficiency === undefined || efficiency === null || efficiency === ""
+          ? null : Number(efficiency);
+
+      const result = await client.query(
+        `INSERT INTO efficiency_reasons
+           (run_id, line_no, run_date, jefe_linea_id, jefe_linea_name,
+            efficiency, reasons, note, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+         ON CONFLICT (run_id) DO UPDATE SET
+           reasons = EXCLUDED.reasons,
+           note = EXCLUDED.note,
+           efficiency = EXCLUDED.efficiency,
+           jefe_linea_id = EXCLUDED.jefe_linea_id,
+           jefe_linea_name = EXCLUDED.jefe_linea_name,
+           updated_at = NOW()
+         RETURNING id, run_id, line_no, to_char(run_date, 'YYYY-MM-DD') AS run_date,
+                   jefe_linea_id, jefe_linea_name, efficiency, reasons, note,
+                   created_at, updated_at`,
+        [runId, run.line_no, run.run_date, req.user.id,
+         req.user.full_name || req.user.username, effNum, cleanReasons,
+         note ? String(note).trim() : null]
+      );
+
+      logger.info("Efficiency reason saved", {
+        runId, line_no: run.line_no, run_date: run.run_date,
+        jefe_linea: req.user.full_name || req.user.username, reasons: cleanReasons,
+      });
+
+      res.json({ success: true, reason: result.rows[0] });
+    } catch (err) { next(err); } finally { client.release(); }
+  }
+);
+
+// GET (lista): motivos por fecha y/o línea, para supervisores / tableros.
+app.get(
+  "/api/efficiency-reasons",
+  authenticateToken,
+  async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { date, line } = req.query;
+      const params = [];
+      const conds = [];
+      if (date) { params.push(date); conds.push(`run_date = $${params.length}`); }
+      if (line) { params.push(String(line)); conds.push(`line_no = $${params.length}`); }
+      const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+      const r = await client.query(
+        `SELECT id, run_id, line_no, to_char(run_date, 'YYYY-MM-DD') AS run_date,
+                jefe_linea_name, efficiency, reasons, note, updated_at
+           FROM efficiency_reasons ${where}
+          ORDER BY run_date DESC, line_no ASC`,
+        params
+      );
+      res.json({ success: true, reasons: r.rows });
+    } catch (err) { next(err); } finally { client.release(); }
+  }
+);
+
+
 // ============================================================================
 // VERIFICADOR — corrección de la captura por hora del líder de línea
 // ----------------------------------------------------------------------------
