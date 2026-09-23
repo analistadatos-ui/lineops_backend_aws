@@ -17,6 +17,13 @@
 //      • The LINE of every order is kept. Only the days (and cell quantities) change.
 //      • Order sequence per line = current sequence (first day it appears), or
 //        by delivery date if `sequence = "commitment"`.
+//      • Orders of the SAME style + color on a line are combined into one block:
+//        packed back-to-back and counted as ONE order for the per-day limit, so
+//        the family uses the fewest possible days (each work order keeps its
+//        own row in line_assignments — they can't be merged in the DB).
+//      • WHOLE PIECES only: every cell is an integer (401, never 401.01). Each
+//        order's total is rounded to whole pieces (e.g. 3,301.41 → 3,301) and
+//        the free capacity of a day is rounded down.
 //      • At most `maxOrdersPerDay` different orders per line-day (default 2).
 //        A 3rd order goes to the next working day even if capacity is left.
 //        Fixed orders and PRE-order holds on that day count toward the limit.
@@ -66,6 +73,12 @@ const fromC = (c) => Math.round(c) / 100;
 
 const sha1 = (s) => crypto.createHash("sha1").update(s).digest("hex");
 const groupKey = (lineNo, woId, color) => `${lineNo}|${woId}|${color ?? ""}`;
+// Style + color family on a line. Without a style the order stands alone.
+const familyKey = (lineNo, style, color, woId) => {
+  const st = String(style || "").trim().toUpperCase();
+  return st ? `${lineNo}|F|${st}|${String(color ?? "").trim().toUpperCase()}` : `${lineNo}|${woId}|${color ?? ""}`;
+};
+const PIECE = 100; // one whole piece in hundredths
 
 const MAX_SPILL_WORKDAYS = 400; // safety horizon for spill-over
 
@@ -129,17 +142,19 @@ function packLine({ days, capC, fixedC, groups, nextDay, maxDays = MAX_SPILL_WOR
       const d = dayAt(i);
       if (d == null) break;
       const cap = capC(d);
-      const free = cap - usedOf(d);
+      // Whole pieces only: free capacity rounded down to a full piece.
+      const free = Math.floor((cap - usedOf(d)) / PIECE) * PIECE;
       if (free <= 0) { i++; continue; }
+      const fam = g.family || g.key;
       const onDay = ordersOf(d);
       // Day already has the maximum number of different orders → next day.
-      if (!onDay.has(g.key) && onDay.size >= limit) { i++; continue; }
+      if (!onDay.has(fam) && onDay.size >= limit) { i++; continue; }
       const q = Math.min(rem, free);
       placements.push({ key: g.key, date: d, qtyC: q });
       used.set(d, usedOf(d) + q);
-      onDay.add(g.key);
+      onDay.add(fam);
       rem -= q;
-      if (usedOf(d) >= cap) i++; // day full → next order/pieces continue tomorrow
+      if (cap - usedOf(d) < PIECE) i++; // day full → next pieces continue tomorrow
     }
     if (rem > 0) unplaced.push({ key: g.key, qtyC: rem });
   }
@@ -298,7 +313,7 @@ async function buildPlan(client, deps, { fromDate, toDate, lines, sequence, maxO
     for (const r of fixedRows) {
       if (r.line_no !== ln) continue;
       if (!fixedOrdersByDay.has(r.assigned_date)) fixedOrdersByDay.set(r.assigned_date, new Set());
-      fixedOrdersByDay.get(r.assigned_date).add(groupKey(ln, r.work_order_id, r.color));
+      fixedOrdersByDay.get(r.assigned_date).add(familyKey(ln, r.style_code || r.estilo, r.color, r.work_order_id));
     }
     const fixedOrders = (d) => {
       const set = new Set(fixedOrdersByDay.get(d) || []);
@@ -317,6 +332,7 @@ async function buildPlan(client, deps, { fromDate, toDate, lines, sequence, maxO
         g = {
           key: k, lineNo: ln, workOrderId: Number(r.work_order_id), color: r.color ?? null,
           workOrderNo: r.work_order_no, customer: r.customer_name, styleCode: r.style_code || r.estilo || "",
+          family: familyKey(ln, r.style_code || r.estilo, r.color, r.work_order_id),
           commitmentDate: r.commitment_date || null, sam: parseFloat(r.wo_sam) || 0,
           firstDate: r.assigned_date, minId: Number(r.id), priority: Number(r.priority) || 0,
           qtyC: 0, before: new Map(), rowIds: [],
@@ -330,19 +346,27 @@ async function buildPlan(client, deps, { fromDate, toDate, lines, sequence, maxO
       if (Number(r.id) < g.minId) g.minId = Number(r.id);
       g.priority = Math.max(g.priority, Number(r.priority) || 0);
     }
+    // Whole pieces: each order's total rounded to an integer (0.28 → 0 is dropped).
+    for (const g of gm.values()) {
+      g.rawQtyC = g.qtyC;
+      g.qtyC = Math.round(g.qtyC / PIECE) * PIECE;
+    }
     const groups = [...gm.values()].filter((g) => g.qtyC > 0);
+    const dropped = [...gm.values()].filter((g) => g.qtyC <= 0);
     const byCurrent = (a, b) =>
       (a.firstDate < b.firstDate ? -1 : a.firstDate > b.firstDate ? 1 : 0) ||
       (b.priority - a.priority) || (a.minId - b.minId);
-    if (sequence === "commitment") {
-      groups.sort((a, b) => {
-        const ca = a.commitmentDate || "9999-12-31";
-        const cb = b.commitmentDate || "9999-12-31";
-        return (ca < cb ? -1 : ca > cb ? 1 : 0) || byCurrent(a, b);
-      });
-    } else {
-      groups.sort(byCurrent);
-    }
+    const byCommit = (a, b) => {
+      const ca = a.commitmentDate || "9999-12-31";
+      const cb = b.commitmentDate || "9999-12-31";
+      return (ca < cb ? -1 : ca > cb ? 1 : 0) || byCurrent(a, b);
+    };
+    const cmp = sequence === "commitment" ? byCommit : byCurrent;
+    // Families stay together: order families by their first member, then members.
+    groups.sort(cmp);
+    const famFirst = new Map();
+    groups.forEach((g, i) => { if (!famFirst.has(g.family)) famFirst.set(g.family, i); });
+    groups.sort((a, b) => (famFirst.get(a.family) - famFirst.get(b.family)) || cmp(a, b));
     if (!groups.length) continue;
 
     const { placements, unplaced } = packLine({
@@ -371,8 +395,8 @@ async function buildPlan(client, deps, { fromDate, toDate, lines, sequence, maxO
       for (const g of groups) {
         const b = g.before.get(d) || 0, a = afterByGroup.get(g.key)?.get(d) || 0;
         before += b; after += a;
-        if (b > 0) ob.add(g.key);
-        if (a > 0) oa.add(g.key);
+        if (b > 0) ob.add(g.family);
+        if (a > 0) oa.add(g.family);
       }
       const lim = maxOrdersPerDay > 0 ? maxOrdersPerDay : Infinity;
       return {
@@ -388,6 +412,8 @@ async function buildPlan(client, deps, { fromDate, toDate, lines, sequence, maxO
       const cellsAfter = [...aft.entries()].sort().map(([d, c]) => ({ date: d, qty: fromC(c) }));
       return {
         seq: idx + 1, key: g.key, workOrderId: g.workOrderId, workOrderNo: g.workOrderNo, color: g.color,
+        family: g.family, familySize: groups.filter((x) => x.family === g.family).length,
+        rawTotalBefore: fromC(g.rawQtyC),
         customer: g.customer, styleCode: g.styleCode, commitmentDate: g.commitmentDate,
         totalBefore: fromC(g.qtyC),
         totalAfter: fromC([...aft.values()].reduce((s, c) => s + c, 0)),
@@ -405,6 +431,8 @@ async function buildPlan(client, deps, { fromDate, toDate, lines, sequence, maxO
       cellsBefore: groups.reduce((s, g) => s + g.before.size, 0),
       cellsAfter: placements.length,
       spillPieces: fromC(placements.filter((p) => p.date > toDate).reduce((s, p) => s + p.qtyC, 0)),
+      roundingDelta: fromC([...gm.values()].reduce((s, g) => s + (g.qtyC - g.rawQtyC), 0)),
+      droppedFractions: dropped.map((g) => ({ workOrderNo: g.workOrderNo, color: g.color, qty: fromC(g.rawQtyC) })),
       unplacedPieces: fromC(unplaced.reduce((s, u) => s + u.qtyC, 0)),
     });
   }
@@ -426,7 +454,10 @@ function summarize(plan) {
               tooManyDaysBefore: 0, tooManyDaysAfter: 0 };
   for (const l of plan.lines) {
     s.orders += l.orders.length;
-    s.piecesBefore += l.orders.reduce((a, o) => a + o.totalBefore, 0);
+    s.piecesBefore += l.orders.reduce((a, o) => a + o.rawTotalBefore, 0) + l.droppedFractions.reduce((a, x) => a + x.qty, 0);
+    s.piecesTarget = (s.piecesTarget || 0) + l.orders.reduce((a, o) => a + o.totalBefore, 0);
+    s.roundingDelta = (s.roundingDelta || 0) + l.roundingDelta;
+    s.fractionalCells = (s.fractionalCells || 0) + l.orders.reduce((a, o) => a + o.cellsAfter.filter((c) => !Number.isInteger(c.qty)).length, 0);
     s.piecesAfter += l.orders.reduce((a, o) => a + o.totalAfter, 0);
     s.cellsBefore += l.cellsBefore;
     s.cellsAfter += l.cellsAfter;
@@ -442,7 +473,11 @@ function summarize(plan) {
   s.piecesAfter = Math.round(s.piecesAfter * 100) / 100;
   s.spillPieces = Math.round(s.spillPieces * 100) / 100;
   s.unplacedPieces = Math.round(s.unplacedPieces * 100) / 100;
-  s.piecesConserved = toC(s.piecesBefore) === toC(s.piecesAfter);
+  s.piecesTarget = Math.round((s.piecesTarget || 0) * 100) / 100;
+  s.roundingDelta = Math.round((s.roundingDelta || 0) * 100) / 100;
+  s.fractionalCells = s.fractionalCells || 0;
+  // Exact: every order ends with its whole-piece total, nothing more, nothing less.
+  s.piecesConserved = toC(s.piecesTarget) === toC(s.piecesAfter) && s.fractionalCells === 0;
   return s;
 }
 
@@ -565,11 +600,17 @@ module.exports = function registerPlanRebalance(app, deps) {
 
       // 1) SNAPSHOT of the current state.
       const rowsBefore = plan.all.map(({ work_order_no, customer_name, style_code, estilo, commitment_date, wo_sam, ...r }) => r);
-      const before = new Map(); // group -> hundredths (planned rows >= fromDate, whole horizon)
+      // Expected planned pieces per (line, order, color) after the write:
+      // untouched planned rows (after "Hasta") as they are + moved orders rounded to whole pieces.
+      const moveIdSet = new Set(plan.moveRows.map((r) => Number(r.id)));
+      const before = new Map();
       for (const r of rowsBefore) {
-        if (r.status !== "planned") continue;
+        if (r.status !== "planned" || moveIdSet.has(Number(r.id))) continue;
         const k = groupKey(r.line_no, r.work_order_id, r.color);
         before.set(k, (before.get(k) || 0) + toC(r.assigned_quantity));
+      }
+      for (const { groups } of plan.placementsByLine.values()) {
+        for (const g of groups) before.set(g.key, (before.get(g.key) || 0) + g.qtyC);
       }
 
       // 2) Remove the rows being redistributed.
@@ -660,11 +701,16 @@ module.exports = function registerPlanRebalance(app, deps) {
           const dayList = [...touchedDays.values()].filter((t) => t.lineNo === l.lineNo).map((t) => t.date);
           if (!dayList.length) continue;
           const cnt = await client.query(
-            `SELECT to_char(assigned_date, 'YYYY-MM-DD') AS d,
-                    COUNT(DISTINCT (work_order_id::text || '|' || COALESCE(color, ''))) AS n
-               FROM line_assignments
-              WHERE line_no::text = $1 AND assigned_date = ANY($2::date[])
-                AND status::text NOT IN ('cancelled', 'rejected')
+            `SELECT to_char(la.assigned_date, 'YYYY-MM-DD') AS d,
+                    COUNT(DISTINCT CASE
+                      WHEN NULLIF(TRIM(COALESCE(wo.style_code, wo.estilo, '')), '') IS NULL
+                        THEN 'WO' || la.work_order_id::text || '|' || COALESCE(la.color, '')
+                      ELSE 'F' || UPPER(TRIM(COALESCE(wo.style_code, wo.estilo))) || '|' || UPPER(TRIM(COALESCE(la.color, '')))
+                    END) AS n
+               FROM line_assignments la
+               JOIN work_orders wo ON wo.id = la.work_order_id
+              WHERE la.line_no::text = $1 AND la.assigned_date = ANY($2::date[])
+                AND la.status::text NOT IN ('cancelled', 'rejected')
               GROUP BY 1`,
             [l.lineNo, dayList]
           );
@@ -672,7 +718,7 @@ module.exports = function registerPlanRebalance(app, deps) {
             const holdSlot = (plan.holdsC.get(`${l.lineNo}|${r.d}`) || 0) > 0 ? 1 : 0;
             const fixedN = new Set(plan.fixedRows
               .filter((x) => x.line_no === l.lineNo && x.assigned_date === r.d)
-              .map((x) => `${x.work_order_id}|${x.color ?? ""}`)).size + holdSlot;
+              .map((x) => familyKey(l.lineNo, x.style_code || x.estilo, x.color, x.work_order_id))).size + holdSlot;
             const n = Number(r.n) + holdSlot;
             if (n > Math.max(params.maxOrdersPerDay, fixedN)) {
               tooMany.push({ lineNo: l.lineNo, date: r.d, orders: n, max: params.maxOrdersPerDay });
@@ -680,12 +726,16 @@ module.exports = function registerPlanRebalance(app, deps) {
           }
         }
       }
-      if (mismatches.length || overloads.length || tooMany.length) {
+      const fractional = [];
+      for (const { placements } of plan.placementsByLine.values()) {
+        for (const p of placements) if (p.qtyC % PIECE !== 0) fractional.push(p);
+      }
+      if (mismatches.length || overloads.length || tooMany.length || fractional.length) {
         await client.query("ROLLBACK");
         return res.status(500).json({
           success: false,
           error: "Verificación fallida: no se aplicó ningún cambio.",
-          details: { mismatches: mismatches.slice(0, 50), overloads: overloads.slice(0, 50), tooMany: tooMany.slice(0, 50) },
+          details: { mismatches: mismatches.slice(0, 50), overloads: overloads.slice(0, 50), tooMany: tooMany.slice(0, 50), fractional: fractional.slice(0, 50) },
         });
       }
 
