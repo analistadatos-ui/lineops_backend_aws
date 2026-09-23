@@ -12,6 +12,7 @@ const { body, validationResult, param, query } = require("express-validator");
 const winston = require("winston");
 const fs = require("fs");
 const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl, generatePresignedPutUrl } = require("./s3-raw");
+const registerPlanRebalance = require("./plan-rebalance"); // ⚖️ snapshots + redistribución exacta del Plan Board
 const planWeekLocks = require("./plan-week-locks"); // 🔒 bloqueo de semanas del Plan Board (CEO)
 // ----------------------------------------------------------------------
 // 1. LOGGER (Winston)
@@ -633,6 +634,7 @@ await registerFinishedWarehouse.initSchema({ pool, setSchema });
 await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
 await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
 await planWeekLocks.initSchema({ pool, setSchema });   // 🔒 después de line_assignments
+await registerPlanRebalance.initSchema({ pool, setSchema }); // ⚖️ plan_board_snapshots
 
     // Create index for faster queries
     await client.query("CREATE INDEX IF NOT EXISTS idx_capacity_history_operation ON operator_capacity_history(operation_id);");
@@ -927,6 +929,13 @@ registerEfficiencyPermissions(app, { authenticateToken, pool, setSchema });
 
 // 🔒 Bloqueo de semanas del Plan Board. lockerRoles = roles que pueden bloquear.
 planWeekLocks(app, { authenticateToken, pool, setSchema, lockerRoles: ["ceo", "skyrina", "master"] });
+
+
+// ⚖️ Plan Board: snapshot + redistribución secuencial exacta (misma línea, días reempacados).
+registerPlanRebalance(app, {
+  authenticateToken, pool, setSchema, planWeekLocks, registerHolidays,
+  getLineCapacityForDate, mergeOrInsertAssignment, cleanupOrphanDraftRuns,
+});
 
 app.post("/api/logout", (req, res) => {
   res.json({ success: true, message: "Logged out successfully" });
