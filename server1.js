@@ -12,7 +12,6 @@ const { body, validationResult, param, query } = require("express-validator");
 const winston = require("winston");
 const fs = require("fs");
 const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl, generatePresignedPutUrl } = require("./s3-raw");
-const registerPlanRebalance = require("./plan-rebalance"); // ⚖️ snapshots + redistribución exacta del Plan Board
 const planWeekLocks = require("./plan-week-locks"); // 🔒 bloqueo de semanas del Plan Board (CEO)
 // ----------------------------------------------------------------------
 // 1. LOGGER (Winston)
@@ -932,10 +931,7 @@ planWeekLocks(app, { authenticateToken, pool, setSchema, lockerRoles: ["ceo", "s
 
 
 // ⚖️ Plan Board: snapshot + redistribución secuencial exacta (misma línea, días reempacados).
-registerPlanRebalance(app, {
-  authenticateToken, pool, setSchema, planWeekLocks, registerHolidays,
-  getLineCapacityForDate, mergeOrInsertAssignment, cleanupOrphanDraftRuns,
-});
+
 
 app.post("/api/logout", (req, res) => {
   res.json({ success: true, message: "Logged out successfully" });
