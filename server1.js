@@ -2997,6 +2997,31 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
       ).values(),
     ];
  
+    // 1b) Days on the TARGET line (>= D) that the selection empties completely.
+    //     When a whole order is selected (e.g. the auto-selected future cells of
+    //     one order), its old days free up. Rows AFTER a freed day need that many
+    //     fewer workdays of push, so the line closes the gap instead of leaving a
+    //     hole. A day still shared with an unselected order is not counted.
+    const Dstart = thisOrNextWorkday(assignedDate);
+    const selIdSet = new Set(selectedRows.map((r) => String(r.id)));
+    const occRes = await client.query(
+      `SELECT id, to_char(assigned_date, 'YYYY-MM-DD') AS d
+         FROM line_assignments
+        WHERE line_no = $1 AND assigned_date >= $2
+          AND status::text NOT IN ('cancelled', 'rejected')`,
+      [targetLine, Dstart]
+    );
+    const dayAllSelected = new Map(); // day -> true while every row that day is selected
+    for (const r of occRes.rows) {
+      const prev = dayAllSelected.has(r.d) ? dayAllSelected.get(r.d) : true;
+      dayAllSelected.set(r.d, prev && selIdSet.has(String(r.id)));
+    }
+    const vacatedDays = [...dayAllSelected.entries()]
+      .filter(([d, all]) => all && !isBlocked(d))
+      .map(([d]) => d)
+      .sort();
+    const vacatedBefore = (ymdStr) => vacatedDays.filter((v) => v < ymdStr).length;
+ 
     await client.query("DELETE FROM line_assignments WHERE id = ANY($1::bigint[])", [idList]);
  
     // 2) The N consecutive workday slots the newcomers will occupy, from D.
@@ -3006,10 +3031,12 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
     const D = slots[0];
     const lastSlot = slots[N - 1];
  
-    // 3) Push the planned tail of the target line (>= D) forward by N workdays,
-    //    latest-day first. Snapshot it first for undo. Shifting every tail row by
-    //    the same N workdays preserves inter-block spacing and clears slots
-    //    D..lastSlot for the newcomers.
+    // 3) Push the planned tail of the target line (>= D) forward, latest-day
+    //    first. Snapshot it first for undo. Each row moves N workdays minus the
+    //    number of days the selection vacated before it (1b), so gaps left by
+    //    the moved order are closed. The shift never grows with the date, so
+    //    order is preserved, rows can't collide, and slots D..lastSlot are
+    //    always clear for the newcomers.
     const tailRes = await client.query(
       `SELECT ${SNAP_COLS}
          FROM line_assignments
@@ -3018,15 +3045,19 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
       [targetLine, D]
     );
     const tailSnapshot = tailRes.rows;
+    let shiftedCount = 0;
     for (const row of tailSnapshot) {
+      const push = Math.max(0, N - vacatedBefore(row.assigned_date));
+      if (push === 0) continue; // already in place after the vacated days closed up
       let nd = row.assigned_date;
-      for (let k = 0; k < N; k++) nd = nextWorkday(nd);   // + N workdays
+      for (let k = 0; k < push; k++) nd = nextWorkday(nd);   // + (N - vacated) workdays
       await client.query(
         `UPDATE line_assignments
             SET assigned_date = $1, planned_start_date = $1, planned_end_date = $1, updated_at = now()
           WHERE id = $2`,
         [nd, row.id]
       );
+      shiftedCount++;
     }
  
     // 4) Place the N newcomers on slots[0..N-1] in selection order. Recompute the
@@ -3077,7 +3108,7 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
     res.json({
       success: true,
       inserted: createdIds.length,
-      shifted: tailSnapshot.length,
+      shifted: shiftedCount,
       firstDate: D,
       lastDate: lastSlot,
       undo: {
@@ -3097,7 +3128,6 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
     client.release();
   }
 });
-
 // ---------------------------------------------------------------------------
 // POST /api/line-assignments/insert-shift-undo
 //
