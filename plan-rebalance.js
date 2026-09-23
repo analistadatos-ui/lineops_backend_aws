@@ -17,6 +17,9 @@
 //      • The LINE of every order is kept. Only the days (and cell quantities) change.
 //      • Order sequence per line = current sequence (first day it appears), or
 //        by delivery date if `sequence = "commitment"`.
+//      • At most `maxOrdersPerDay` different orders per line-day (default 2).
+//        A 3rd order goes to the next working day even if capacity is left.
+//        Fixed orders and PRE-order holds on that day count toward the limit.
 //      • Weekends and holidays (plant-wide or per line) are skipped.
 //      • Rows that are NOT 'planned' (released / completed), pre-order holds and
 //        planned rows after `toDate` are FIXED: they keep their place and
@@ -26,7 +29,7 @@
 //      • Daily capacity = the SAME number the Plan Board shows / exports as
 //        "Capacidad línea/día" (sum of the line's runs on the most-recent
 //        configured day, CEO style efficiency overrides, planner-line fallback),
-//        rounded to whole pieces.
+//        rounded DOWN to whole pieces so a full day is never above 100%.
 //
 //    Accuracy guarantees (checked inside the transaction; any failure = ROLLBACK):
 //      • pieces per (line, order, color) before == after, to the cent
@@ -96,9 +99,17 @@ async function optional(client, fn, fallback) {
 //
 // Returns { placements: [{ key, date, qtyC }], unplaced: [{ key, qtyC }] }
 // ---------------------------------------------------------------------------
-function packLine({ days, capC, fixedC, groups, nextDay, maxDays = MAX_SPILL_WORKDAYS }) {
+function packLine({ days, capC, fixedC, groups, nextDay, maxDays = MAX_SPILL_WORKDAYS,
+                    maxOrdersPerDay = 0, fixedOrders = () => [] }) {
   const used = new Map(); // day -> hundredths used (fixed + placed)
   const usedOf = (d) => (used.has(d) ? used.get(d) : fixedC(d));
+  // day -> Set of order keys on that day (fixed ones + the ones we place)
+  const orders = new Map();
+  const ordersOf = (d) => {
+    if (!orders.has(d)) orders.set(d, new Set(fixedOrders(d)));
+    return orders.get(d);
+  };
+  const limit = Number.isInteger(maxOrdersPerDay) && maxOrdersPerDay > 0 ? maxOrdersPerDay : Infinity;
   const placements = [];
   const unplaced = [];
   let i = 0;
@@ -120,9 +131,13 @@ function packLine({ days, capC, fixedC, groups, nextDay, maxDays = MAX_SPILL_WOR
       const cap = capC(d);
       const free = cap - usedOf(d);
       if (free <= 0) { i++; continue; }
+      const onDay = ordersOf(d);
+      // Day already has the maximum number of different orders → next day.
+      if (!onDay.has(g.key) && onDay.size >= limit) { i++; continue; }
       const q = Math.min(rem, free);
       placements.push({ key: g.key, date: d, qtyC: q });
       used.set(d, usedOf(d) + q);
+      onDay.add(g.key);
       rem -= q;
       if (usedOf(d) >= cap) i++; // day full → next order/pieces continue tomorrow
     }
@@ -178,9 +193,9 @@ async function loadCapacityModel(client, lineNos) {
     if (list && list.length) {
       let chosen = null;
       for (const e of list) { if (e.d <= day) chosen = e; else break; }
-      return Math.round((chosen || list[0]).total);
+      return Math.floor((chosen || list[0]).total + 1e-6);
     }
-    return Math.round(planner.get(String(lineNo)) || 0);
+    return Math.floor((planner.get(String(lineNo)) || 0) + 1e-6);
   };
   return { capPcs };
 }
@@ -195,7 +210,7 @@ const SNAP_COLS = `la.id, la.work_order_id, la.line_run_id, la.line_no::text AS 
        to_char(la.planned_end_date, 'YYYY-MM-DD')   AS planned_end_date,
        la.priority, la.status::text AS status, la.color`;
 
-async function buildPlan(client, deps, { fromDate, toDate, lines, sequence }) {
+async function buildPlan(client, deps, { fromDate, toDate, lines, sequence, maxOrdersPerDay = 2 }) {
   // Lines in scope: requested ones, else every line with a planned row in range.
   let lineNos = Array.isArray(lines) && lines.length ? [...new Set(lines.map(String))] : null;
   if (!lineNos) {
@@ -278,6 +293,18 @@ async function buildPlan(client, deps, { fromDate, toDate, lines, sequence }) {
       fixedByDay.set(r.assigned_date, (fixedByDay.get(r.assigned_date) || 0) + toC(r.assigned_quantity));
     }
     const fixedC = (d) => (fixedByDay.get(d) || 0) + (holdsC.get(`${ln}|${d}`) || 0);
+    // Different orders already sitting on a day (fixed rows + one slot for PRE holds).
+    const fixedOrdersByDay = new Map();
+    for (const r of fixedRows) {
+      if (r.line_no !== ln) continue;
+      if (!fixedOrdersByDay.has(r.assigned_date)) fixedOrdersByDay.set(r.assigned_date, new Set());
+      fixedOrdersByDay.get(r.assigned_date).add(groupKey(ln, r.work_order_id, r.color));
+    }
+    const fixedOrders = (d) => {
+      const set = new Set(fixedOrdersByDay.get(d) || []);
+      if ((holdsC.get(`${ln}|${d}`) || 0) > 0) set.add(`${ln}|PRE-HOLD`);
+      return [...set];
+    };
     const capC = (d) => (blocked(d) ? 0 : capPcs(ln, d) * 100);
 
     // Groups = one per (order, color) on this line, in sequence.
@@ -318,7 +345,9 @@ async function buildPlan(client, deps, { fromDate, toDate, lines, sequence }) {
     }
     if (!groups.length) continue;
 
-    const { placements, unplaced } = packLine({ days, capC, fixedC, groups, nextDay: nextWorkday });
+    const { placements, unplaced } = packLine({
+      days, capC, fixedC, groups, nextDay: nextWorkday, maxOrdersPerDay, fixedOrders,
+    });
     placementsByLine.set(ln, { placements, groups });
     unplaced.forEach((u) => unplacedAll.push({ ...u, lineNo: ln }));
 
@@ -337,14 +366,21 @@ async function buildPlan(client, deps, { fromDate, toDate, lines, sequence }) {
       const cap = capC(d);
       const fixed = fixedC(d);
       let before = fixed, after = fixed;
+      const fo = fixedOrders(d);
+      const ob = new Set(fo), oa = new Set(fo);
       for (const g of groups) {
-        before += g.before.get(d) || 0;
-        after += afterByGroup.get(g.key)?.get(d) || 0;
+        const b = g.before.get(d) || 0, a = afterByGroup.get(g.key)?.get(d) || 0;
+        before += b; after += a;
+        if (b > 0) ob.add(g.key);
+        if (a > 0) oa.add(g.key);
       }
+      const lim = maxOrdersPerDay > 0 ? maxOrdersPerDay : Infinity;
       return {
         date: d, inRange: d >= fromDate && d <= toDate, blocked: blocked(d),
         capacity: fromC(cap), fixed: fromC(fixed), before: fromC(before), after: fromC(after),
         overBefore: before > cap, overAfter: after > cap && after > fixed,
+        ordersBefore: ob.size, ordersAfter: oa.size,
+        tooManyBefore: ob.size > lim, tooManyAfter: oa.size > lim && oa.size > fo.length,
       };
     });
     const orders = groups.map((g, idx) => {
@@ -379,14 +415,15 @@ async function buildPlan(client, deps, { fromDate, toDate, lines, sequence }) {
     .map((r) => `${r.id}|${r.line_no}|${r.assigned_date}|${toC(r.assigned_quantity)}|${r.status}|${r.color ?? ""}`)
     .sort();
   const fpHolds = [...holdsC.entries()].map(([k, v]) => `${k}|${v}`).sort();
-  const inputFingerprint = sha1(JSON.stringify({ fromDate, toDate, lineNos, sequence, fpRows, fpHolds }));
+  const inputFingerprint = sha1(JSON.stringify({ fromDate, toDate, lineNos, sequence, maxOrdersPerDay, fpRows, fpHolds }));
 
   return { lineNos, lines: outLines, placementsByLine, moveRows, fixedRows, all, holdsC, inputFingerprint, unplaced: unplacedAll };
 }
 
 function summarize(plan) {
   const s = { lines: plan.lines.length, orders: 0, piecesBefore: 0, piecesAfter: 0, cellsBefore: 0, cellsAfter: 0,
-              overDaysBefore: 0, overDaysAfter: 0, spillPieces: 0, unplacedPieces: 0, lateOrders: 0 };
+              overDaysBefore: 0, overDaysAfter: 0, spillPieces: 0, unplacedPieces: 0, lateOrders: 0,
+              tooManyDaysBefore: 0, tooManyDaysAfter: 0 };
   for (const l of plan.lines) {
     s.orders += l.orders.length;
     s.piecesBefore += l.orders.reduce((a, o) => a + o.totalBefore, 0);
@@ -395,6 +432,8 @@ function summarize(plan) {
     s.cellsAfter += l.cellsAfter;
     s.overDaysBefore += l.days.filter((d) => d.overBefore && d.inRange).length;
     s.overDaysAfter += l.days.filter((d) => d.overAfter).length;
+    s.tooManyDaysBefore += l.days.filter((d) => d.tooManyBefore && d.inRange).length;
+    s.tooManyDaysAfter += l.days.filter((d) => d.tooManyAfter).length;
     s.spillPieces += l.spillPieces;
     s.unplacedPieces += l.unplacedPieces;
     s.lateOrders += l.orders.filter((o) => o.lateVsCommitment).length;
@@ -448,7 +487,10 @@ module.exports = function registerPlanRebalance(app, deps) {
     if (addDaysStr(fromDate, 62) < toDate) throw Object.assign(new Error("El rango máximo es de 62 días"), { status: 400 });
     const lines = Array.isArray(b.lines) ? b.lines.map(String).filter(Boolean) : null;
     const sequence = b.sequence === "commitment" ? "commitment" : "current";
-    return { fromDate, toDate, lines, sequence };
+    // 0 = sin límite. Default 2 órdenes por línea/día.
+    let maxOrdersPerDay = b.maxOrdersPerDay == null ? 2 : parseInt(b.maxOrdersPerDay, 10);
+    if (!Number.isInteger(maxOrdersPerDay) || maxOrdersPerDay < 0 || maxOrdersPerDay > 20) maxOrdersPerDay = 2;
+    return { fromDate, toDate, lines, sequence, maxOrdersPerDay };
   };
   const fail = (res, err) => {
     if (planWeekLocks?.isLockError?.(err)) return planWeekLocks.sendLocked(res, err);
@@ -611,12 +653,39 @@ module.exports = function registerPlanRebalance(app, deps) {
           if (load > cap) overloads.push({ lineNo: l.lineNo, date: r.d, load: fromC(load), capacity: fromC(cap) });
         }
       }
-      if (mismatches.length || overloads.length) {
+      // Max different orders per line-day on every day we wrote to.
+      const tooMany = [];
+      if (params.maxOrdersPerDay > 0) {
+        for (const l of plan.lines) {
+          const dayList = [...touchedDays.values()].filter((t) => t.lineNo === l.lineNo).map((t) => t.date);
+          if (!dayList.length) continue;
+          const cnt = await client.query(
+            `SELECT to_char(assigned_date, 'YYYY-MM-DD') AS d,
+                    COUNT(DISTINCT (work_order_id::text || '|' || COALESCE(color, ''))) AS n
+               FROM line_assignments
+              WHERE line_no::text = $1 AND assigned_date = ANY($2::date[])
+                AND status::text NOT IN ('cancelled', 'rejected')
+              GROUP BY 1`,
+            [l.lineNo, dayList]
+          );
+          for (const r of cnt.rows) {
+            const holdSlot = (plan.holdsC.get(`${l.lineNo}|${r.d}`) || 0) > 0 ? 1 : 0;
+            const fixedN = new Set(plan.fixedRows
+              .filter((x) => x.line_no === l.lineNo && x.assigned_date === r.d)
+              .map((x) => `${x.work_order_id}|${x.color ?? ""}`)).size + holdSlot;
+            const n = Number(r.n) + holdSlot;
+            if (n > Math.max(params.maxOrdersPerDay, fixedN)) {
+              tooMany.push({ lineNo: l.lineNo, date: r.d, orders: n, max: params.maxOrdersPerDay });
+            }
+          }
+        }
+      }
+      if (mismatches.length || overloads.length || tooMany.length) {
         await client.query("ROLLBACK");
         return res.status(500).json({
           success: false,
           error: "Verificación fallida: no se aplicó ningún cambio.",
-          details: { mismatches: mismatches.slice(0, 50), overloads: overloads.slice(0, 50) },
+          details: { mismatches: mismatches.slice(0, 50), overloads: overloads.slice(0, 50), tooMany: tooMany.slice(0, 50) },
         });
       }
 
