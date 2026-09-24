@@ -16,9 +16,13 @@
 // fractions add up to 1, so a 20-operator style and a 35-operator style can
 // share a day correctly.
 //
+// Changing a style's standard RE-PLANS every future planned cell (and pre-order
+// hold) of that style on every line — see recomputeStyle().
+//
 // SETUP (server1.js)
 //   const plannerStyleParams = require("./planner-style-params");
-//   plannerStyleParams(app, { authenticateToken, pool, setSchema });
+//   plannerStyleParams(app, { authenticateToken, pool, setSchema,
+//                             holidays: registerHolidays, planWeekLocks });
 //   // in the migrations block:
 //   await plannerStyleParams.initSchema({ pool, setSchema });
 // The tables are also created lazily on first use, so the module works even
@@ -239,8 +243,218 @@ function styleParamsRequired(res, style) {
   });
 }
 
+// ---- recompute: re-plan every future cell of a style after its standard changes
+//
+// When the planner changes a style's SAM / operators / hours / efficiency, every
+// FUTURE planned cell of that style, on every line, is re-packed with the new
+// pieces/day:
+//   • what moves: line_assignments with status 'planned' and pre-order holds
+//     dated from TOMORROW on. Today and past days are never touched, nor are
+//     released / completed cells (already with the line leaders); they still
+//     occupy their share of the day.
+//   • per line, each order (work order + color, or pre-order + color) keeps its
+//     START day and its total pieces, then is laid out again day by day: skip
+//     weekends and holidays, fill the free room left by other styles, spill
+//     the rest forward. Orders keep their original sequence (earliest first).
+//   • standard went DOWN → the style runs over more days; went UP → fewer days.
+//   • pieces that no longer fit within the horizon go back to the pool
+//     (assignments) / stay unreserved (holds) and are reported.
+// Other styles' cells are never moved.
+const RECOMPUTE_HORIZON_DAYS = 540;
+
+const ymdAdd = (ymdStr, n) => {
+  const [y, m, d] = ymdStr.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+};
+const ymdWeekend = (ymdStr) => {
+  const [y, m, d] = ymdStr.split("-").map(Number);
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  return dow === 0 || dow === 6;
+};
+
+async function recomputeStyle(client, style, { holidays = null } = {}) {
+  const key = normStyle(style);
+  const params = await getParams(client, key);
+  if (!params) return { style: key, recomputed: false, reason: "no-standard" };
+  const target = targetOf(params);
+  const minutes = effectiveMinutesOf(params);
+  if (!(target > 0)) return { style: key, recomputed: false, reason: "zero-target" };
+
+  // Re-plan window starts TOMORROW: from's and past cells stay exactly as they are.
+  const from = (await client.query("SELECT to_char(CURRENT_DATE + 1, 'YYYY-MM-DD') AS d")).rows[0].d;
+  const STYLE_OF_WO = `UPPER(TRIM(COALESCE(NULLIF(TRIM(wo.style_code), ''), NULLIF(TRIM(wo.estilo), ''), '')))`;
+
+  // Future planned cells of this style (locked so nobody edits them meanwhile).
+  const aRows = (await client.query(
+    `SELECT la.id, la.work_order_id, la.line_no, la.color,
+            to_char(la.assigned_date, 'YYYY-MM-DD') AS d, la.assigned_quantity::float AS qty
+       FROM line_assignments la
+       JOIN work_orders wo ON wo.id = la.work_order_id
+      WHERE la.status = 'planned'
+        AND la.assigned_date >= $2::date
+        AND ${STYLE_OF_WO} = $1
+      ORDER BY la.line_no, la.assigned_date, la.id
+      FOR UPDATE OF la`,
+    [key, from]
+  )).rows;
+
+  let hRows = [];
+  if (await holdsTableExists(client)) {
+    hRows = (await client.query(
+      `SELECT h.id, h.pre_order_id, h.line_no, h.color, h.pre_order_no, h.customer_name,
+              h.style_code, h.estilo, h.created_by,
+              to_char(h.assigned_date, 'YYYY-MM-DD') AS d, h.quantity::float AS qty
+         FROM pre_order_day_holds h
+         LEFT JOIN pre_orders po ON po.id = h.pre_order_id
+        WHERE h.assigned_date >= $2::date
+          AND UPPER(TRIM(COALESCE(NULLIF(TRIM(h.style_code), ''), NULLIF(TRIM(po.style_code), ''),
+                                  NULLIF(TRIM(h.estilo), ''), NULLIF(TRIM(po.estilo), ''), ''))) = $1
+        ORDER BY h.line_no, h.assigned_date, h.id
+        FOR UPDATE OF h`,
+      [key, from]
+    )).rows;
+  }
+
+  const summary = {
+    style: key, recomputed: true, from, target_pcs: Math.round(target * 100) / 100,
+    cellsBefore: aRows.length + hRows.length, cellsAfter: 0, lines: [], unplaced: [],
+  };
+  if (!aRows.length && !hRows.length) return summary;
+
+  // Group into "units" per line: one unit = one order (+color) on that line.
+  const lines = new Map(); // line_no -> Map(unitKey -> unit)
+  const unitOf = (lineNo, k, init) => {
+    if (!lines.has(lineNo)) lines.set(lineNo, new Map());
+    const m = lines.get(lineNo);
+    if (!m.has(k)) m.set(k, { ...init, start: null, total: 0, firstId: Infinity, days: [] });
+    return m.get(k);
+  };
+  for (const r of aRows) {
+    const u = unitOf(String(r.line_no), `A|${r.work_order_id}|${r.color || ""}`,
+      { kind: "assignment", workOrderId: r.work_order_id, color: r.color });
+    u.total += r.qty; u.start = u.start && u.start < r.d ? u.start : r.d; u.firstId = Math.min(u.firstId, Number(r.id));
+    u.days.push({ d: r.d, qty: r.qty });
+  }
+  for (const r of hRows) {
+    const u = unitOf(String(r.line_no), `H|${r.pre_order_id}|${r.color || ""}`,
+      { kind: "hold", preOrderId: r.pre_order_id, color: r.color || "", meta: r });
+    u.total += r.qty; u.start = u.start && u.start < r.d ? u.start : r.d; u.firstId = Math.min(u.firstId, Number(r.id));
+    u.days.push({ d: r.d, qty: r.qty });
+  }
+
+  // Take them off the board, then lay them out again.
+  if (aRows.length) await client.query("DELETE FROM line_assignments WHERE id = ANY($1::bigint[])", [aRows.map((r) => r.id)]);
+  if (hRows.length) await client.query("DELETE FROM pre_order_day_holds WHERE id = ANY($1::bigint[])", [hRows.map((r) => r.id)]);
+
+  const horizonEnd = ymdAdd(from, RECOMPUTE_HORIZON_DAYS);
+  for (const [lineNo, unitsMap] of lines) {
+    // Holidays of this line (plant-wide rows too). Best-effort.
+    const blocked = new Set();
+    if (holidays?.holidaysBetween) {
+      try {
+        const hs = await holidays.holidaysBetween(client, { from, to: horizonEnd });
+        for (const h of hs) if (h.line_no == null || String(h.line_no) === lineNo) blocked.add(h.holiday_date);
+      } catch (e) { console.warn("⚠️  recompute: holidays not available:", e.message); }
+    }
+
+    const units = [...unitsMap.values()].sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : a.firstId - b.firstId));
+    // Free room per day for this style, AFTER removing its own cells.
+    const load = await lineLoadRange(client, { lineNo, from, to: horizonEnd, fallbackTarget: target });
+    const lineSummary = { line_no: lineNo, orders: units.length, daysBefore: 0, daysAfter: 0 };
+
+    for (const u of units) {
+      lineSummary.daysBefore += new Set(u.days.map((x) => x.d)).size;
+      let remaining = Math.round(u.total * 100) / 100;
+      let day = u.start < from ? from : u.start;
+      const placed = [];
+      while (remaining > 0.0001 && day <= horizonEnd) {
+        if (ymdWeekend(day) || blocked.has(day)) { day = ymdAdd(day, 1); continue; }
+        const free = Math.max(0, Math.floor((1 - (load.get(day) || 0)) * target + 1e-6));
+        if (free < 1) { day = ymdAdd(day, 1); continue; }
+        const chunk = Math.min(remaining, free);
+        placed.push({ d: day, qty: chunk });
+        load.set(day, (load.get(day) || 0) + chunk / target);
+        remaining = Math.round((remaining - chunk) * 100) / 100;
+        day = ymdAdd(day, 1);
+      }
+
+      const startD = placed[0]?.d || null;
+      const endD = placed[placed.length - 1]?.d || null;
+      for (const c of placed) {
+        if (u.kind === "assignment") {
+          await client.query(
+            `INSERT INTO line_assignments
+               (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+                available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
+             VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, 'planned', $9)`,
+            [u.workOrderId, lineNo, c.d, c.qty, minutes, target, startD, endD, u.color ?? null]
+          );
+        } else {
+          const m = u.meta;
+          await client.query(
+            `INSERT INTO pre_order_day_holds
+               (pre_order_id, line_no, assigned_date, quantity, color,
+                pre_order_no, customer_name, style_code, estilo, created_by, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())
+             ON CONFLICT (pre_order_id, line_no, assigned_date, color)
+             DO UPDATE SET quantity = pre_order_day_holds.quantity + EXCLUDED.quantity, updated_at = NOW()`,
+            [u.preOrderId, lineNo, c.d, c.qty, u.color, m.pre_order_no, m.customer_name, m.style_code, m.estilo, m.created_by]
+          );
+        }
+      }
+      summary.cellsAfter += placed.length;
+      lineSummary.daysAfter += placed.length;
+      if (remaining > 0.0001) {
+        summary.unplaced.push({
+          line_no: lineNo, kind: u.kind, qty: remaining,
+          ref: u.kind === "assignment" ? `WO ${u.workOrderId}` : (u.meta?.pre_order_no || `PRE ${u.preOrderId}`),
+          work_order_id: u.workOrderId ?? null, pre_order_id: u.preOrderId ?? null, color: u.color || null,
+        });
+      }
+    }
+    summary.lines.push(lineSummary);
+  }
+  return summary;
+}
+
+// Did a change touch the numbers that drive capacity (not just the notes)?
+const capacityChanged = (a, b) => !a || !b ||
+  Number(a.sam_minutes) !== Number(b.sam_minutes) ||
+  Number(a.operators_count) !== Number(b.operators_count) ||
+  Number(a.working_hours) !== Number(b.working_hours) ||
+  Number(a.efficiency) !== Number(b.efficiency);
+
+// Save (upsert + history) inside the caller's transaction. Returns { row, prev }.
+async function upsertParams(client, key, params, who) {
+  const prev = (await client.query("SELECT * FROM planner_style_params WHERE style_code = $1 FOR UPDATE", [key])).rows[0] || null;
+  const row = (await client.query(
+    `INSERT INTO planner_style_params
+       (style_code, sam_minutes, operators_count, working_hours, efficiency,
+        target_pcs, target_per_hour, notes, created_by, updated_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
+     ON CONFLICT (style_code) DO UPDATE SET
+       sam_minutes = EXCLUDED.sam_minutes, operators_count = EXCLUDED.operators_count,
+       working_hours = EXCLUDED.working_hours, efficiency = EXCLUDED.efficiency,
+       target_pcs = EXCLUDED.target_pcs, target_per_hour = EXCLUDED.target_per_hour,
+       notes = EXCLUDED.notes, updated_by = EXCLUDED.updated_by, updated_at = now()
+     RETURNING *`,
+    [key, params.sam_minutes, params.operators_count, params.working_hours, params.efficiency,
+     params.target_pcs, params.target_per_hour, params.notes, who]
+  )).rows[0];
+  await client.query(
+    `INSERT INTO planner_style_params_history
+       (style_code, action, sam_minutes, operators_count, working_hours, efficiency, target_pcs, notes, changed_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [key, prev ? "update" : "create", row.sam_minutes, row.operators_count,
+     row.working_hours, row.efficiency, row.target_pcs, row.notes, who]
+  );
+  return { row, prev };
+}
+
 // ---- routes ----------------------------------------------------------------
-function register(app, { authenticateToken, pool, setSchema }) {
+function register(app, { authenticateToken, pool, setSchema, holidays = null, planWeekLocks = null }) {
   const canWrite = (req, res, next) => {
     if (!WRITE_ROLES.includes(req.user?.role)) {
       return res.status(403).json({ success: false, error: "Solo el planeador puede modificar los estándares por estilo." });
@@ -299,8 +513,31 @@ function register(app, { authenticateToken, pool, setSchema }) {
     res.json({ success: true, history: r.rows });
   }));
 
+  // Runs the recompute inside a SAVEPOINT with the CEO week locks enforced: if
+  // it would touch a locked week, only the recompute is undone (the standard is
+  // still saved) and the response says so.
+  const recomputeSafely = async (client, key) => {
+    await client.query("SAVEPOINT recompute_style");
+    try {
+      if (planWeekLocks?.enforce) await planWeekLocks.enforce(client);
+      const r = await recomputeStyle(client, key, { holidays });
+      await client.query("RELEASE SAVEPOINT recompute_style");
+      return r;
+    } catch (err) {
+      await client.query("ROLLBACK TO SAVEPOINT recompute_style");
+      if (planWeekLocks?.isLockError?.(err)) {
+        return { style: key, recomputed: false, reason: "locked", error: err.message };
+      }
+      throw err;
+    }
+  };
+
   // Create or update a style standard (planner only).
-  // Body: { samMinutes, operatorsCount, workingHours, efficiency (0.85 | 85), notes? }
+  // Body: { samMinutes, operatorsCount, workingHours, efficiency (0.85 | 85), notes?,
+  //         recompute? (default true) }
+  // When SAM / operators / hours / efficiency change (or the style is new), every
+  // future planned cell of the style on every line is re-planned (recomputeStyle)
+  // in the same transaction. Response: { params, created, recompute: summary }.
   app.put("/api/planner/style-params/:style", authenticateToken, canWrite, withClient(async (client, req, res) => {
     const key = normStyle(req.params.style);
     if (!key) return res.status(400).json({ success: false, error: "Estilo requerido" });
@@ -308,43 +545,39 @@ function register(app, { authenticateToken, pool, setSchema }) {
     if (errors) return res.status(400).json({ success: false, error: errors.join(". ") });
 
     await client.query("BEGIN");
-    const prev = await client.query("SELECT 1 FROM planner_style_params WHERE style_code = $1 FOR UPDATE", [key]);
-    const row = (await client.query(
-      `INSERT INTO planner_style_params
-         (style_code, sam_minutes, operators_count, working_hours, efficiency,
-          target_pcs, target_per_hour, notes, created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
-       ON CONFLICT (style_code) DO UPDATE SET
-         sam_minutes = EXCLUDED.sam_minutes, operators_count = EXCLUDED.operators_count,
-         working_hours = EXCLUDED.working_hours, efficiency = EXCLUDED.efficiency,
-         target_pcs = EXCLUDED.target_pcs, target_per_hour = EXCLUDED.target_per_hour,
-         notes = EXCLUDED.notes, updated_by = EXCLUDED.updated_by, updated_at = now()
-       RETURNING *`,
-      [key, params.sam_minutes, params.operators_count, params.working_hours, params.efficiency,
-       params.target_pcs, params.target_per_hour, params.notes, who(req)]
-    )).rows[0];
-    await client.query(
-      `INSERT INTO planner_style_params_history
-         (style_code, action, sam_minutes, operators_count, working_hours, efficiency, target_pcs, notes, changed_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [key, prev.rowCount ? "update" : "create", row.sam_minutes, row.operators_count,
-       row.working_hours, row.efficiency, row.target_pcs, row.notes, who(req)]
-    );
-    // Keep the informational rate columns of FUTURE planned cells of this style in
-    // step with the new standard. Quantities are NOT re-packed: if the new
-    // standard makes a day over-full, the board shows it (>100%) for the planner.
-    const upd = await client.query(
-      `UPDATE line_assignments la
-          SET available_minutes = $2, required_production_rate = $3, updated_at = now()
-         FROM work_orders wo
-        WHERE wo.id = la.work_order_id
-          AND la.status = 'planned'
-          AND la.assigned_date >= CURRENT_DATE
-          AND UPPER(TRIM(COALESCE(NULLIF(TRIM(wo.style_code), ''), NULLIF(TRIM(wo.estilo), ''), ''))) = $1`,
-      [key, effectiveMinutesOf(row), targetOf(row)]
-    );
+    const { row, prev } = await upsertParams(client, key, params, who(req));
+    let recompute = { style: key, recomputed: false, reason: "unchanged" };
+    if (req.body?.recompute !== false && capacityChanged(prev, row)) {
+      recompute = await recomputeSafely(client, key);
+    }
     await client.query("COMMIT");
-    res.json({ success: true, params: row, created: !prev.rowCount, futureCellsUpdated: upd.rowCount });
+    res.json({ success: true, params: row, created: !prev, recompute });
+  }));
+
+  // What WOULD change if these values were saved (nothing is written).
+  // Body: same as PUT. Response: { recompute: summary, changed }
+  app.post("/api/planner/style-params/:style/preview", authenticateToken, canWrite, withClient(async (client, req, res) => {
+    const key = normStyle(req.params.style);
+    const { params, errors } = parseInput(req.body);
+    if (errors) return res.status(400).json({ success: false, error: errors.join(". ") });
+    await client.query("BEGIN");
+    try {
+      const { row, prev } = await upsertParams(client, key, params, who(req));
+      const changed = capacityChanged(prev, row);
+      const recompute = changed ? await recomputeStyle(client, key, { holidays }) : { style: key, recomputed: false, reason: "unchanged" };
+      res.json({ success: true, changed, recompute });
+    } finally {
+      await client.query("ROLLBACK");
+    }
+  }));
+
+  // Re-plan a style with its CURRENT standard (e.g. after lines were edited by hand).
+  app.post("/api/planner/style-params/:style/recompute", authenticateToken, canWrite, withClient(async (client, req, res) => {
+    const key = normStyle(req.params.style);
+    await client.query("BEGIN");
+    const recompute = await recomputeSafely(client, key);
+    await client.query("COMMIT");
+    res.json({ success: true, recompute });
   }));
 
   app.delete("/api/planner/style-params/:style", authenticateToken, canWrite, withClient(async (client, req, res) => {
@@ -401,4 +634,5 @@ module.exports.getParamsMap = getParamsMap;
 module.exports.styleOfWorkOrder = styleOfWorkOrder;
 module.exports.lineLoadRange = lineLoadRange;
 module.exports.cellCapacity = cellCapacity;
+module.exports.recomputeStyle = recomputeStyle;
 module.exports.styleParamsRequired = styleParamsRequired;
