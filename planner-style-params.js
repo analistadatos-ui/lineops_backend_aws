@@ -162,9 +162,9 @@ async function holdsTableExists(client) {
 // Fraction of each day (0 = empty, 1 = full) already used on a line, for every
 // day in [from, to]. Each assignment uses qty ÷ its style's planner pieces/day.
 // Assignments whose style has no planner standard yet (created before this
-// feature) fall back to the rate stored on the assignment; pre-order holds and
-// anything else with no known rate are measured with `fallbackTarget` (the
-// pieces/day of the style being placed).
+// feature) fall back to the rate stored on the assignment. Pre-order holds use
+// their pre-order's style standard. Anything with no known rate is measured
+// with `fallbackTarget` (the pieces/day of the style being placed).
 async function lineLoadRange(client, { lineNo, from, to, fallbackTarget, excludeIds = [] }) {
   const rows = await client.query(
     `SELECT to_char(la.assigned_date, 'YYYY-MM-DD') AS d,
@@ -191,14 +191,25 @@ async function lineLoadRange(client, { lineNo, from, to, fallbackTarget, exclude
     add(r.d, r.qty, p ? targetOf(p) : (r.rate > 0 ? r.rate : fallbackTarget));
   }
   if (await holdsTableExists(client)) {
+    // Pre-order holds are measured with THEIR OWN style's standard (the style
+    // lives on pre_orders); a hold whose style has no standard yet falls back
+    // to the style being placed.
     const held = await client.query(
-      `SELECT to_char(assigned_date, 'YYYY-MM-DD') AS d, COALESCE(SUM(quantity), 0)::float AS qty
-         FROM pre_order_day_holds
-        WHERE line_no = $1 AND assigned_date BETWEEN $2::date AND $3::date
-        GROUP BY assigned_date`,
+      `SELECT to_char(h.assigned_date, 'YYYY-MM-DD') AS d,
+              COALESCE(SUM(h.quantity), 0)::float AS qty,
+              UPPER(TRIM(COALESCE(NULLIF(TRIM(h.style_code), ''), NULLIF(TRIM(po.style_code), ''),
+                                  NULLIF(TRIM(h.estilo), ''), NULLIF(TRIM(po.estilo), ''), ''))) AS style
+         FROM pre_order_day_holds h
+         LEFT JOIN pre_orders po ON po.id = h.pre_order_id
+        WHERE h.line_no = $1 AND h.assigned_date BETWEEN $2::date AND $3::date
+        GROUP BY h.assigned_date, 3`,
       [String(lineNo), from, to]
     );
-    for (const h of held.rows) add(h.d, h.qty, fallbackTarget);
+    const hmap = await getParamsMap(client, held.rows.map((h) => h.style));
+    for (const h of held.rows) {
+      const p = hmap.get(h.style);
+      add(h.d, h.qty, p ? targetOf(p) : fallbackTarget);
+    }
   }
   return load;
 }
