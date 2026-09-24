@@ -621,6 +621,7 @@ await registerEfficiencyPermissions.initSchema({ pool, setSchema });
 await registerStyleOrders.initSchema({ pool, setSchema });
 await registerSupermarketPlan.initSchema({ pool, setSchema });   // ← nueva
 await registerHolidays.initSchema({ pool, setSchema });
+await plannerStyleParams.initSchema({ pool, setSchema });   // planner style standards
 await registerFinishedWarehouseAnalytics.initSchema({ pool, setSchema });
 // ~línea 622, en el bloque async de arranque, junto a los otros initSchema:
 await registerPreOrders.initSchema({ pool, setSchema });
@@ -871,6 +872,13 @@ registerStyleOrders(app, { authenticateToken, pool, setSchema, generatePresigned
 
 const registerHolidays = require("./holidays");
 registerHolidays(app, { authenticateToken, pool, setSchema });
+
+// Planner-owned SAM / operators / hours / efficiency PER STYLE. The Plan Board
+// capacity comes from here, NOT from the line engineers' line_runs.
+const plannerStyleParams = require("./planner-style-params");
+plannerStyleParams(app, { authenticateToken, pool, setSchema });
+
+
 // ~línea 867, junto a registerMerchantPlan:
 const registerPreOrders = require("./pre-orders");
 registerPreOrders(app, { authenticateToken, pool, setSchema });
@@ -2429,12 +2437,12 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       ? original.status
       : "planned";
  
-    // Prefer the work order's own SAM for the informational rate columns.
-    const woRes = await client.query(
-      "SELECT sam_minutes FROM work_orders WHERE id = $1",
-      [workOrderId]
-    );
-    const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
+    // Planner standard for this order's style drives the target line capacity.
+    const moveStyle = await plannerStyleParams.styleOfWorkOrder(client, workOrderId);
+    if (!(await plannerStyleParams.getParams(client, moveStyle))) {
+      await client.query("ROLLBACK");
+      return plannerStyleParams.styleParamsRequired(res, moveStyle);
+    }
  
     // Free the original's capacity first so the re-flow can reuse its old slot.
     // Everything happens in one transaction, so a shortfall rolls this back and
@@ -2465,29 +2473,14 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     while (remaining > 0 && scanned < MAX_DAYS) {
       scanned++;
       if (isWeekend(dayStr) || holidaySet.has(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend / holiday work
-      const { lines } = await getLineCapacityForDate(client, dayStr);
-      const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
-      if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no capacity configured -> skip
- 
-      const usedRes = await client.query(
-        `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
-           FROM line_assignments
-          WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
-        [String(lineNo), dayStr]
-      );
-      const used = parseFloat(usedRes.rows[0].used) || 0;
-      const capacity = parseFloat(lineData.target_pcs) || 0;
-      const available = Math.max(0, capacity - used);
+      const cap = await plannerStyleParams.cellCapacity(client, { lineNo: String(lineNo), date: dayStr, style: moveStyle });
+      const available = cap.available;
       if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
  
       const chunk = Math.min(remaining, available);
- 
-      const operators = parseInt(lineData.operators_count) || 20;
-      const workingHours = parseFloat(lineData.working_hours) || 8;
-      const efficiency = parseFloat(lineData.efficiency) || 0.85;
-      const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
-      const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
-      const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
+      const effectiveDailyMinutes = cap.availableMinutes;
+      const piecesPerDay = cap.target;
+      const lineData = { id: null }; // planning is decoupled from engineering runs
  
       const ins = await client.query(
         `INSERT INTO line_assignments
@@ -2638,22 +2631,17 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
     // 3) Re-insert the moved order on the now-vacated target cell. Recompute the
     //    informational rate columns from the target line's run for D when one
     //    exists; otherwise keep the block's own values (columns are NOT NULL).
-    const woRes = await client.query("SELECT sam_minutes FROM work_orders WHERE id = $1", [a.work_order_id]);
-    const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
-    const { lines } = await getLineCapacityForDate(client, D);
-    const lineData = lines.find((l) => String(l.line_no) === targetLine);
- 
+    // Informational rate columns from the PLANNER's style standard (if any);
+    // otherwise keep the block's own values (columns are NOT NULL).
+    const sp = await plannerStyleParams.getParams(
+      client, await plannerStyleParams.styleOfWorkOrder(client, a.work_order_id)
+    );
     let availableMinutes = parseFloat(a.available_minutes) || 0;
     let requiredRate = parseFloat(a.required_production_rate) || 0;
-    let lineRunId = null;
-    if (lineData) {
-      const operators = parseInt(lineData.operators_count) || 20;
-      const workingHours = parseFloat(lineData.working_hours) || 8;
-      const efficiency = parseFloat(lineData.efficiency) || 0.85;
-      const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
-      availableMinutes = operators * workingHours * 60 * efficiency;
-      requiredRate = samMinutes > 0 ? availableMinutes / samMinutes : 0;
-      lineRunId = lineData.id || null;
+    const lineRunId = null; // planning is decoupled from engineering runs
+    if (sp) {
+      availableMinutes = plannerStyleParams.effectiveMinutesOf(sp);
+      requiredRate = plannerStyleParams.targetOf(sp);
     }
  
     const status = ["planned", "released", "completed", "cancelled"].includes(a.status) ? a.status : "planned";
@@ -2778,12 +2766,12 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
         ? original.status
         : "planned";
  
-      // Prefer the work order's own SAM for the informational rate columns.
-      const woRes = await client.query(
-        "SELECT sam_minutes FROM work_orders WHERE id = $1",
-        [workOrderId]
-      );
-      const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
+      // Planner standard for this order's style drives the target line capacity.
+      const batchStyle = await plannerStyleParams.styleOfWorkOrder(client, workOrderId);
+      if (!(await plannerStyleParams.getParams(client, batchStyle))) {
+        await client.query("ROLLBACK");
+        return plannerStyleParams.styleParamsRequired(res, batchStyle);
+      }
  
       let remaining = totalQty;
       let dayStr = assignedDate;
@@ -2792,33 +2780,17 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
       while (remaining > 0 && scanned < MAX_DAYS) {
         scanned++;
         if (isWeekend(dayStr) || holidaySet.has(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; } // no weekend / holiday work
-        const { lines } = await getLineCapacityForDate(client, dayStr);
-        const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
-        if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no run -> skip
- 
-        const usedRes = await client.query(
-          `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
-             FROM line_assignments
-            WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
-          [String(lineNo), dayStr]
-        );
-        const used = parseFloat(usedRes.rows[0].used) || 0;
-        const capacity = parseFloat(lineData.target_pcs) || 0;
-        const available = Math.max(0, capacity - used);
+        const cap = await plannerStyleParams.cellCapacity(client, { lineNo: String(lineNo), date: dayStr, style: batchStyle });
+        const available = cap.available;
         if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
  
         const chunk = Math.min(remaining, available);
- 
-        const operators = parseInt(lineData.operators_count) || 20;
-        const workingHours = parseFloat(lineData.working_hours) || 8;
-        const efficiency = parseFloat(lineData.efficiency) || 0.85;
-        const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
-        const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
-        const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
+        const effectiveDailyMinutes = cap.availableMinutes;
+        const piecesPerDay = cap.target;
  
         const row = await mergeOrInsertAssignment(client, {
           workOrderId,
-          lineRunId: lineData.id || null,
+          lineRunId: null, // planning is decoupled from engineering runs
           lineNo: String(lineNo),
           assignedDate: dayStr,
           quantity: chunk,
@@ -3072,22 +3044,16 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
     for (let i = 0; i < N; i++) {
       const a = selectedRows[i];
       const day = slots[i];
-      const woRes = await client.query("SELECT sam_minutes FROM work_orders WHERE id = $1", [a.work_order_id]);
-      const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
-      const { lines } = await getLineCapacityForDate(client, day);
-      const lineData = lines.find((l) => String(l.line_no) === targetLine);
- 
+      // Informational rate columns from the PLANNER's style standard (if any).
+      const sp = await plannerStyleParams.getParams(
+        client, await plannerStyleParams.styleOfWorkOrder(client, a.work_order_id)
+      );
       let availableMinutes = parseFloat(a.available_minutes) || 0;
       let requiredRate = parseFloat(a.required_production_rate) || 0;
-      let lineRunId = a.line_run_id || null;
-      if (lineData) {
-        const operators = parseInt(lineData.operators_count) || 20;
-        const workingHours = parseFloat(lineData.working_hours) || 8;
-        const efficiency = parseFloat(lineData.efficiency) || 0.85;
-        const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
-        availableMinutes = operators * workingHours * 60 * efficiency;
-        requiredRate = samMinutes > 0 ? availableMinutes / samMinutes : 0;
-        lineRunId = lineData.id || null;
+      const lineRunId = null; // planning is decoupled from engineering runs; /confirm links it
+      if (sp) {
+        availableMinutes = plannerStyleParams.effectiveMinutesOf(sp);
+        requiredRate = plannerStyleParams.targetOf(sp);
       }
       const status = ["planned", "released", "completed", "cancelled"].includes(a.status) ? a.status : "planned";
       const placed = await client.query(
@@ -6414,12 +6380,14 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
   try {
     await setSchema(client);
     const { workOrderId, lineNo, date } = req.query;
-
+ 
     let query = `
       SELECT la.*,
              wo.work_order_no,
              wo.style_description,
-             wo.customer_name
+             wo.customer_name,
+             wo.style_code,
+             wo.estilo
         FROM line_assignments la
         JOIN work_orders wo ON wo.id = la.work_order_id
        WHERE 1=1`;
@@ -6439,7 +6407,7 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
       params.push(date);
     }
     query += " ORDER BY la.created_at DESC";
-
+ 
     const result = await client.query(query, params);
     res.json({ success: true, assignments: result.rows });
   } catch (err) {
@@ -6861,57 +6829,32 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, error: "Work order not found" });
     }
-    const workOrder = woResult.rows[0];
  
-    const { lines } = await getLineCapacityForDate(client, assignedDate);
-    const lineData = lines.find((l) => l.line_no === lineNo);
-    if (!lineData) {
+    // Capacity comes from the PLANNER's standard for this order's style
+    // (planner_style_params), not from the line engineers' line_runs. No
+    // standard yet → 409 STYLE_PARAMS_REQUIRED so the board asks the planner.
+    const style = await plannerStyleParams.styleOfWorkOrder(client, parseInt(workOrderId));
+    const cap = await plannerStyleParams.cellCapacity(client, { lineNo: String(lineNo), date: assignedDate, style });
+    if (!cap.params) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ success: false, error: `No capacity configuration found for line ${lineNo}` });
+      return plannerStyleParams.styleParamsRequired(res, style);
     }
- 
-    // Prefer the work order's own SAM (from its master code) over the line's generic SAM
-    const samMinutes = parseFloat(workOrder.sam_minutes) || parseFloat(lineData.sam_minutes) || 3.5;
-    const operators = parseInt(lineData.operators_count) || 20;
-    const workingHours = parseFloat(lineData.working_hours) || 8;
-    const efficiency = parseFloat(lineData.efficiency) || 0.85;
- 
-    const dailyAvailableMinutes = operators * workingHours * 60;
-    const effectiveDailyMinutes = dailyAvailableMinutes * efficiency;
-    const piecesPerDay = effectiveDailyMinutes / samMinutes;
+    const samMinutes = parseFloat(cap.params.sam_minutes);
+    const effectiveDailyMinutes = cap.availableMinutes;
+    const piecesPerDay = cap.target;
  
     const qty = parseFloat(quantity);
     const totalMinutesNeeded = qty * samMinutes;
-    const daysNeeded = Math.ceil(totalMinutesNeeded / effectiveDailyMinutes);
+    const daysNeeded = effectiveDailyMinutes > 0 ? Math.ceil(totalMinutesNeeded / effectiveDailyMinutes) : 0;
  
     const startDate = plannedStartDate || assignedDate;
     const endDateObj = new Date(startDate);
     endDateObj.setDate(endDateObj.getDate() + daysNeeded);
     const plannedEndDate = endDateObj.toISOString().slice(0, 10);
  
-    // Guard against double-booking beyond the line's daily target for that date
-    const alreadyAssignedResult = await client.query(
-      `SELECT COALESCE(SUM(assigned_quantity), 0) as total FROM line_assignments
-       WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
-      [lineNo, assignedDate]
-    );
-    const alreadyAssigned = parseFloat(alreadyAssignedResult.rows[0].total) || 0;
- 
-    // ── add: holds on this line/day also occupy capacity ──
-    let heldOnCell = 0;
-    try {
-      const heldRes = await client.query(
-        `SELECT COALESCE(SUM(quantity), 0) AS total FROM pre_order_day_holds
-          WHERE line_no = $1 AND assigned_date = $2`,
-        [lineNo, assignedDate]
-      );
-      heldOnCell = parseFloat(heldRes.rows[0].total) || 0;
-    } catch (e) {
-      heldOnCell = 0;
-    }
- 
-    // change this line to also subtract heldOnCell:
-    const availableCapacity = Math.max(0, parseFloat(lineData.target_pcs) - alreadyAssigned - heldOnCell);
+    // Free room left on this line-day for this style, after every other style
+    // (and pre-order hold) already planned there.
+    const availableCapacity = cap.available;
  
     if (qty > availableCapacity) {
       await client.query("ROLLBACK");
@@ -6928,8 +6871,8 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
     // the caller only sends what fits in this day's remaining capacity.
     const assignment = await mergeOrInsertAssignment(client, {
       workOrderId: parseInt(workOrderId),
-      lineRunId: lineData.id || null,
-      lineNo,
+      lineRunId: null, // planning no longer borrows an engineering run; /confirm links it
+      lineNo: String(lineNo),
       assignedDate,
       quantity: qty,
       availableMinutes: effectiveDailyMinutes,
