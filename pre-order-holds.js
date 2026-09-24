@@ -43,6 +43,10 @@
 //     preOrderNo, customerName, styleCode, estilo }
 // Re-dropping the same pre-order+line+day+color ADDS to the existing quantity
 // (the board walks a PO across days, sending only what fits each day).
+//
+// CAPACITY: POST is checked against the PLANNER's standard for the hold's style
+// (planner-style-params.js), not the line engineers' runs. Requires
+// planner-style-params.js next to this file.
 // ==========================================================================
 
 async function initSchema({ pool, setSchema }) {
@@ -79,6 +83,11 @@ async function initSchema({ pool, setSchema }) {
     client.release();
   }
 }
+
+// Planner-owned standards per style (SAM / operators / hours / efficiency).
+// A hold now reserves capacity measured with ITS style's standard, exactly
+// like a real PO, and the server refuses a hold that doesn't fit the day.
+const plannerStyleParams = require("./planner-style-params");
 
 // --- coercion helpers ------------------------------------------------------
 const txt = (v, n) => (v == null ? null : String(v).trim().slice(0, n || 200) || null);
@@ -119,6 +128,12 @@ function registerPreOrderHolds(app, deps) {
   });
 
   // ---- POST: upsert one hold (merges quantity on conflict) ---------------
+  // Capacity check (planner style standards): the hold's style must have a
+  // standard (else 409 STYLE_PARAMS_REQUIRED so the board asks the planner),
+  // and `quantity` must fit what is left of that line-day for that style after
+  // every assignment and other hold already there (else 400).
+  // Body may send { skipCapacityCheck: true } only to restore a hold exactly as
+  // it was (e.g. an undo); the board never sends it for a normal drop.
   app.post("/api/pre-order-holds", authenticateToken, async (req, res) => {
     const b = req.body || {};
     const preOrderId = b.preOrderId ?? b.pre_order_id ?? null;
@@ -131,6 +146,41 @@ function registerPreOrderHolds(app, deps) {
     const client = await pool.connect();
     try {
       await setSchema(client);
+      await client.query("BEGIN");
+      // Serialize writers on this line-day so two drops can't both take the
+      // last free pieces.
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`hold|${String(lineNo).trim()}|${assignedDate}`]);
+
+      // Style of the hold: what the board sent, else the pre-order's own.
+      let style = plannerStyleParams.normStyle(b.styleCode ?? b.style_code ?? "") ||
+                  plannerStyleParams.normStyle(b.estilo ?? "");
+      if (!style) {
+        const po = await client.query(
+          `SELECT UPPER(TRIM(COALESCE(NULLIF(TRIM(style_code), ''), NULLIF(TRIM(estilo), ''), ''))) AS style
+             FROM pre_orders WHERE id = $1`,
+          [parseInt(preOrderId, 10)]
+        );
+        style = po.rows[0]?.style || "";
+      }
+
+      if (b.skipCapacityCheck !== true) {
+        const cap = await plannerStyleParams.cellCapacity(client, {
+          lineNo: String(lineNo).trim(), date: assignedDate, style,
+        });
+        if (!cap.params) {
+          await client.query("ROLLBACK");
+          return plannerStyleParams.styleParamsRequired(res, style);
+        }
+        if (quantity > cap.available) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            success: false,
+            error: `La Línea ${String(lineNo).trim()} solo tiene capacidad para ${Math.floor(cap.available)} pzas de ${style} el ${assignedDate}.`,
+            available: cap.available,
+          });
+        }
+      }
+
       const { rows } = await client.query(
         `INSERT INTO pre_order_day_holds
            (pre_order_id, line_no, assigned_date, quantity, color,
@@ -152,13 +202,15 @@ function registerPreOrderHolds(app, deps) {
           col(b.color),
           txt(b.preOrderNo ?? b.pre_order_no, 80),
           txt(b.customerName ?? b.customer_name, 150),
-          txt(b.styleCode ?? b.style_code, 20),
+          txt(b.styleCode ?? b.style_code, 20) || txt(style, 20),
           txt(b.estilo, 120),
           req.user?.id ?? null,
         ]
       );
+      await client.query("COMMIT");
       res.json({ success: true, hold: rows[0] });
     } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
       console.error("\u274c POST /api/pre-order-holds:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
