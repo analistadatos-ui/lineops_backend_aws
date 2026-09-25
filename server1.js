@@ -6272,9 +6272,15 @@ app.get("/api/planning/line-work-orders", authenticateToken, async (req, res) =>
         mc.modelo          AS modelo,
         mc.correlativo     AS correlativo,
         mc.color           AS mc_color,
-        -- style = tipo‖modelo‖correlativo (e.g. DAM+BOD+01 = DAMBOD01); falls back
-        -- to the client estilo / style_code when there is no master code linked.
-        COALESCE(NULLIF(TRIM(CONCAT(mc.type, mc.modelo, mc.correlativo)), ''), wo.estilo, wo.style_code, '') AS style_from_code,
+        -- style = the order's OWN style_code (tipo‖modelo‖correlativo, e.g. DAMBOD08 —
+        -- the same code baked into work_order_no). The linked master code is only a
+        -- fallback: master_code_id can point at a code whose correlativo differs
+        -- (edited/reused codes), which made a DAMBOD08 order copy as DAMBOD07.
+        COALESCE(
+          NULLIF(TRIM(wo.style_code), ''),
+          NULLIF(TRIM(CONCAT(mc.type, mc.modelo, mc.correlativo)), ''),
+          wo.estilo, ''
+        ) AS style_from_code,
         COALESCE(NULLIF(mc.color, ''), wo.color, '') AS order_color
       FROM line_assignments la
       JOIN work_orders wo ON wo.id = la.work_order_id
