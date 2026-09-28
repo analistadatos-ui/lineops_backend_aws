@@ -876,7 +876,10 @@ registerHolidays(app, { authenticateToken, pool, setSchema });
 // Planner-owned SAM / operators / hours / efficiency PER STYLE. The Plan Board
 // capacity comes from here, NOT from the line engineers' line_runs.
 const plannerStyleParams = require("./planner-style-params");
-plannerStyleParams(app, { authenticateToken, pool, setSchema });
+plannerStyleParams(app, {
+  authenticateToken, pool, setSchema, holidays: registerHolidays, planWeekLocks,
+  effApproverRoles: ["ceo","master"],
+});
 
 
 // ~línea 867, junto a registerMerchantPlan:
@@ -6423,6 +6426,7 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
     client.release();
   }
 });
+ 
 
 
 // Server-side port of the frontend utils/timeSlots.js `buildShiftSlots`. A draft

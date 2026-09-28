@@ -34,6 +34,13 @@
 const WRITE_ROLES = (process.env.PLANNER_STYLE_WRITE_ROLES || "planner")
   .split(",").map((s) => s.trim()).filter(Boolean);
 
+// Roles that APPROVE / REJECT efficiency changes. The planner can change SAM,
+// operators and working hours directly, but a new EFFICIENCY for a style that
+// already has a standard only takes effect after one of these roles approves it.
+// Override with PLANNER_EFF_APPROVER_ROLES="ceo,skyrina,master".
+const DEFAULT_EFF_APPROVER_ROLES = (process.env.PLANNER_EFF_APPROVER_ROLES || "ceo")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+
 const normStyle = (s) => String(s ?? "").trim().toUpperCase();
 
 const SCHEMA_SQL = [
@@ -70,6 +77,26 @@ const SCHEMA_SQL = [
    )`,
   `CREATE INDEX IF NOT EXISTS idx_psp_history_style
      ON planner_style_params_history(style_code, changed_at DESC)`,
+  // Efficiency change requests (planner → CEO). One PENDING request per style;
+  // a newer request supersedes the older one.
+  `CREATE TABLE IF NOT EXISTS planner_style_eff_requests(
+     id                    BIGSERIAL PRIMARY KEY,
+     style_code            VARCHAR(50) NOT NULL,
+     current_efficiency    NUMERIC(5,4),
+     requested_efficiency  NUMERIC(5,4) NOT NULL,
+     reason                TEXT,
+     status                VARCHAR(12) NOT NULL DEFAULT 'pending',
+     requested_by          VARCHAR(100),
+     requested_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+     decided_by            VARCHAR(100),
+     decided_at            TIMESTAMPTZ,
+     decision_note         TEXT,
+     CONSTRAINT chk_pser_eff CHECK (requested_efficiency > 0 AND requested_efficiency <= 1),
+     CONSTRAINT chk_pser_status CHECK (status IN ('pending','approved','rejected','cancelled','superseded'))
+   )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_pser_one_pending
+     ON planner_style_eff_requests(style_code) WHERE status = 'pending'`,
+  `CREATE INDEX IF NOT EXISTS idx_pser_status ON planner_style_eff_requests(status, requested_at DESC)`,
 ];
 
 let schemaReady = null; // one-time lazy creation per process
@@ -113,16 +140,58 @@ function parseInput(body) {
   if (Number.isFinite(eff) && eff > 1) eff = eff / 100;
   if (!(Number.isFinite(eff) && eff > 0 && eff <= 1)) errors.push("Eficiencia debe estar entre 1% y 100%");
   if (errors.length) return { errors };
-  const p = { sam_minutes: sam, operators_count: ops, working_hours: hours, efficiency: eff };
-  const target = targetOf(p);
   return {
-    params: {
-      ...p,
-      target_pcs: Math.round(target * 100) / 100,
-      target_per_hour: Math.round((target / hours) * 100) / 100,
+    params: withTargets({
+      sam_minutes: sam, operators_count: ops, working_hours: hours, efficiency: eff,
       notes: body?.notes != null ? String(body.notes).slice(0, 1000) : null,
-    },
+    }),
+    effReason: body?.efficiencyReason != null ? String(body.efficiencyReason).slice(0, 1000) : null,
   };
+}
+
+// Fill target_pcs / target_per_hour from the four inputs.
+function withTargets(p) {
+  const target = targetOf(p);
+  const hours = Number(p.working_hours) || 0;
+  return {
+    ...p,
+    target_pcs: Math.round(target * 100) / 100,
+    target_per_hour: hours > 0 ? Math.round((target / hours) * 100) / 100 : 0,
+  };
+}
+
+const sameEff = (a, b) => Math.abs(Number(a) - Number(b)) < 1e-6;
+
+// The planner may not change efficiency on an EXISTING standard: keep the
+// current one and turn the new value into a pending request. A new style's
+// first efficiency is accepted as entered (there is nothing to change yet).
+// Returns { params, requestedEff } — requestedEff is null when nothing to ask.
+function splitEfficiency(prev, params) {
+  if (!prev || sameEff(prev.efficiency, params.efficiency)) return { params, requestedEff: null };
+  return {
+    params: withTargets({ ...params, efficiency: Number(prev.efficiency) }),
+    requestedEff: params.efficiency,
+  };
+}
+
+async function createEffRequest(client, { key, current, requested, reason, who }) {
+  await client.query(
+    `UPDATE planner_style_eff_requests SET status = 'superseded', decided_at = now()
+      WHERE style_code = $1 AND status = 'pending'`,
+    [key]
+  );
+  return (await client.query(
+    `INSERT INTO planner_style_eff_requests
+       (style_code, current_efficiency, requested_efficiency, reason, requested_by)
+     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [key, current, requested, reason, who]
+  )).rows[0];
+}
+
+async function pendingEffRequest(client, key) {
+  return (await client.query(
+    "SELECT * FROM planner_style_eff_requests WHERE style_code = $1 AND status = 'pending'", [key]
+  )).rows[0] || null;
 }
 
 // ---- lookups (usable by server1.js inside its own transactions) -----------
@@ -427,7 +496,7 @@ const capacityChanged = (a, b) => !a || !b ||
   Number(a.efficiency) !== Number(b.efficiency);
 
 // Save (upsert + history) inside the caller's transaction. Returns { row, prev }.
-async function upsertParams(client, key, params, who) {
+async function upsertParams(client, key, params, who, action = null) {
   const prev = (await client.query("SELECT * FROM planner_style_params WHERE style_code = $1 FOR UPDATE", [key])).rows[0] || null;
   const row = (await client.query(
     `INSERT INTO planner_style_params
@@ -447,14 +516,24 @@ async function upsertParams(client, key, params, who) {
     `INSERT INTO planner_style_params_history
        (style_code, action, sam_minutes, operators_count, working_hours, efficiency, target_pcs, notes, changed_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-    [key, prev ? "update" : "create", row.sam_minutes, row.operators_count,
+    [key, action || (prev ? "update" : "create"), row.sam_minutes, row.operators_count,
      row.working_hours, row.efficiency, row.target_pcs, row.notes, who]
   );
   return { row, prev };
 }
 
 // ---- routes ----------------------------------------------------------------
-function register(app, { authenticateToken, pool, setSchema, holidays = null, planWeekLocks = null }) {
+function register(app, {
+  authenticateToken, pool, setSchema, holidays = null, planWeekLocks = null,
+  effApproverRoles = DEFAULT_EFF_APPROVER_ROLES,
+}) {
+  const canApproveEff = (req) => effApproverRoles.includes(req.user?.role);
+  const approver = (req, res, next) => {
+    if (!canApproveEff(req)) {
+      return res.status(403).json({ success: false, error: "Solo el CEO puede aprobar cambios de eficiencia." });
+    }
+    next();
+  };
   const canWrite = (req, res, next) => {
     if (!WRITE_ROLES.includes(req.user?.role)) {
       return res.status(403).json({ success: false, error: "Solo el planeador puede modificar los estándares por estilo." });
@@ -481,7 +560,11 @@ function register(app, { authenticateToken, pool, setSchema, holidays = null, pl
   // All standards (the board loads this once).
   app.get("/api/planner/style-params", authenticateToken, withClient(async (client, req, res) => {
     const r = await client.query("SELECT * FROM planner_style_params ORDER BY style_code");
-    res.json({ success: true, params: r.rows, canEdit: WRITE_ROLES.includes(req.user?.role) });
+    const pend = await client.query("SELECT * FROM planner_style_eff_requests WHERE status = 'pending'");
+    res.json({
+      success: true, params: r.rows, pendingEff: pend.rows,
+      canEdit: WRITE_ROLES.includes(req.user?.role), canApproveEff: canApproveEff(req),
+    });
   }));
 
   // One style. When the planner has nothing yet, also returns the most recent
@@ -502,7 +585,8 @@ function register(app, { authenticateToken, pool, setSchema, holidays = null, pl
       );
       suggestion = h.rows[0] || null;
     }
-    res.json({ success: true, style: key, found: !!params, params, suggestion });
+    const pendingEff = params ? await pendingEffRequest(client, key) : null;
+    res.json({ success: true, style: key, found: !!params, params, suggestion, pendingEff });
   }));
 
   app.get("/api/planner/style-params/:style/history", authenticateToken, withClient(async (client, req, res) => {
@@ -541,31 +625,45 @@ function register(app, { authenticateToken, pool, setSchema, holidays = null, pl
   app.put("/api/planner/style-params/:style", authenticateToken, canWrite, withClient(async (client, req, res) => {
     const key = normStyle(req.params.style);
     if (!key) return res.status(400).json({ success: false, error: "Estilo requerido" });
-    const { params, errors } = parseInput(req.body);
+    const { params: input, effReason, errors } = parseInput(req.body);
     if (errors) return res.status(400).json({ success: false, error: errors.join(". ") });
 
     await client.query("BEGIN");
+    const current = (await client.query(
+      "SELECT * FROM planner_style_params WHERE style_code = $1 FOR UPDATE", [key]
+    )).rows[0] || null;
+    // SAM / operators / hours apply now; a changed efficiency waits for the CEO.
+    const { params, requestedEff } = splitEfficiency(current, input);
     const { row, prev } = await upsertParams(client, key, params, who(req));
+    let effRequest = null;
+    if (requestedEff != null) {
+      effRequest = await createEffRequest(client, {
+        key, current: current.efficiency, requested: requestedEff, reason: effReason, who: who(req),
+      });
+    }
     let recompute = { style: key, recomputed: false, reason: "unchanged" };
     if (req.body?.recompute !== false && capacityChanged(prev, row)) {
       recompute = await recomputeSafely(client, key);
     }
     await client.query("COMMIT");
-    res.json({ success: true, params: row, created: !prev, recompute });
+    res.json({ success: true, params: row, created: !prev, recompute, effRequest });
   }));
 
   // What WOULD change if these values were saved (nothing is written).
   // Body: same as PUT. Response: { recompute: summary, changed }
   app.post("/api/planner/style-params/:style/preview", authenticateToken, canWrite, withClient(async (client, req, res) => {
     const key = normStyle(req.params.style);
-    const { params, errors } = parseInput(req.body);
+    const { params: input, errors } = parseInput(req.body);
     if (errors) return res.status(400).json({ success: false, error: errors.join(". ") });
     await client.query("BEGIN");
     try {
+      const current = await getParams(client, key);
+      // Same rule as PUT: a changed efficiency is NOT applied here (it is only a request).
+      const { params, requestedEff } = splitEfficiency(current, input);
       const { row, prev } = await upsertParams(client, key, params, who(req));
       const changed = capacityChanged(prev, row);
       const recompute = changed ? await recomputeStyle(client, key, { holidays }) : { style: key, recomputed: false, reason: "unchanged" };
-      res.json({ success: true, changed, recompute });
+      res.json({ success: true, changed, recompute, effNeedsApproval: requestedEff != null });
     } finally {
       await client.query("ROLLBACK");
     }
@@ -580,7 +678,9 @@ function register(app, { authenticateToken, pool, setSchema, holidays = null, pl
     res.json({ success: true, recompute });
   }));
 
-  app.delete("/api/planner/style-params/:style", authenticateToken, canWrite, withClient(async (client, req, res) => {
+  // Deleting a standard is reserved to the efficiency approvers: otherwise a
+  // delete + re-create would bypass the efficiency approval.
+  app.delete("/api/planner/style-params/:style", authenticateToken, approver, withClient(async (client, req, res) => {
     const key = normStyle(req.params.style);
     await client.query("BEGIN");
     const del = await client.query("DELETE FROM planner_style_params WHERE style_code = $1 RETURNING *", [key]);
@@ -595,6 +695,97 @@ function register(app, { authenticateToken, pool, setSchema, holidays = null, pl
     }
     await client.query("COMMIT");
     res.json({ success: true, deleted: del.rowCount > 0 });
+  }));
+
+  // ---- efficiency change requests (planner asks, CEO decides) -------------
+  // GET /api/planner/style-eff-requests?status=pending|approved|rejected|all
+  app.get("/api/planner/style-eff-requests", authenticateToken, withClient(async (client, req, res) => {
+    const status = String(req.query.status || "pending");
+    const r = await client.query(
+      `SELECT r.*, p.sam_minutes, p.operators_count, p.working_hours, p.efficiency AS standard_efficiency
+         FROM planner_style_eff_requests r
+         LEFT JOIN planner_style_params p ON p.style_code = r.style_code
+        WHERE ($1 = 'all' OR r.status = $1)
+        ORDER BY r.requested_at DESC
+        LIMIT 200`,
+      [status]
+    );
+    res.json({ success: true, requests: r.rows, canApprove: canApproveEff(req) });
+  }));
+
+  // Impact of approving: what the style's pieces/day becomes and which cells
+  // would be re-planned (nothing is written).
+  app.get("/api/planner/style-eff-requests/:id/preview", authenticateToken, approver, withClient(async (client, req, res) => {
+    await client.query("BEGIN");
+    try {
+      const rq = (await client.query("SELECT * FROM planner_style_eff_requests WHERE id = $1", [req.params.id])).rows[0];
+      if (!rq) return res.status(404).json({ success: false, error: "Solicitud no encontrada" });
+      const cur = await getParams(client, rq.style_code);
+      if (!cur) return res.status(409).json({ success: false, error: "El estilo ya no tiene estándar." });
+      const next = withTargets({ ...cur, efficiency: Number(rq.requested_efficiency) });
+      await upsertParams(client, rq.style_code, next, "preview");
+      const recompute = await recomputeStyle(client, rq.style_code, { holidays });
+      res.json({ success: true, before: targetOf(cur), after: targetOf(next), recompute });
+    } finally {
+      await client.query("ROLLBACK");
+    }
+  }));
+
+  // Approve → the efficiency becomes the style's standard and the style is
+  // re-planned from tomorrow (same rules and week locks as a planner change).
+  app.post("/api/planner/style-eff-requests/:id/approve", authenticateToken, approver, withClient(async (client, req, res) => {
+    await client.query("BEGIN");
+    const rq = (await client.query(
+      "SELECT * FROM planner_style_eff_requests WHERE id = $1 FOR UPDATE", [req.params.id]
+    )).rows[0];
+    if (!rq) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, error: "Solicitud no encontrada" }); }
+    if (rq.status !== "pending") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ success: false, error: `La solicitud ya está ${rq.status}.` });
+    }
+    const cur = (await client.query(
+      "SELECT * FROM planner_style_params WHERE style_code = $1 FOR UPDATE", [rq.style_code]
+    )).rows[0];
+    if (!cur) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ success: false, error: "El estilo ya no tiene estándar." });
+    }
+    const next = withTargets({ ...cur, efficiency: Number(rq.requested_efficiency) });
+    const { row } = await upsertParams(client, rq.style_code, next, who(req), "eff_ok");
+    const decided = (await client.query(
+      `UPDATE planner_style_eff_requests
+          SET status = 'approved', decided_by = $2, decided_at = now(), decision_note = $3
+        WHERE id = $1 RETURNING *`,
+      [rq.id, who(req), req.body?.note ? String(req.body.note).slice(0, 1000) : null]
+    )).rows[0];
+    const recompute = capacityChanged(cur, row)
+      ? await recomputeSafely(client, rq.style_code)
+      : { style: rq.style_code, recomputed: false, reason: "unchanged" };
+    await client.query("COMMIT");
+    res.json({ success: true, request: decided, params: row, recompute });
+  }));
+
+  app.post("/api/planner/style-eff-requests/:id/reject", authenticateToken, approver, withClient(async (client, req, res) => {
+    const r = await client.query(
+      `UPDATE planner_style_eff_requests
+          SET status = 'rejected', decided_by = $2, decided_at = now(), decision_note = $3
+        WHERE id = $1 AND status = 'pending' RETURNING *`,
+      [req.params.id, who(req), req.body?.note ? String(req.body.note).slice(0, 1000) : null]
+    );
+    if (!r.rowCount) return res.status(409).json({ success: false, error: "La solicitud no está pendiente." });
+    res.json({ success: true, request: r.rows[0] });
+  }));
+
+  // The planner withdraws a pending request.
+  app.post("/api/planner/style-eff-requests/:id/cancel", authenticateToken, canWrite, withClient(async (client, req, res) => {
+    const r = await client.query(
+      `UPDATE planner_style_eff_requests
+          SET status = 'cancelled', decided_by = $2, decided_at = now()
+        WHERE id = $1 AND status = 'pending' RETURNING *`,
+      [req.params.id, who(req)]
+    );
+    if (!r.rowCount) return res.status(409).json({ success: false, error: "La solicitud no está pendiente." });
+    res.json({ success: true, request: r.rows[0] });
   }));
 
   // Per-day free capacity of ONE line for ONE style over a date range. The board
