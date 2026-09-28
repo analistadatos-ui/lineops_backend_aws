@@ -110,14 +110,33 @@ function registerPreOrderHolds(app, deps) {
       if (from) { params.push(from); where.push(`assigned_date >= $${params.length}`); }
       if (to) { params.push(to); where.push(`assigned_date <= $${params.length}`); }
       const { rows } = await client.query(
-        `SELECT id, pre_order_id, line_no,
-                to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date,
-                quantity, color, pre_order_no, customer_name, style_code, estilo, updated_at
-           FROM pre_order_day_holds
-          ${where.length ? "WHERE " + where.join(" AND ") : ""}
-          ORDER BY assigned_date, line_no, pre_order_no`,
+        `SELECT h.id, h.pre_order_id, h.line_no,
+                to_char(h.assigned_date, 'YYYY-MM-DD') AS assigned_date,
+                h.quantity, h.color, h.pre_order_no, h.customer_name, h.style_code, h.estilo,
+                h.updated_at
+           FROM pre_order_day_holds h
+          ${where.length ? "WHERE " + where.map((w) => "h." + w).join(" AND ") : ""}
+          ORDER BY h.assigned_date, h.line_no, h.pre_order_no`,
         params
       );
+
+      // SAM per hold, so the board can count holds in the EQUIVALENT load
+      // (eq = quantity x SAM / equivalence) exactly like real POs.
+      // SAM comes ONLY from the planner's style standard (planner_style_params):
+      // the same SAM the POST capacity check used, so a cell that shows 100% of
+      // pieces also shows its full eq. A hold can't be placed without a
+      // standard (POST returns STYLE_PARAMS_REQUIRED), so every hold has one.
+      const samByStyle = new Map();
+      for (const r of rows) {
+        const style = plannerStyleParams.normStyle(r.style_code || "") ||
+                      plannerStyleParams.normStyle(r.estilo || "");
+        if (style && !samByStyle.has(style)) {
+          let sp = null;
+          try { sp = await plannerStyleParams.getParams(client, style); } catch (_) { sp = null; }
+          samByStyle.set(style, Number(sp?.sam_minutes) || 0);
+        }
+        r.sam_minutes = style ? samByStyle.get(style) : 0;
+      }
       res.json({ success: true, holds: rows });
     } catch (err) {
       console.error("\u274c GET /api/pre-order-holds:", err.message);
