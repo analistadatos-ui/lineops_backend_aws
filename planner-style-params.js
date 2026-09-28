@@ -343,7 +343,9 @@ const ymdWeekend = (ymdStr) => {
   return dow === 0 || dow === 6;
 };
 
-async function recomputeStyle(client, style, { holidays = null } = {}) {
+// `lines`: optional array of line_no to re-plan; null/undefined = every line.
+// Cells of the style on lines NOT listed are left exactly as they are.
+async function recomputeStyle(client, style, { holidays = null, lines: onlyLines = null } = {}) {
   const key = normStyle(style);
   const params = await getParams(client, key);
   if (!params) return { style: key, recomputed: false, reason: "no-standard" };
@@ -354,6 +356,10 @@ async function recomputeStyle(client, style, { holidays = null } = {}) {
   // Re-plan window starts TOMORROW: from's and past cells stay exactly as they are.
   const from = (await client.query("SELECT to_char(CURRENT_DATE + 1, 'YYYY-MM-DD') AS d")).rows[0].d;
   const STYLE_OF_WO = `UPPER(TRIM(COALESCE(NULLIF(TRIM(wo.style_code), ''), NULLIF(TRIM(wo.estilo), ''), '')))`;
+  const lineFilter = Array.isArray(onlyLines) ? onlyLines.map((l) => String(l).trim()).filter(Boolean) : null;
+  if (lineFilter && !lineFilter.length) {
+    return { style: key, recomputed: false, reason: "no-lines", from, target_pcs: Math.round(target * 100) / 100 };
+  }
 
   // Future planned cells of this style (locked so nobody edits them meanwhile).
   const aRows = (await client.query(
@@ -364,9 +370,10 @@ async function recomputeStyle(client, style, { holidays = null } = {}) {
       WHERE la.status = 'planned'
         AND la.assigned_date >= $2::date
         AND ${STYLE_OF_WO} = $1
+        AND ($3::text[] IS NULL OR la.line_no::text = ANY($3::text[]))
       ORDER BY la.line_no, la.assigned_date, la.id
       FOR UPDATE OF la`,
-    [key, from]
+    [key, from, lineFilter]
   )).rows;
 
   let hRows = [];
@@ -380,14 +387,15 @@ async function recomputeStyle(client, style, { holidays = null } = {}) {
         WHERE h.assigned_date >= $2::date
           AND UPPER(TRIM(COALESCE(NULLIF(TRIM(h.style_code), ''), NULLIF(TRIM(po.style_code), ''),
                                   NULLIF(TRIM(h.estilo), ''), NULLIF(TRIM(po.estilo), ''), ''))) = $1
+          AND ($3::text[] IS NULL OR h.line_no::text = ANY($3::text[]))
         ORDER BY h.line_no, h.assigned_date, h.id
         FOR UPDATE OF h`,
-      [key, from]
+      [key, from, lineFilter]
     )).rows;
   }
 
   const summary = {
-    style: key, recomputed: true, from, target_pcs: Math.round(target * 100) / 100,
+    style: key, recomputed: true, from, onlyLines: lineFilter, target_pcs: Math.round(target * 100) / 100,
     cellsBefore: aRows.length + hRows.length, cellsAfter: 0, lines: [], unplaced: [],
   };
   if (!aRows.length && !hRows.length) return summary;
@@ -487,6 +495,9 @@ async function recomputeStyle(client, style, { holidays = null } = {}) {
   }
   return summary;
 }
+
+// Body `lines` / `recomputeLines`: array → only those lines; [] → none; absent → all.
+const parseLines = (v) => (Array.isArray(v) ? v.map((l) => String(l).trim()).filter(Boolean) : null);
 
 // Did a change touch the numbers that drive capacity (not just the notes)?
 const capacityChanged = (a, b) => !a || !b ||
@@ -600,11 +611,11 @@ function register(app, {
   // Runs the recompute inside a SAVEPOINT with the CEO week locks enforced: if
   // it would touch a locked week, only the recompute is undone (the standard is
   // still saved) and the response says so.
-  const recomputeSafely = async (client, key) => {
+  const recomputeSafely = async (client, key, lines = null) => {
     await client.query("SAVEPOINT recompute_style");
     try {
       if (planWeekLocks?.enforce) await planWeekLocks.enforce(client);
-      const r = await recomputeStyle(client, key, { holidays });
+      const r = await recomputeStyle(client, key, { holidays, lines });
       await client.query("RELEASE SAVEPOINT recompute_style");
       return r;
     } catch (err) {
@@ -618,7 +629,8 @@ function register(app, {
 
   // Create or update a style standard (planner only).
   // Body: { samMinutes, operatorsCount, workingHours, efficiency (0.85 | 85), notes?,
-  //         recompute? (default true) }
+  //         recompute? (default true),
+  //         recomputeLines? — ["4","7"] only those lines, [] none, absent = all }
   // When SAM / operators / hours / efficiency change (or the style is new), every
   // future planned cell of the style on every line is re-planned (recomputeStyle)
   // in the same transaction. Response: { params, created, recompute: summary }.
@@ -642,8 +654,11 @@ function register(app, {
       });
     }
     let recompute = { style: key, recomputed: false, reason: "unchanged" };
+    const lines = parseLines(req.body?.recomputeLines);
     if (req.body?.recompute !== false && capacityChanged(prev, row)) {
-      recompute = await recomputeSafely(client, key);
+      recompute = lines && !lines.length
+        ? { style: key, recomputed: false, reason: "no-lines" }
+        : await recomputeSafely(client, key, lines);
     }
     await client.query("COMMIT");
     res.json({ success: true, params: row, created: !prev, recompute, effRequest });
@@ -673,7 +688,7 @@ function register(app, {
   app.post("/api/planner/style-params/:style/recompute", authenticateToken, canWrite, withClient(async (client, req, res) => {
     const key = normStyle(req.params.style);
     await client.query("BEGIN");
-    const recompute = await recomputeSafely(client, key);
+    const recompute = await recomputeSafely(client, key, parseLines(req.body?.lines));
     await client.query("COMMIT");
     res.json({ success: true, recompute });
   }));
@@ -758,9 +773,13 @@ function register(app, {
         WHERE id = $1 RETURNING *`,
       [rq.id, who(req), req.body?.note ? String(req.body.note).slice(0, 1000) : null]
     )).rows[0];
-    const recompute = capacityChanged(cur, row)
-      ? await recomputeSafely(client, rq.style_code)
-      : { style: rq.style_code, recomputed: false, reason: "unchanged" };
+    // Body `lines`: ["4","7"] re-plan only those lines, [] none, absent = all.
+    const lines = parseLines(req.body?.lines);
+    const recompute = !capacityChanged(cur, row)
+      ? { style: rq.style_code, recomputed: false, reason: "unchanged" }
+      : lines && !lines.length
+        ? { style: rq.style_code, recomputed: false, reason: "no-lines" }
+        : await recomputeSafely(client, rq.style_code, lines);
     await client.query("COMMIT");
     res.json({ success: true, request: decided, params: row, recompute });
   }));
