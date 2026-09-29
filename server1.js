@@ -980,8 +980,8 @@ app.post(
       const { line, date, style, color, operators, workingHours, sam, efficiency, target, targetPerHour, slots , workOrderId } = req.body;
 
       // style stays the plain estilo (tipo+modelo+correlativo, e.g. DAMBOD01);
-      // color is stored separately so two colors of the same style coexist as
-      // distinct runs (unique on line_no, run_date, style, color).
+      // color is stored separately. Unique key is now
+      // (line_no, run_date, style, color, work_order_id).
       const lineRunResult = await client.query(
         `INSERT INTO line_runs (line_no, run_date, style, color, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour, work_order_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
@@ -1016,15 +1016,33 @@ app.post(
         slotIds[slot.label] = slotResult.rows[0].id;
       }
 
+      // Same crew rule as the copy: joining a style already running that day
+      // means using that crew's hours. Slots are rebuilt, so refresh slotIds.
+      const crewOwnerId = await adoptCrewShift(client, runId);
+      if (crewOwnerId) {
+        const fresh = await client.query(
+          `SELECT id, slot_label FROM shift_slots WHERE run_id = $1`,
+          [runId]
+        );
+        for (const k of Object.keys(slotIds)) delete slotIds[k];
+        for (const row of fresh.rows) slotIds[row.slot_label] = row.id;
+      }
+
       await client.query("COMMIT");
-      res.json({ success: true, message: "Production data saved", lineRunId: runId, slotIds });
+      res.json({
+        success: true,
+        message: "Production data saved",
+        lineRunId: runId,
+        slotIds,
+        sharedHoursFromRunId: crewOwnerId,
+      });
     } catch (err) {
       await client.query("ROLLBACK");
-      // Unique (line_no, run_date, style, color) collision -> friendly message.
+      // Unique (line, date, style, color, work order) collision -> friendly message.
       if (err.code === "23505") {
         return res.status(409).json({
           success: false,
-          error: "Ya existe una corrida para esa línea, fecha, estilo y color. Elige otro color o fecha.",
+          error: "Ya existe una corrida para esa línea, fecha, estilo, color y orden de trabajo. Elige otra orden o fecha.",
         });
       }
       next(err);
@@ -2050,10 +2068,13 @@ app.get("/api/line-runs", authenticateToken, async (req, res, next) => {
   try {
     await setSchema(client);
     const result = await client.query(
-      `SELECT id, line_no, run_date, style,color, operators_count, working_hours, sam_minutes,
-              efficiency, target_pcs, target_per_hour, is_draft, created_at
-       FROM line_runs
-       ORDER BY run_date DESC, line_no`
+      `SELECT lr.id, lr.line_no, lr.run_date, lr.style, lr.color, lr.operators_count,
+              lr.working_hours, lr.sam_minutes, lr.efficiency, lr.target_pcs,
+              lr.target_per_hour, lr.is_draft, lr.created_at,
+              lr.work_order_id, wo.work_order_no
+       FROM line_runs lr
+       LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
+       ORDER BY lr.run_date DESC, lr.line_no`
     );
     res.json({ success: true, runs: result.rows });
   } catch (err) {
@@ -2265,7 +2286,7 @@ app.patch("/api/line-runs/operators", authenticateToken, async (req, res) => {
           `INSERT INTO line_runs
              (line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour, created_at, updated_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
-           ON CONFLICT (line_no, run_date, style)
+             ON CONFLICT (line_no, run_date, style, (COALESCE(color, '')), (COALESCE(work_order_id, 0)))
            DO UPDATE SET operators_count = EXCLUDED.operators_count,
                          target_pcs      = EXCLUDED.target_pcs,
                          target_per_hour = EXCLUDED.target_per_hour,
@@ -3910,9 +3931,9 @@ app.post("/api/duplicate-run/:runId", authenticateToken, async (req, res) => {
     const src = sourceRunRes.rows[0];
 
     // 2. Insert new line_run.
-    //    When an order is chosen, the run takes that order's style
-    //    (tipo+modelo+correlativo) and color as its own field. Otherwise it keeps
-    //    the source run's style/color. Uniqueness is (line_no, run_date, style, color).
+    //    When an order is chosen, the run takes that order's style and color.
+    //    Otherwise it keeps the source run's style/color.
+    //    Uniqueness is (line_no, run_date, style, color, work_order_id).
     const styleToUse =
       newStyle && String(newStyle).trim() !== "" ? String(newStyle).trim() : src.style;
     const colorToUse =
@@ -3943,7 +3964,7 @@ app.post("/api/duplicate-run/:runId", authenticateToken, async (req, res) => {
     const newRunId = newRunRes.rows[0].id;
 
     // 3. Copy shift_slots – store mapping old slot_id -> new slot_id
-    const slotMap = new Map(); // old slot_id -> new slot_id
+    const slotMap = new Map();
     const slotsRes = await client.query(
       `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours
        FROM shift_slots WHERE run_id = $1 ORDER BY slot_order`,
@@ -4021,15 +4042,19 @@ app.post("/api/duplicate-run/:runId", authenticateToken, async (req, res) => {
       }
     }
 
+    // 7. Same style already on that line/day (other color or other work order):
+    //    same crew, so the copy takes that crew's hours instead of the source's.
+    const crewOwnerId = await adoptCrewShift(client, newRunId);
+
     await client.query("COMMIT");
-    res.json({ success: true, newRunId });
+    res.json({ success: true, newRunId, sharedHoursFromRunId: crewOwnerId });
   } catch (err) {
     await client.query("ROLLBACK");
-    // Unique (line_no, run_date, style, color) collision -> friendly message.
+    // Unique (line, date, style, color, work order) collision -> friendly message.
     if (err.code === "23505") {
       return res.status(409).json({
         success: false,
-        error: "Ya existe una corrida para esa línea, fecha, estilo y color. Elige otro color o fecha.",
+        error: "Ya existe una corrida para esa línea, fecha, estilo, color y orden de trabajo. Elige otra orden o fecha.",
       });
     }
     console.error("❌ Error duplicating run:", err.message);
@@ -4429,6 +4454,47 @@ async function recalcRunTargets(client, runId, workingHours) {
 
   return { newTarget, newTargetPerHour, workingHours: wh };
 }
+
+
+// A new run that joins a style already running on that line/day is the SAME
+// crew (another color or another work order of that style). It must take the
+// existing crew's shift instead of bringing its own: replace its slots with
+// the owner's (lowest id sibling) and recalculate its target. Returns the
+// owner run id, or null when the run is the first of its style that day.
+async function adoptCrewShift(client, runId) {
+  const siblingIds = await getSiblingColorRunIds(client, runId);
+  if (siblingIds.length === 0) return null;
+  const ownerId = siblingIds.reduce((a, b) => (Number(b) < Number(a) ? b : a));
+
+  const ownerSlots = await client.query(
+    `SELECT slot_order, slot_label, slot_start, slot_end, planned_hours
+       FROM shift_slots WHERE run_id = $1 ORDER BY slot_order`,
+    [ownerId]
+  );
+  if (ownerSlots.rows.length === 0) return null;
+
+  // Brand-new run: no production yet, so its slots can be rebuilt safely.
+  await client.query(`DELETE FROM slot_targets WHERE run_id = $1`, [runId]);
+  await client.query(`DELETE FROM shift_slots WHERE run_id = $1`, [runId]);
+
+  let hours = 0;
+  for (const s of ownerSlots.rows) {
+    const ins = await client.query(
+      `INSERT INTO shift_slots (run_id, slot_order, slot_label, slot_start, slot_end, planned_hours)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [runId, s.slot_order, s.slot_label, s.slot_start, s.slot_end, s.planned_hours]
+    );
+    await client.query(
+      `INSERT INTO slot_targets (run_id, slot_id, slot_target, cumulative_target, created_at, updated_at)
+       VALUES ($1, $2, 0, 0, NOW(), NOW())`,
+      [runId, ins.rows[0].id]
+    );
+    hours += parseFloat(s.planned_hours) || 0;
+  }
+  await recalcRunTargets(client, runId, hours);
+  return ownerId;
+}
+
 
 // --------------------------------------------------------------
 // update-working-hours (FIXED)
@@ -6689,7 +6755,7 @@ async function ensureDraftRunForAssignment(client, { lineNo, runDate, workOrderI
        (line_no, run_date, style, operators_count, working_hours, sam_minutes,
         efficiency, target_pcs, target_per_hour, work_order_id, is_draft, created_at, updated_at)
      VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9, $10, true, NOW(), NOW())
-     ON CONFLICT ON CONSTRAINT uq_line_run DO NOTHING
+     ON CONFLICT DO NOTHING
      RETURNING id`,
     [line, runDate, runStyle, operators, hours, sam, eff, targetPcs, targetPerHour, workOrderId ?? null]
   );
