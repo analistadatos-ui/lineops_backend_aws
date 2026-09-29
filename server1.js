@@ -4353,6 +4353,79 @@ app.put("/api/update-operator-count/:runId", authenticateToken, async (req, res)
   }
 });
 
+
+
+// --------------------------------------------------------------
+// Working hours are shared by every color of the same style.
+// A style split into colors (e.g. DAMBOD08 NEG + UVA) is one crew on one
+// shift, so the hours/breaks are set once and copied to the sibling runs.
+// Siblings = same line_no + run_date + style + is_draft, different id.
+// --------------------------------------------------------------
+async function getSiblingColorRunIds(client, runId) {
+  const r = await client.query(
+    `SELECT s.id
+       FROM line_runs s
+       JOIN line_runs p ON p.id = $1
+      WHERE s.id <> p.id
+        AND s.line_no = p.line_no
+        AND s.run_date = p.run_date
+        AND UPPER(TRIM(COALESCE(s.style, ''))) = UPPER(TRIM(COALESCE(p.style, '')))
+        AND s.is_draft = p.is_draft`,
+    [runId]
+  );
+  return r.rows.map((row) => row.id);
+}
+
+// Recalculate target_pcs / target_per_hour / slot_targets for one run using
+// its OWN operators, SAM and efficiency and the given working hours.
+async function recalcRunTargets(client, runId, workingHours) {
+  const runResult = await client.query(
+    `SELECT operators_count, sam_minutes, efficiency FROM line_runs WHERE id = $1`,
+    [runId]
+  );
+  if (runResult.rows.length === 0) return null;
+  const run = runResult.rows[0];
+
+  const operators = parseFloat(run.operators_count) || 0;
+  const sam = parseFloat(run.sam_minutes) || 0;
+  const efficiency = parseFloat(run.efficiency) || 0.7;
+  const wh = parseFloat(workingHours) || 0;
+
+  const piecesAt100 = sam > 0 ? (operators * wh * 60) / sam : 0;
+  const newTarget = piecesAt100 * efficiency;
+  const newTargetPerHour = wh > 0 ? newTarget / wh : 0;
+
+  await client.query(
+    `UPDATE line_runs
+        SET working_hours = $1, target_pcs = $2, target_per_hour = $3, updated_at = NOW()
+      WHERE id = $4`,
+    [wh, newTarget, newTargetPerHour, runId]
+  );
+
+  const slotsResult = await client.query(
+    `SELECT id, planned_hours FROM shift_slots WHERE run_id = $1 ORDER BY slot_order`,
+    [runId]
+  );
+  const totalPlannedHours = slotsResult.rows.reduce(
+    (sum, slot) => sum + (parseFloat(slot.planned_hours) || 0),
+    0
+  );
+  let cumulativeTarget = 0;
+  for (const slot of slotsResult.rows) {
+    const slotHours = parseFloat(slot.planned_hours) || 0;
+    const slotTarget = totalPlannedHours > 0 ? (slotHours / totalPlannedHours) * newTarget : 0;
+    cumulativeTarget += slotTarget;
+    await client.query(
+      `UPDATE slot_targets
+          SET slot_target = $1, cumulative_target = $2, updated_at = NOW()
+        WHERE run_id = $3 AND slot_id = $4`,
+      [slotTarget, cumulativeTarget, runId, slot.id]
+    );
+  }
+
+  return { newTarget, newTargetPerHour, workingHours: wh };
+}
+
 // --------------------------------------------------------------
 // update-working-hours (FIXED)
 // --------------------------------------------------------------
@@ -4443,11 +4516,17 @@ app.put("/api/update-working-hours/:runId", authenticateToken, async (req, res) 
       }
     }
 
+    const siblingIds = await getSiblingColorRunIds(client, runId);
+    for (const siblingId of siblingIds) {
+      await recalcRunTargets(client, siblingId, wh);
+    }
+
     await client.query("COMMIT");
 
     res.json({
       success: true,
       message: "Working hours updated successfully",
+      syncedColorRuns: siblingIds.length,   // <-- new field
       newTarget,
       newTargetPerHour,
       workingHours: wh
@@ -4557,11 +4636,35 @@ app.put("/api/update-shift-slots/:runId", authenticateToken, async (req, res) =>
       );
     }
 
+    const siblingIds = await getSiblingColorRunIds(client, runId);
+    const ownSlots = await client.query(
+      `SELECT slot_order, planned_hours FROM shift_slots WHERE run_id = $1 ORDER BY slot_order`,
+      [runId]
+    );
+    for (const siblingId of siblingIds) {
+      for (const s of ownSlots.rows) {
+        await client.query(
+          `UPDATE shift_slots SET planned_hours = $1 WHERE run_id = $2 AND slot_order = $3`,
+          [parseFloat(s.planned_hours) || 0, siblingId, s.slot_order]
+        );
+      }
+      const sibSlots = await client.query(
+        `SELECT planned_hours FROM shift_slots WHERE run_id = $1`,
+        [siblingId]
+      );
+      const sibHours = sibSlots.rows.reduce(
+        (sum, s) => sum + (parseFloat(s.planned_hours) || 0),
+        0
+      );
+      await recalcRunTargets(client, siblingId, sibHours);
+    }
+
     await client.query("COMMIT");
 
     res.json({
       success: true,
       message: "Shift slots updated successfully",
+      syncedColorRuns: siblingIds.length,   // <-- new field
       workingHours: wh,
       newTarget,
       newTargetPerHour,
