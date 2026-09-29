@@ -1446,6 +1446,7 @@ app.post(
 );
 
 // GET (lista): motivos por fecha y/o línea, para supervisores / tableros.
+// GET (lista): motivos por fecha y/o línea, para supervisores / tableros.
 app.get(
   "/api/efficiency-reasons",
   authenticateToken,
@@ -1453,15 +1454,18 @@ app.get(
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { date, line } = req.query;
+      const { date, startDate, endDate, line } = req.query;
       const params = [];
       const conds = [];
       if (date) { params.push(date); conds.push(`run_date = $${params.length}`); }
+      // Rango de fechas (lo usa la pestaña Messages de ActualEfficiency)
+      if (startDate) { params.push(startDate); conds.push(`run_date >= $${params.length}`); }
+      if (endDate) { params.push(endDate); conds.push(`run_date <= $${params.length}`); }
       if (line) { params.push(String(line)); conds.push(`line_no = $${params.length}`); }
       const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
       const r = await client.query(
         `SELECT id, run_id, line_no, to_char(run_date, 'YYYY-MM-DD') AS run_date,
-                jefe_linea_name, efficiency, reasons, note, updated_at
+                jefe_linea_name, efficiency, reasons, note, created_at, updated_at
            FROM efficiency_reasons ${where}
           ORDER BY run_date DESC, line_no ASC`,
         params
