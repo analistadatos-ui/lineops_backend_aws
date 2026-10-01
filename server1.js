@@ -867,6 +867,102 @@ app.get("/api/me", authenticateToken, (req, res) => {
 });
 
 
+// ======================================================================
+// 🔒 PLAN BOARD LOCK
+// The planner finishes the plan, then clicks "Bloquear tablero". While locked,
+// no assignment, move, insert, delete or settle can happen — from the board,
+// another browser, a script, or any other module. Production capture keeps
+// working (it only updates status / produced quantity, never line/day/qty).
+// ======================================================================
+const BOARD_LOCK_ROLES = ["planner","master", "ceo", "skyrina"];
+
+const readBoardLock = async (client) => {
+  const r = await client.query(
+    `SELECT locked, locked_by, locked_at, note
+       FROM prod_db_schema.plan_board_lock WHERE id = 1`
+  );
+  const row = r.rows[0] || {};
+  return {
+    locked: !!row.locked,
+    lockedBy: row.locked_by || null,
+    lockedAt: row.locked_at || null,
+    note: row.note || null,
+  };
+};
+
+app.get("/api/plan-board-lock", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const lock = await readBoardLock(client);
+    res.json({ success: true, ...lock, canLock: BOARD_LOCK_ROLES.includes(req.user?.role) });
+  } catch (err) {
+    // Table not created yet → report unlocked instead of breaking the board.
+    res.json({ success: true, locked: false, canLock: false, warning: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Body: { locked: true | false, note? }
+app.post("/api/plan-board-lock", authenticateToken, async (req, res) => {
+  if (!BOARD_LOCK_ROLES.includes(req.user?.role)) {
+    return res.status(403).json({ success: false, error: "Su rol no puede bloquear ni desbloquear el Plan Board." });
+  }
+  const locked = req.body?.locked === true;
+  const who = req.user?.full_name || req.user?.username || `user ${req.user?.id}`;
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query(
+      `INSERT INTO prod_db_schema.plan_board_lock (id, locked, locked_by, locked_at, note)
+       VALUES (1, $1, $2, now(), $3)
+       ON CONFLICT (id) DO UPDATE
+         SET locked = EXCLUDED.locked, locked_by = EXCLUDED.locked_by,
+             locked_at = EXCLUDED.locked_at, note = EXCLUDED.note`,
+      [locked, who, req.body?.note || null]
+    );
+    logger.info(`🔒 Plan board ${locked ? "LOCKED" : "UNLOCKED"} by ${who}`);
+    res.json({ success: true, ...(await readBoardLock(client)) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Every write to the board goes through one of these prefixes. Registered here,
+// before those routes and before the pre-order-holds module, so it answers first.
+// Allowed while locked: sending the plan to the lines (/confirm).
+const BOARD_WRITE_PREFIXES = ["/api/line-assignments", "/api/pre-order-holds"];
+const BOARD_WRITE_ALLOWED_WHEN_LOCKED = [/^\/api\/line-assignments\/confirm\/?$/];
+app.use(async (req, res, next) => {
+  if (!["POST", "PATCH", "PUT", "DELETE"].includes(req.method)) return next();
+  if (!BOARD_WRITE_PREFIXES.some((p) => req.path === p || req.path.startsWith(p + "/"))) return next();
+  if (BOARD_WRITE_ALLOWED_WHEN_LOCKED.some((re) => re.test(req.path))) return next();
+  // Read the lock and give the connection back BEFORE calling the route (pool max is 2).
+  let lock = { locked: false };
+  const client = await pool.connect().catch(() => null);
+  if (client) {
+    try {
+      await setSchema(client);
+      lock = await readBoardLock(client);
+    } catch (err) {
+      // Lock table missing (SQL not run yet): don't block; the DB trigger is the backstop.
+    } finally {
+      client.release();
+    }
+  }
+  if (!lock.locked) return next();
+  return res.status(423).json({
+    success: false,
+    boardLocked: true,
+    ...lock,
+    error: `🔒 El Plan Board está bloqueado${lock.lockedBy ? ` por ${lock.lockedBy}` : ""}. Desbloquéelo para asignar, mover, insertar o eliminar.`,
+  });
+});
+
+
 const registerStyleOrders = require("./style-orders");
 registerStyleOrders(app, { authenticateToken, pool, setSchema, generatePresignedGetUrl, generatePresignedPutUrl });
 
