@@ -1459,11 +1459,29 @@ app.post(
 );
 
 // Códigos válidos (deben coincidir con EFFICIENCY_REASONS en LineLeaderPage.jsx)
+// "inefficiencies" reemplaza a "others" en la pantalla; "others" se sigue
+// aceptando solo para no romper registros / clientes antiguos.
 const EFFICIENCY_REASON_CODES = [
   "materials_missing", "trims_missing", "absents",
-  "machine_no_function", "change_style", "others",
+  "machine_no_function", "change_style", "inefficiencies", "others",
 ];
 
+// Asegura la columna action_plan ("qué harás mañana para mejorar") una sola vez
+// por proceso, aunque RUN_MIGRATIONS no esté activo.
+let effReasonColumnsReady = null;
+function ensureEffReasonColumns(client) {
+  if (!effReasonColumnsReady) {
+    effReasonColumnsReady = client
+      .query("ALTER TABLE efficiency_reasons ADD COLUMN IF NOT EXISTS action_plan TEXT;")
+      .catch((e) => {
+        effReasonColumnsReady = null; // reintenta en la siguiente petición
+        throw e;
+      });
+  }
+  return effReasonColumnsReady;
+}
+
+// GET: ¿ya hay un motivo guardado para esta corrida?
 // GET: ¿ya hay un motivo guardado para esta corrida?
 app.get(
   "/api/lineleader/efficiency-reason/:runId",
@@ -1474,10 +1492,11 @@ app.get(
     const client = await pool.connect();
     try {
       await setSchema(client);
+      await ensureEffReasonColumns(client);
       const r = await client.query(
         `SELECT id, run_id, line_no, to_char(run_date, 'YYYY-MM-DD') AS run_date,
                 jefe_linea_id, jefe_linea_name, efficiency, reasons, note,
-                created_at, updated_at
+                action_plan, created_at, updated_at
            FROM efficiency_reasons
           WHERE run_id = $1`,
         [req.params.runId]
@@ -1486,7 +1505,6 @@ app.get(
     } catch (err) { next(err); } finally { client.release(); }
   }
 );
-
 // POST: guardar / actualizar el motivo de baja eficiencia de una corrida.
 app.post(
   "/api/lineleader/efficiency-reason/:runId",
@@ -1500,8 +1518,9 @@ app.post(
     const client = await pool.connect();
     try {
       await setSchema(client);
+      await ensureEffReasonColumns(client);
       const { runId } = req.params;
-      const { reasons, note, efficiency } = req.body;
+      const { reasons, note, efficiency, action_plan } = req.body;
 
       const runRes = await client.query(
         `SELECT line_no, to_char(run_date, 'YYYY-MM-DD') AS run_date
@@ -1525,6 +1544,15 @@ app.post(
         return res.status(400).json({ success: false, error: "Motivos inválidos" });
       }
 
+      // "Ineficiencias" requiere el plan de acción para mañana.
+      const cleanActionPlan = action_plan ? String(action_plan).trim() : "";
+      if (cleanReasons.includes("inefficiencies") && !cleanActionPlan) {
+        return res.status(400).json({
+          success: false,
+          error: "Escribe qué harás mañana para mejorar (Ineficiencias).",
+        });
+      }
+
       const effNum =
         efficiency === undefined || efficiency === null || efficiency === ""
           ? null : Number(efficiency);
@@ -1532,21 +1560,23 @@ app.post(
       const result = await client.query(
         `INSERT INTO efficiency_reasons
            (run_id, line_no, run_date, jefe_linea_id, jefe_linea_name,
-            efficiency, reasons, note, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+            efficiency, reasons, note, action_plan, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
          ON CONFLICT (run_id) DO UPDATE SET
            reasons = EXCLUDED.reasons,
            note = EXCLUDED.note,
+           action_plan = EXCLUDED.action_plan,
            efficiency = EXCLUDED.efficiency,
            jefe_linea_id = EXCLUDED.jefe_linea_id,
            jefe_linea_name = EXCLUDED.jefe_linea_name,
            updated_at = NOW()
          RETURNING id, run_id, line_no, to_char(run_date, 'YYYY-MM-DD') AS run_date,
                    jefe_linea_id, jefe_linea_name, efficiency, reasons, note,
-                   created_at, updated_at`,
+                   action_plan, created_at, updated_at`,
         [runId, run.line_no, run.run_date, req.user.id,
          req.user.full_name || req.user.username, effNum, cleanReasons,
-         note ? String(note).trim() : null]
+         note ? String(note).trim() : null,
+         cleanReasons.includes("inefficiencies") ? cleanActionPlan : null]
       );
 
       logger.info("Efficiency reason saved", {
@@ -1568,6 +1598,7 @@ app.get(
     const client = await pool.connect();
     try {
       await setSchema(client);
+      await ensureEffReasonColumns(client);
       const { date, startDate, endDate, line } = req.query;
       const params = [];
       const conds = [];
@@ -1579,7 +1610,8 @@ app.get(
       const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
       const r = await client.query(
         `SELECT id, run_id, line_no, to_char(run_date, 'YYYY-MM-DD') AS run_date,
-                jefe_linea_name, efficiency, reasons, note, created_at, updated_at
+                jefe_linea_name, efficiency, reasons, note, action_plan,
+                created_at, updated_at
            FROM efficiency_reasons ${where}
           ORDER BY run_date DESC, line_no ASC`,
         params
