@@ -191,7 +191,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { workOrderId, fabric, fabricCode, cutDate, quantity, notes, yieldPerPiece, color, sizes, styleNo, season, fabrics, priority } = req.body;
+      const { workOrderId, fabric, fabricCode, cutDate, quantity, notes, yieldPerPiece, color, sizes, styleNo, season, fabrics, priority, allowExtra } = req.body;
 
       const VALID_PRIORITIES = ["urgent", "intermediate", "normal"];
       const priorityFinal = VALID_PRIORITIES.includes(priority) ? priority : "normal";
@@ -233,9 +233,61 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       const sumLen = fabricsArr.reduce((s, f) => s + (f.totalLength || 0), 0);
       const totalLength = sumLen > 0 ? sumLen : (repYield != null ? repYield * qty : null);
 
-      const wo = await client.query("SELECT id, style_code, season FROM work_orders WHERE id = $1", [parseInt(workOrderId)]);
+      // ── ANTI-DUPLICADO ────────────────────────────────────────────────────
+      // Transacción + candado por (orden, color): dos clics, dos pestañas o dos
+      // planners a la vez quedan en fila; el segundo ya ve el corte del primero.
+      // Regla: lo activo (no cancelado) de esa orden+color + lo nuevo no puede
+      // pasar las piezas del color. Si se rebasa → 409 con lo que ya existe.
+      // allowExtra:true (confirmado por el planner en pantalla) permite un
+      // recorte adicional a propósito.
+      await client.query("BEGIN");
+      const colorKey = String(color || "").trim().toUpperCase();
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`cut|${parseInt(workOrderId)}|${colorKey}`]);
+
+      const wo = await client.query(
+        "SELECT id, style_code, season, work_order_no, total_to_produce, quantity FROM work_orders WHERE id = $1",
+        [parseInt(workOrderId)]
+      );
       if (wo.rows.length === 0) {
+        await client.query("ROLLBACK");
         return res.status(404).json({ success: false, error: "Work order not found" });
+      }
+
+      // Piezas del color (de las líneas de la orden); sin líneas, el total de la orden.
+      const lineQty = await client.query(
+        `SELECT COUNT(*)::int AS n,
+                COALESCE(SUM(quantity) FILTER (WHERE UPPER(TRIM(color)) = $2), 0) AS color_qty,
+                COALESCE(SUM(quantity), 0) AS all_qty
+           FROM work_order_lines WHERE work_order_id = $1`,
+        [parseInt(workOrderId), colorKey]
+      );
+      const lq = lineQty.rows[0];
+      const woTotal = Number(wo.rows[0].total_to_produce) || Number(wo.rows[0].quantity) || 0;
+      const limit = lq.n > 0 ? (colorKey ? Number(lq.color_qty) : Number(lq.all_qty)) : woTotal;
+
+      const existing = await client.query(
+        `SELECT id, quantity, status, to_char(cut_date, 'YYYY-MM-DD') AS cut_date
+           FROM cut_orders
+          WHERE work_order_id = $1
+            AND UPPER(TRIM(COALESCE(color, ''))) = $2
+            AND status <> 'cancelled'
+          ORDER BY id`,
+        [parseInt(workOrderId), colorKey]
+      );
+      const alreadyCut = existing.rows.reduce((sum, r) => sum + (Number(r.quantity) || 0), 0);
+      const remaining = Math.max(limit - alreadyCut, 0);
+      if (limit > 0 && alreadyCut + qty > limit + 0.001 && allowExtra !== true) {
+        await client.query("ROLLBACK");
+        const list = existing.rows.map((r) => `CORTE-${String(r.id).padStart(4, "0")}`).join(", ");
+        return res.status(409).json({
+          success: false,
+          code: "CUT_DUPLICATE",
+          error: remaining <= 0
+            ? `${wo.rows[0].work_order_no}${colorKey ? ` color ${colorKey}` : ""} ya tiene corte completo (${list}).`
+            : `${wo.rows[0].work_order_no}${colorKey ? ` color ${colorKey}` : ""} solo tiene ${Math.round(remaining)} pzas por asignar (ya en corte: ${list}).`,
+          remaining,
+          existing: existing.rows,
+        });
       }
       const styleNoFinal = styleNo || wo.rows[0].style_code || null;
       const seasonFinal = season || wo.rows[0].season || null;
@@ -248,8 +300,10 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
          Array.isArray(sizes) && sizes.length ? JSON.stringify(sizes) : null, styleNoFinal, seasonFinal,
          JSON.stringify(fabricsArr), priorityFinal]
       );
+      await client.query("COMMIT");
       res.json({ success: true, cutOrder: result.rows[0] });
     } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
       console.error("❌ Error creating cut order:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
