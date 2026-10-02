@@ -632,6 +632,7 @@ await registerMerchantAnalytics.initSchema({ pool, setSchema });
 await registerMerchantPlan.initSchema({ pool, setSchema });
 await registerPreOrderHolds.initSchema({ pool, setSchema });   // ← add
 await registerCutOrders.initSchema({ pool, setSchema });
+await registerCutOrderRequests.initSchema({ pool, setSchema });   // solicitudes de corte (después de cut_orders)
 await registerBom.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
 await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
@@ -1008,6 +1009,10 @@ registerFinishedWarehouse(app, { authenticateToken, pool, setSchema });
 
 const registerCutOrders = require("./cut-orders");
 registerCutOrders(app, { authenticateToken, pool, setSchema });
+
+// Solicitudes de corte: corte pide una orden, planeación la asigna o la rechaza.
+const registerCutOrderRequests = require("./cut-order-requests");
+registerCutOrderRequests(app, { authenticateToken, pool, setSchema });
 
 const registerOrderSets = require("./order-sets");
 registerOrderSets(app, { authenticateToken, pool, setSchema });

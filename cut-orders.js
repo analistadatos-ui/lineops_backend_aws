@@ -116,6 +116,11 @@ function verifierName(user) {
  * @param {import('pg').Pool} deps.pool
  * @param {(client: any) => Promise<void>} deps.setSchema
  */
+// Solicitudes de corte (cut-order-requests.js): al crear un corte se cierra la
+// solicitud pendiente de esa orden+color. Opcional: sin el módulo, no pasa nada.
+let fulfillPendingRequests = null;
+try { ({ fulfillPendingRequests } = require("./cut-order-requests")); } catch (_) { fulfillPendingRequests = null; }
+
 function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
   // List all cut orders (newest first), with work-order info joined in.
   app.get("/api/cut-orders", authenticateToken, async (req, res) => {
@@ -300,8 +305,15 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
          Array.isArray(sizes) && sizes.length ? JSON.stringify(sizes) : null, styleNoFinal, seasonFinal,
          JSON.stringify(fabricsArr), priorityFinal]
       );
+      // Cierra la solicitud de corte pendiente (si la había) en la MISMA transacción.
+      let fulfilledRequests = 0;
+      if (fulfillPendingRequests) {
+        fulfilledRequests = await fulfillPendingRequests(client, {
+          workOrderId, color, cutOrderId: result.rows[0].id, user: req.user,
+        });
+      }
       await client.query("COMMIT");
-      res.json({ success: true, cutOrder: result.rows[0] });
+      res.json({ success: true, cutOrder: result.rows[0], fulfilledRequests });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       console.error("❌ Error creating cut order:", err.message);
