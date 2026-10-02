@@ -61,6 +61,7 @@ app.use(
       }
     },
     credentials: true,
+    maxAge: 7200, // browser caches the OPTIONS preflight for 2 h
   })
 );
 
@@ -114,8 +115,10 @@ const pool = new Pool({
 });
 
 pool.on("error", (err) => {
-  logger.error("Unexpected database pool error", { error: err.message, stack: err.stack });
-  process.exit(-1);
+  // An IDLE client was dropped (e.g. RDS Proxy closed it). pg discards it and
+  // the next pool.connect() opens a fresh one. Exiting here killed the Lambda
+  // container and made in-flight requests return 502.
+  logger.error("Unexpected database pool error (idle client dropped)", { error: err.message });
 });
 
 const setSchema = async (client) => {
