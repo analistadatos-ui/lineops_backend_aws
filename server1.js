@@ -2625,10 +2625,14 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       const hrows = await registerHolidays.holidaysBetween(client, { from: assignedDate, to: addDaysStr(assignedDate, 730) });
       for (const h of hrows) if (h.line_no == null || String(h.line_no) === String(lineNo)) holidaySet.add(h.holiday_date);
     } catch (e) { console.warn("⚠️  holidays not available for move:", e.message); }
+    // 🔒 Semanas bloqueadas por el CEO: el reparto las BRINCA y sigue en la
+    // siguiente semana libre (si no, el trigger rechazaría todo el movimiento).
+    const lockedWeeks = await planWeekLocks.lockedWeekSet(client);
  
     while (remaining > 0 && scanned < MAX_DAYS) {
       scanned++;
       if (isWeekend(dayStr) || holidaySet.has(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend / holiday work
+      if (planWeekLocks.isLockedDay(lockedWeeks, dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; } // 🔒 semana bloqueada
       const cap = await plannerStyleParams.cellCapacity(client, { lineNo: String(lineNo), date: dayStr, style: moveStyle });
       const available = cap.available;
       if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
@@ -2683,6 +2687,7 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     client.release();
   }
 });
+ 
 
 
 // ---------------------------------------------------------------------------
@@ -2721,14 +2726,19 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
     const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
     return dow === 0 || dow === 6;
   };
-  // Next production day: +1, then hop over Sat/Sun.
+  // 🔒 Semanas bloqueadas por el CEO (lunes "YYYY-MM-DD"); se cargan abajo.
+  let lockedWeeks = new Set();
+  // Next production day: +1, then hop over Sat/Sun and CEO-locked weeks. Cells
+  // inside a locked week are pinned (left out of the tail), and the push jumps
+  // over that week, so the line slides around it without touching it.
   const nextWorkday = (ymdStr) => {
     let d = addDaysStr(ymdStr, 1);
-    while (isWeekend(d)) d = addDaysStr(d, 1);
+    while (isWeekend(d) || planWeekLocks.isLockedDay(lockedWeeks, d)) d = addDaysStr(d, 1);
     return d;
   };
   try {
     await setSchema(client);
+    lockedWeeks = await planWeekLocks.lockedWeekSet(client);
     const id = parseInt(req.params.id);
     const { lineNo, assignedDate } = req.body;
     if (!lineNo || !assignedDate) {
@@ -2765,12 +2775,14 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
     // 2) Push the whole tail of the target line forward one workday, latest
     //    first, so each block lands on a slot the next block already vacated.
     //    The occupant of D itself is part of the tail, so D ends up empty.
+    //    🔒 Cells in CEO-locked weeks are NOT part of the tail: they stay put.
     const tail = await client.query(
       `SELECT id, to_char(assigned_date, 'YYYY-MM-DD') AS d
          FROM line_assignments
         WHERE line_no = $1
           AND assigned_date >= $2
           AND status = 'planned'
+          AND ${planWeekLocks.notInLockedWeekSql("assigned_date")}
         ORDER BY assigned_date DESC, id DESC`,
       [targetLine, D]
     );
@@ -2912,6 +2924,9 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
       const hrows = await registerHolidays.holidaysBetween(client, { from: assignedDate, to: addDaysStr(assignedDate, 730) });
       for (const h of hrows) if (h.line_no == null || String(h.line_no) === String(lineNo)) holidaySet.add(h.holiday_date);
     } catch (e) { console.warn("⚠️  holidays not available for move-batch:", e.message); }
+    // 🔒 Semanas bloqueadas por el CEO: el reparto las BRINCA y sigue en la
+    // siguiente semana libre (si no, el trigger rechazaría todo el movimiento).
+    const lockedWeeks = await planWeekLocks.lockedWeekSet(client);
  
     for (const original of cur.rows) {
       const totalQty = parseFloat(original.assigned_quantity) || 0;
@@ -2936,6 +2951,7 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
       while (remaining > 0 && scanned < MAX_DAYS) {
         scanned++;
         if (isWeekend(dayStr) || holidaySet.has(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; } // no weekend / holiday work
+        if (planWeekLocks.isLockedDay(lockedWeeks, dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; } // 🔒 semana bloqueada
         const cap = await plannerStyleParams.cellCapacity(client, { lineNo: String(lineNo), date: dayStr, style: batchStyle });
         const available = cap.available;
         if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
@@ -3041,7 +3057,11 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
   // Days blocked for the target line (registered holidays / line stoppages),
   // populated once per request below — before any workday hop consults it.
   const holidaySet = new Set();
-  const isBlocked = (ymdStr) => isWeekend(ymdStr) || holidaySet.has(ymdStr);
+  // 🔒 CEO-locked weeks behave like holidays for every hop below: newcomers never
+  // land there and the tail jumps over them. Their own cells are pinned (left
+  // out of the tail query), so a locked week is never touched by an insert.
+  let lockedWeeks = new Set();
+  const isBlocked = (ymdStr) => isWeekend(ymdStr) || holidaySet.has(ymdStr) || planWeekLocks.isLockedDay(lockedWeeks, ymdStr);
   const nextWorkday = (ymdStr) => {
     let d = addDaysStr(ymdStr, 1);
     while (isBlocked(d)) d = addDaysStr(d, 1);
@@ -3088,6 +3108,15 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
       }
     } catch (e) {
       console.warn("⚠️  holidays not available for insert-shift-batch:", e.message);
+    }
+    lockedWeeks = await planWeekLocks.lockedWeekSet(client);
+    if (planWeekLocks.isLockedDay(lockedWeeks, assignedDate)) {
+      return res.status(423).json({
+        success: false,
+        locked: true,
+        weekStart: planWeekLocks.weekStartOf(assignedDate),
+        error: "🔒 La semana destino está bloqueada por el CEO. Elija un día de una semana abierta.",
+      });
     }
  
     // The destination day itself must be a working day for this line.
@@ -3170,10 +3199,13 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
     //    the moved order are closed. The shift never grows with the date, so
     //    order is preserved, rows can't collide, and slots D..lastSlot are
     //    always clear for the newcomers.
+    //    🔒 Rows in CEO-locked weeks are pinned: not shifted, not snapshotted,
+    //    so neither the insert nor its undo ever touches them.
     const tailRes = await client.query(
       `SELECT ${SNAP_COLS}
          FROM line_assignments
         WHERE line_no = $1 AND assigned_date >= $2 AND status = 'planned'
+          AND ${planWeekLocks.notInLockedWeekSql("assigned_date")}
         ORDER BY assigned_date DESC, id DESC`,
       [targetLine, D]
     );
@@ -3255,6 +3287,7 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
     client.release();
   }
 });
+ 
 // ---------------------------------------------------------------------------
 // POST /api/line-assignments/insert-shift-undo
 //

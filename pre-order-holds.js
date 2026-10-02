@@ -88,6 +88,9 @@ async function initSchema({ pool, setSchema }) {
 // A hold now reserves capacity measured with ITS style's standard, exactly
 // like a real PO, and the server refuses a hold that doesn't fit the day.
 const plannerStyleParams = require("./planner-style-params");
+// 🔒 Candado de semanas del CEO: una reserva PRE no se crea, cambia ni borra
+// en una semana bloqueada (trigger en pre_order_day_holds, opt-in con enforce).
+const planWeekLocks = require("./plan-week-locks");
 
 // --- coercion helpers ------------------------------------------------------
 const txt = (v, n) => (v == null ? null : String(v).trim().slice(0, n || 200) || null);
@@ -166,6 +169,7 @@ function registerPreOrderHolds(app, deps) {
     try {
       await setSchema(client);
       await client.query("BEGIN");
+      await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
       // Serialize writers on this line-day so two drops can't both take the
       // last free pieces.
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`hold|${String(lineNo).trim()}|${assignedDate}`]);
@@ -230,6 +234,7 @@ function registerPreOrderHolds(app, deps) {
       res.json({ success: true, hold: rows[0] });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
+      if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
       console.error("\u274c POST /api/pre-order-holds:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
@@ -247,11 +252,18 @@ function registerPreOrderHolds(app, deps) {
     const client = await pool.connect();
     try {
       await setSchema(client);
+      // All-or-nothing, como al borrar POs: si alguna reserva cae en una semana
+      // bloqueada, no se borra ninguna y el tablero muestra el aviso del candado.
+      await client.query("BEGIN");
+      await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
       const { rowCount } = id != null
         ? await client.query("DELETE FROM pre_order_day_holds WHERE id = $1", [parseInt(id, 10)])
         : await client.query("DELETE FROM pre_order_day_holds WHERE pre_order_id = $1", [parseInt(preOrderId, 10)]);
+      await client.query("COMMIT");
       res.json({ success: true, deleted: rowCount });
     } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
       console.error("\u274c DELETE /api/pre-order-holds:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
