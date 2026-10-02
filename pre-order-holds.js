@@ -116,8 +116,12 @@ function registerPreOrderHolds(app, deps) {
         `SELECT h.id, h.pre_order_id, h.line_no,
                 to_char(h.assigned_date, 'YYYY-MM-DD') AS assigned_date,
                 h.quantity, h.color, h.pre_order_no, h.customer_name, h.style_code, h.estilo,
-                h.updated_at
+                h.updated_at,
+                -- Fecha de entrega de la pre-orden: viaja con cada reserva para
+                -- que el tablero marque a tiempo / atrasada sin otra consulta.
+                to_char(p.target_date, 'YYYY-MM-DD') AS target_date
            FROM pre_order_day_holds h
+           LEFT JOIN pre_orders p ON p.id = h.pre_order_id
           ${where.length ? "WHERE " + where.map((w) => "h." + w).join(" AND ") : ""}
           ORDER BY h.assigned_date, h.line_no, h.pre_order_no`,
         params
