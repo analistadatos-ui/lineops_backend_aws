@@ -111,8 +111,54 @@ const pool = new Pool({
       : false,
   max: Number(process.env.PG_POOL_MAX) || 2, // low: one small pool per Lambda instance, behind RDS Proxy
   idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT) || 30000,
-  connectionTimeoutMillis: Number(process.env.PG_CONNECTION_TIMEOUT) || 5000,
+    connectionTimeoutMillis: Number(process.env.PG_CONNECTION_TIMEOUT) || 5000,
+  keepAlive: true,
 });
+
+// ----------------------------------------------------------------------
+// CONEXIONES MUERTAS EN LAMBDA
+// Lambda congela el contenedor entre peticiones. Si Aurora se pausó o cerró
+// el socket, al descongelar el pool entregaba una conexión muerta → 500 en
+// todos los endpoints a la vez. Ahora se prueba con SELECT 1 la conexión que
+// estuvo inactiva; si está muerta se destruye y se abre otra (hasta 3 veces).
+// ----------------------------------------------------------------------
+const PG_DEAD_CONN = /Connection terminated|ECONNRESET|EPIPE|ETIMEDOUT|terminating connection|server closed the connection|Client has encountered a connection error|not queryable|Connection ended/i;
+const PG_VALIDATE_IDLE_MS = 10000; // usadas hace <10 s se entregan sin probar
+const _poolConnect = pool.connect.bind(pool);
+pool.connect = async function (cb) {
+  if (typeof cb === "function") return _poolConnect(cb); // estilo callback: sin cambios
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const client = await _poolConnect();
+    if (!client.__lastUsedAt || Date.now() - client.__lastUsedAt > PG_VALIDATE_IDLE_MS) {
+      try {
+        await client.query("SELECT 1");
+      } catch (err) {
+        lastErr = err;
+        try { client.release(err); } catch (_) { /* ya destruida */ } // release(err) = destruir
+        if (!PG_DEAD_CONN.test(err?.message || "")) throw err;
+        logger.warn("♻️  Conexión de BD muerta descartada; reintentando", { attempt: attempt + 1, error: err.message });
+        continue;
+      }
+    }
+    client.__lastUsedAt = Date.now();
+    return client;
+  }
+  throw lastErr;
+};
+
+// pool.query(...) directo: si la conexión estaba muerta, reintenta UNA vez.
+const _poolQuery = pool.query.bind(pool);
+pool.query = async function (...args) {
+  if (typeof args[args.length - 1] === "function") return _poolQuery(...args);
+  try {
+    return await _poolQuery(...args);
+  } catch (err) {
+    if (!PG_DEAD_CONN.test(err?.message || "")) throw err;
+    logger.warn("♻️  pool.query con conexión muerta; reintentando una vez", { error: err.message });
+    return _poolQuery(...args);
+  }
+};
 
 pool.on("error", (err) => {
   // An IDLE client was dropped (e.g. RDS Proxy closed it). pg discards it and
