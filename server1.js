@@ -5445,8 +5445,82 @@ app.get("/api/quality/lines/:lineNo/runs", authenticateToken, requireQualityInsp
 });
 
 /**
+ * GET /api/quality/lines/:lineNo/orders?date=YYYY-MM-DD
+ * Work orders on a line for ONE day (default: today). An order is listed when it
+ * has a line_run on that line that day, or is planned there that day in
+ * line_assignments. Each order carries the production styles (style_code, e.g.
+ * DAMCHA03) of its runs on that line; the page uses that day's runs, else the
+ * latest run, else work_orders.style_code. work_orders.estilo is the customer's
+ * 6-char style (e.g. FN2809) and is NOT a production style, so it isn't sent.
+ * Also returns that day's runs on the line that have no work order linked.
+ * The page sends its local date, because CURRENT_DATE on the DB server can
+ * already be "tomorrow" in the evening (UTC vs Mexico City).
+ */
+app.get("/api/quality/lines/:lineNo/orders", authenticateToken, requireQualityInspector, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { lineNo } = req.params;
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || '') ? req.query.date : null;
+
+    const orders = await client.query(`
+      WITH day AS (SELECT COALESCE($2::date, CURRENT_DATE) AS d),
+      cand AS (
+        SELECT lr.work_order_id AS wo_id
+        FROM line_runs lr, day
+        WHERE lr.line_no = $1 AND lr.work_order_id IS NOT NULL AND lr.run_date = day.d
+        UNION
+        SELECT la.work_order_id
+        FROM line_assignments la, day
+        WHERE la.line_no = $1 AND la.status <> 'cancelled' AND la.assigned_date = day.d
+      )
+      SELECT wo.id, wo.work_order_no, COALESCE(c.name, wo.customer_name) AS customer_name,
+             wo.quantity, wo.color, wo.style_description, wo.status,
+             NULLIF(TRIM(wo.style_code), '') AS style_code,
+             COALESCE((
+               SELECT json_agg(json_build_object(
+                        'run_id', s.id, 'style', s.style,
+                        'run_date', to_char(s.run_date, 'YYYY-MM-DD'),
+                        'target_pcs', s.target_pcs, 'operators_count', s.operators_count))
+               FROM (
+                 SELECT DISTINCT ON (lr.style) lr.id, lr.style, lr.run_date, lr.target_pcs, lr.operators_count
+                 FROM line_runs lr, day
+                 WHERE lr.line_no = $1 AND lr.work_order_id = wo.id AND lr.run_date <= day.d
+                 ORDER BY lr.style, lr.run_date DESC, lr.id DESC
+               ) s
+             ), '[]'::json) AS runs
+      FROM cand
+      JOIN work_orders wo ON wo.id = cand.wo_id
+      LEFT JOIN customers c ON c.id = wo.customer_id
+      WHERE wo.status <> 'cancelled'
+      ORDER BY wo.work_order_no
+    `, [lineNo, date]);
+
+    // That day's runs with no work order linked, so capture is never blocked.
+    const unlinked = await client.query(`
+      SELECT DISTINCT ON (lr.style) lr.id AS run_id, lr.style,
+             to_char(lr.run_date, 'YYYY-MM-DD') AS run_date, lr.target_pcs, lr.operators_count
+      FROM line_runs lr
+      WHERE lr.line_no = $1 AND lr.work_order_id IS NULL
+        AND lr.run_date = COALESCE($2::date, CURRENT_DATE)
+      ORDER BY lr.style, lr.id DESC
+    `, [lineNo, date]);
+
+    res.json({ success: true, date: date, orders: orders.rows, unlinkedRuns: unlinked.rows });
+  } catch (err) {
+    console.error("❌ Error fetching line orders:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+/**
  * GET /api/quality/inspections/:lineNo
- * Returns inspections for a specific line
+ * Returns inspections for a specific line.
+ * Optional query: date=YYYY-MM-DD, style, workOrderId ("none" = no order).
+ * Quality inspector accounts only ever see their own inspections.
  */
 app.get("/api/quality/inspections/:lineNo", authenticateToken, requireQualityInspector, async (req, res) => {
   const client = await pool.connect();
@@ -5454,7 +5528,16 @@ app.get("/api/quality/inspections/:lineNo", authenticateToken, requireQualityIns
     await setSchema(client);
     
     const { lineNo } = req.params;
-    
+    const { date, style, workOrderId } = req.query;
+
+    const where = ['i.line_no = $1'];
+    const params = [lineNo];
+    if (req.user.role === 'quality_inspector') { params.push(req.user.id); where.push(`i.inspector_user_id = $${params.length}`); }
+    if (date) { params.push(date); where.push(`i.inspection_date = $${params.length}`); }
+    if (style) { params.push(style); where.push(`i.style = $${params.length}`); }
+    if (workOrderId === 'none') where.push('i.work_order_id IS NULL');
+    else if (workOrderId) { params.push(workOrderId); where.push(`i.work_order_id = $${params.length}`); }
+
     const result = await client.query(`
       SELECT i.*, 
              to_char(i.inspection_date, 'YYYY-MM-DD') as inspection_date,
@@ -5462,10 +5545,10 @@ app.get("/api/quality/inspections/:lineNo", authenticateToken, requireQualityIns
              COALESCE(SUM(de.defect_quantity), 0) as total_defects
       FROM quality_inspections i
       LEFT JOIN quality_defect_entries de ON i.id = de.inspection_id
-      WHERE i.line_no = $1
+      WHERE ${where.join(' AND ')}
       GROUP BY i.id
       ORDER BY i.inspection_date DESC, i.created_at DESC
-    `, [lineNo]);
+    `, params);
     
     res.json({
       success: true,
@@ -5573,6 +5656,8 @@ app.get("/api/quality/defect-types", authenticateToken, requireQualityInspector,
     client.release();
   }
 });
+
+
 /**
  * POST /api/quality/inspection
  * Create a new inspection
@@ -5586,7 +5671,7 @@ app.post("/api/quality/inspection", authenticateToken, requireQualityInspector, 
     const { 
       lineNo, 
       style,
-      inspectorName, 
+      workOrderId,
       inspectionDate,
       shiftSlot,
       totalCheckedQuantity,
@@ -5594,11 +5679,23 @@ app.post("/api/quality/inspection", authenticateToken, requireQualityInspector, 
       defects 
     } = req.body;
     
-    if (!lineNo || !inspectorName || !defects || !Array.isArray(defects)) {
+    if (!lineNo || !defects || !Array.isArray(defects)) {
+      await client.query("ROLLBACK");
       return res.status(400).json({
         success: false,
-        error: "Missing required fields: lineNo, inspectorName, and defects array"
+        error: "Missing required fields: lineNo and defects array"
       });
+    }
+
+    // The inspector is always the logged-in account, never a typed name.
+    const inspectorName = req.user.full_name || req.user.username;
+
+    if (workOrderId) {
+      const wo = await client.query(`SELECT id FROM work_orders WHERE id = $1`, [workOrderId]);
+      if (wo.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, error: "Work order not found" });
+      }
     }
     
     const totalDefects = defects.reduce((sum, d) => sum + (d.quantity || 1), 0);
@@ -5606,9 +5703,10 @@ app.post("/api/quality/inspection", authenticateToken, requireQualityInspector, 
     const inspectionResult = await client.query(`
       INSERT INTO quality_inspections (
         line_no, style, inspector_name, inspection_date, shift_slot, 
-        total_defects, total_checked_quantity, notes, created_at, updated_at
+        total_defects, total_checked_quantity, notes, work_order_id, inspector_user_id,
+        created_at, updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
       RETURNING id
     `, [
       lineNo,
@@ -5618,7 +5716,9 @@ app.post("/api/quality/inspection", authenticateToken, requireQualityInspector, 
       shiftSlot || null,
       totalDefects,
       totalCheckedQuantity || 0,
-      notes || null
+      notes || null,
+      workOrderId || null,
+      req.user.id
     ]);
     
     const inspectionId = inspectionResult.rows[0].id;
@@ -5689,12 +5789,17 @@ app.delete("/api/quality/inspection/:inspectionId", authenticateToken, requireQu
     const { inspectionId } = req.params;
     
     const checkResult = await client.query(
-      `SELECT id FROM quality_inspections WHERE id = $1`,
+      `SELECT id, inspector_user_id FROM quality_inspections WHERE id = $1`,
       [inspectionId]
     );
     
     if (checkResult.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ success: false, error: "Inspection not found" });
+    }
+    if (req.user.role === 'quality_inspector' && String(checkResult.rows[0].inspector_user_id) !== String(req.user.id)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ success: false, error: "You can only delete your own inspections" });
     }
     
     await client.query(`DELETE FROM quality_inspections WHERE id = $1`, [inspectionId]);
@@ -5744,11 +5849,15 @@ app.get("/api/quality/run-operators/:runId", authenticateToken, requireQualityIn
   }
 });
 
+
 /**
  * GET /api/quality/analytics
  * CEO analytical view of the quality_inspections table.
  * Query params: startDate=YYYY-MM-DD, endDate=YYYY-MM-DD (defaults to today),
- *   line (optional), style (optional).
+ *   line, style, client (customer name), workOrder (work_orders.id) — all optional.
+ * The work order saved on the inspection is used when present; older inspections
+ * are resolved through line_runs (same line + style, latest run on/before the
+ * inspection date), falling back to that day's line_assignments for the line.
  * Returns aggregated defect data for the selected period.
  */
 app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
@@ -5763,26 +5872,82 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
     const startDate = req.query.startDate || today;
     const endDate = req.query.endDate || startDate;
-    const { line, style } = req.query;
+    const { line, style, client: clientName, workOrder } = req.query;
 
-    // Build the optional line/style filter that applies to the inspections table (alias i)
+    // Inspections enriched with their work order + client. The date range is
+    // applied inside so the lateral lookup only runs for rows in the period.
+    const insp = `(
+      SELECT q.id, q.line_no, q.style, q.inspector_name, q.inspector_user_id,
+             q.inspection_date, q.shift_slot, q.total_defects, q.total_checked_quantity,
+             q.bad_type, q.bad_reason, q.notes, q.created_at, q.updated_at,
+             wl.work_order_id, wl.work_order_no, wl.customer_name
+      FROM quality_inspections q
+      LEFT JOIN LATERAL (
+        SELECT wo.id AS work_order_id, wo.work_order_no,
+               COALESCE(c.name, wo.customer_name) AS customer_name
+        FROM (
+          SELECT q.work_order_id AS wo_id, -1 AS pri, q.inspection_date AS d, 0::numeric AS qty
+          WHERE q.work_order_id IS NOT NULL
+          UNION ALL
+          SELECT lr.work_order_id, 0, lr.run_date, 0::numeric
+          FROM line_runs lr
+          WHERE lr.line_no = q.line_no
+            AND lr.style = q.style
+            AND lr.work_order_id IS NOT NULL
+            AND lr.run_date <= q.inspection_date
+          UNION ALL
+          SELECT la.work_order_id, 1, la.assigned_date, la.assigned_quantity
+          FROM line_assignments la
+          WHERE la.line_no = q.line_no
+            AND la.assigned_date = q.inspection_date
+            AND la.status <> 'cancelled'
+        ) cand
+        JOIN work_orders wo ON wo.id = cand.wo_id
+        LEFT JOIN customers c ON c.id = wo.customer_id
+        ORDER BY cand.pri, cand.d DESC, cand.qty DESC
+        LIMIT 1
+      ) wl ON true
+      WHERE q.inspection_date BETWEEN $1 AND $2
+    )`;
+
+    // Build the optional filters that apply to the enriched inspections (alias i)
     const filters = [];
     const params = [startDate, endDate];
     let p = 3;
     if (line && line !== 'all') { filters.push(`i.line_no = $${p++}`); params.push(line); }
     if (style && style !== 'all') { filters.push(`i.style = $${p++}`); params.push(style); }
+    if (clientName && clientName !== 'all') { filters.push(`i.customer_name = $${p++}`); params.push(clientName); }
+    if (workOrder && workOrder !== 'all') { filters.push(`i.work_order_id = $${p++}`); params.push(workOrder); }
     const extra = filters.length ? ` AND ${filters.join(' AND ')}` : '';
     const dateWhere = `i.inspection_date BETWEEN $1 AND $2${extra}`;
 
-    // 1. Headline KPIs. Defect totals come from the entries; checked quantity is a
-    // per-inspection figure, so it is summed in a separate subquery to avoid the
-    // row multiplication caused by joining the entries table.
+    // Dropdown options for client / work order. They ignore the other filters so
+    // picking one doesn't empty its own list; work orders narrow to the chosen client.
+    const clientOptions = await client.query(`
+      SELECT DISTINCT i.customer_name AS name
+      FROM ${insp} i
+      WHERE i.customer_name IS NOT NULL
+      ORDER BY 1
+    `, [startDate, endDate]);
+
+    const woParams = [startDate, endDate];
+    let woWhere = 'i.work_order_id IS NOT NULL';
+    if (clientName && clientName !== 'all') { woWhere += ' AND i.customer_name = $3'; woParams.push(clientName); }
+    const workOrderOptions = await client.query(`
+      SELECT i.work_order_id AS id, i.work_order_no, MAX(i.customer_name) AS customer_name
+      FROM ${insp} i
+      WHERE ${woWhere}
+      GROUP BY i.work_order_id, i.work_order_no
+      ORDER BY i.work_order_no
+    `, woParams);
+
+    // 1. Headline KPIs
     const summary = await client.query(`
       SELECT
         COALESCE((
           SELECT SUM(de.defect_quantity)
           FROM quality_defect_entries de
-          JOIN quality_inspections i ON de.inspection_id = i.id
+          JOIN ${insp} i ON de.inspection_id = i.id
           WHERE ${dateWhere}
         ), 0)::int                                AS total_defects,
         COUNT(DISTINCT i.id)::int                  AS total_inspections,
@@ -5790,7 +5955,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
         COUNT(DISTINCT i.style)::int               AS active_styles,
         COUNT(DISTINCT i.inspector_name)::int      AS active_inspectors,
         COALESCE(SUM(i.total_checked_quantity), 0)::numeric AS total_checked
-      FROM quality_inspections i
+      FROM ${insp} i
       WHERE ${dateWhere}
     `, params);
 
@@ -5799,7 +5964,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
       SELECT i.line_no,
              COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects,
              COUNT(DISTINCT i.id)::int AS inspections
-      FROM quality_inspections i
+      FROM ${insp} i
       LEFT JOIN quality_defect_entries de ON de.inspection_id = i.id
       WHERE ${dateWhere}
       GROUP BY i.line_no
@@ -5811,7 +5976,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
       SELECT dt.defect_code, dt.defect_name, dt.category,
              COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects
       FROM quality_defect_entries de
-      JOIN quality_inspections i ON de.inspection_id = i.id
+      JOIN ${insp} i ON de.inspection_id = i.id
       JOIN quality_defect_types dt ON de.defect_type_id = dt.id
       WHERE ${dateWhere}
       GROUP BY dt.id, dt.defect_code, dt.defect_name, dt.category
@@ -5823,7 +5988,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
       SELECT dr.reason_code, dr.reason_description, dt.defect_name,
              COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects
       FROM quality_defect_entries de
-      JOIN quality_inspections i ON de.inspection_id = i.id
+      JOIN ${insp} i ON de.inspection_id = i.id
       JOIN quality_defect_types dt ON de.defect_type_id = dt.id
       LEFT JOIN quality_defect_reasons dr ON de.defect_reason_id = dr.id
       WHERE ${dateWhere} AND dr.id IS NOT NULL
@@ -5837,7 +6002,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
       SELECT i.inspector_name,
              COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects,
              COUNT(DISTINCT i.id)::int AS inspections
-      FROM quality_inspections i
+      FROM ${insp} i
       LEFT JOIN quality_defect_entries de ON de.inspection_id = i.id
       WHERE ${dateWhere}
       GROUP BY i.inspector_name
@@ -5848,7 +6013,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
     const byStyle = await client.query(`
       SELECT COALESCE(i.style, 'Sin estilo') AS style,
              COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects
-      FROM quality_inspections i
+      FROM ${insp} i
       LEFT JOIN quality_defect_entries de ON de.inspection_id = i.id
       WHERE ${dateWhere}
       GROUP BY i.style
@@ -5860,7 +6025,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
       SELECT to_char(de.created_at, 'HH24:00') AS hour,
              COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects
       FROM quality_defect_entries de
-      JOIN quality_inspections i ON de.inspection_id = i.id
+      JOIN ${insp} i ON de.inspection_id = i.id
       WHERE ${dateWhere}
       GROUP BY to_char(de.created_at, 'HH24:00')
       ORDER BY hour
@@ -5871,13 +6036,14 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
       SELECT i.id,
              to_char(i.inspection_date, 'YYYY-MM-DD') AS inspection_date,
              i.line_no, i.style, i.inspector_name, i.shift_slot,
-             i.bad_type, i.bad_reason,
+             i.bad_type, i.bad_reason, i.work_order_id, i.work_order_no, i.customer_name,
              to_char(i.created_at AT TIME ZONE 'America/Mexico_City', 'HH24:MI') AS time,
              COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects
-      FROM quality_inspections i
+      FROM ${insp} i
       LEFT JOIN quality_defect_entries de ON de.inspection_id = i.id
       WHERE ${dateWhere}
-      GROUP BY i.id
+      GROUP BY i.id, i.inspection_date, i.line_no, i.style, i.inspector_name, i.shift_slot,
+               i.bad_type, i.bad_reason, i.work_order_id, i.work_order_no, i.customer_name, i.created_at
       ORDER BY i.created_at DESC
     `, params);
 
@@ -5892,6 +6058,10 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
       byStyle: byStyle.rows,
       hourly: hourly.rows,
       detail: detail.rows,
+      filterOptions: {
+        clients: clientOptions.rows.map((r) => r.name),
+        workOrders: workOrderOptions.rows,
+      },
     });
   } catch (err) {
     console.error("❌ Error fetching quality analytics:", err.message);
