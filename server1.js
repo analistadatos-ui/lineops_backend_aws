@@ -2856,7 +2856,7 @@ app.patch("/api/line-assignments/:id/insert-shift", authenticateToken, async (re
     // Informational rate columns from the PLANNER's style standard (if any);
     // otherwise keep the block's own values (columns are NOT NULL).
     const sp = await plannerStyleParams.getParams(
-      client, await plannerStyleParams.styleOfWorkOrder(client, a.work_order_id)
+      client, await plannerStyleParams.styleOfWorkOrder(client, a.work_order_id), targetLine
     );
     let availableMinutes = parseFloat(a.available_minutes) || 0;
     let requiredRate = parseFloat(a.required_production_rate) || 0;
@@ -3288,7 +3288,7 @@ app.post("/api/line-assignments/insert-shift-batch", authenticateToken, async (r
       const day = slots[i];
       // Informational rate columns from the PLANNER's style standard (if any).
       const sp = await plannerStyleParams.getParams(
-        client, await plannerStyleParams.styleOfWorkOrder(client, a.work_order_id)
+        client, await plannerStyleParams.styleOfWorkOrder(client, a.work_order_id), targetLine
       );
       let availableMinutes = parseFloat(a.available_minutes) || 0;
       let requiredRate = parseFloat(a.required_production_rate) || 0;
