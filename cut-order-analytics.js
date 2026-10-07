@@ -201,10 +201,29 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       // Etapa is derived in JS, so it filters the rows after the fetch.
       const stageFilter = STAGES.includes(req.query.stage) ? req.query.stage : null;
       const slim = req.query.slim === '1';
+      // Búsqueda por número de orden: work_order_no, customer_po (pedido) o el
+      // id del corte. Coincidencia parcial y sin distinguir mayúsculas.
+      const search = (req.query.q || '').toString().trim().slice(0, 100);
+      // Con búsqueda, allDates=1 ignora el rango de fechas para encontrar la
+      // orden aunque no se sepa cuándo se cortó.
+      const allDates = !!search && req.query.allDates === '1';
 
-      const params = [startDate, endDate];
-      let where = 'co.cut_date BETWEEN $1 AND $2';
-      if (statusFilter) { params.push(statusFilter); where += ` AND co.status = $${params.length}`; }
+      const params = [];
+      const conds = [];
+      if (!allDates) {
+        params.push(startDate, endDate);
+        conds.push(`co.cut_date BETWEEN $${params.length - 1} AND $${params.length}`);
+      }
+      if (statusFilter) { params.push(statusFilter); conds.push(`co.status = $${params.length}`); }
+      if (search) {
+        // Escapa los comodines de LIKE para que "%" o "_" se busquen literalmente.
+        params.push(`%${search.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+        const p = `$${params.length}`;
+        conds.push(`(wo.work_order_no::text ILIKE ${p}
+                  OR wo.customer_po::text ILIKE ${p}
+                  OR co.id::text ILIKE ${p})`);
+      }
+      const where = conds.length ? conds.join(' AND ') : 'TRUE';
 
       const verified = await hasVerifyCols(client);
       const verifiedSelect = verified
@@ -434,7 +453,8 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
 
       res.json({
         success: true,
-        range: { startDate, endDate },
+        range: { startDate, endDate, allDates },
+        search: search || null,
         summary,
         byStatus: STATUSES.map((s) => byStatus[s]).filter((r) => r.orders > 0),
         byStage: STAGES.map((s) => byStage[s]).filter((r) => r.orders > 0),
