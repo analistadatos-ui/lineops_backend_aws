@@ -229,10 +229,22 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       // Con búsqueda, allDates=1 ignora el rango de fechas para encontrar la
       // orden aunque no se sepa cuándo se cortó.
       const allDates = !!search && req.query.allDates === '1';
+      // dateBy=completed: el rango se aplica al día en que se completó cada
+      // marcada (marker.completedAt, hora de la planta) y no a cut_date. Así
+      // "Hoy" muestra las órdenes con marcadas completadas hoy, aunque la
+      // orden se haya planeado otro día.
+      const byCompleted = req.query.dateBy === 'completed';
+      const fromDay = allDates ? null : startDate;
+      const toDay = allDates ? null : endDate;
+      const inRange = (day) => !!day && (!fromDay || day >= fromDay) && (!toDay || day <= toDay);
 
       const params = [];
       const conds = [];
-      if (!allDates) {
+      if (byCompleted) {
+        // Prefiltro barato; el rango exacto se revisa en JS sobre cada marcada.
+        conds.push(`co.markers::text LIKE '%completedAt%'`);
+        if (!statusFilter) conds.push(`co.status <> 'cancelled'`);
+      } else if (!allDates) {
         params.push(startDate, endDate);
         conds.push(`co.cut_date BETWEEN $${params.length - 1} AND $${params.length}`);
       }
@@ -290,9 +302,23 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         const remaining = remainingOf(row, sp, cut, planned);
         const status = row.status || 'pending';
         const stage = stageOf({ row, markers, planned, cut, remaining, status });
-        return { row, sp, markers, planned, cut, remaining, status, stage };
+        // Marcadas completadas dentro del rango (por su completedAt).
+        const doneInRange = [];
+        markers.forEach((m, i) => {
+          if (!m || m.done !== true || !m.completedAt) return;
+          const day = localDay(m.completedAt);
+          if (inRange(day)) doneInRange.push({ m, i, day });
+        });
+        return { row, sp, markers, planned, cut, remaining, status, stage, doneInRange };
       });
-      const rows = stageFilter ? prepared.filter((r) => r.stage === stageFilter) : prepared;
+      let rows = prepared.filter((r) =>
+        (!stageFilter || r.stage === stageFilter) && (!byCompleted || r.doneInRange.length > 0)
+      );
+      if (byCompleted) {
+        // Lo más reciente arriba: la orden con la última marcada completada.
+        const last = (r) => r.doneInRange.reduce((mx, x) => (String(x.m.completedAt) > mx ? String(x.m.completedAt) : mx), '');
+        rows = rows.slice().sort((a, b) => (last(a) < last(b) ? 1 : last(a) > last(b) ? -1 : 0));
+      }
 
       // ---- Roll-ups --------------------------------------------------------
       const summary = {
@@ -338,7 +364,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       let effSum = 0;
       let effCount = 0;
 
-      for (const { row, sp, markers, planned, cut, remaining, status, stage } of rows) {
+      for (const { row, sp, markers, planned, cut, remaining, status, stage, doneInRange } of rows) {
         summary.total_quantity += planned;
         summary.total_cut += cut;
         summary.total_remaining += remaining;
@@ -456,6 +482,13 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
             efficiency_max: eff.max,
             efficiency_count: eff.count,
             tallas: orderTallas,
+            // Marcadas completadas dentro del rango pedido (por completedAt).
+            marcadas_done_in_range: doneInRange.length,
+            marcadas_pending: Math.max(markers.length - marcadasDone, 0),
+            pieces_done_in_range: doneInRange.reduce((s, x) => s + markerPieces(x.m), 0),
+            markers_done_in_range: doneInRange.map((x) => x.m.name || `Marcada ${x.i + 1}`),
+            efficiency_in_range: markerEfficiencyStats(doneInRange.map((x) => x.m)).avg,
+            last_completed_day: doneInRange.reduce((mx, x) => (x.day > mx ? x.day : mx), '') || null,
             progress: planned > 0 ? Math.min(Math.round((cut / planned) * 100), 100) : (cut > 0 ? 100 : 0),
           });
         }
@@ -477,8 +510,12 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       // ---- Marcadas completadas por día ------------------------------------
       // Independiente de cut_date: una marcada cuenta el día en que el
       // supervisor la completó (marker.completedAt), aunque la orden de corte
-      // se haya creado semanas antes. Por eso es una consulta aparte, sin el
-      // filtro de fechas; el rango se aplica abajo sobre completedAt.
+      // se haya creado semanas antes. Con dateBy=completed las órdenes de arriba
+      // ya son exactamente ésas; si no, es una consulta aparte sin cut_date.
+      let doneRows;
+      if (byCompleted) {
+        doneRows = rows.map((r) => r.row);
+      } else {
       const cParams = [];
       const cConds = [`co.status <> 'cancelled'`, `co.markers::text LIKE '%completedAt%'`];
       if (statusFilter) { cParams.push(statusFilter); cConds.push(`co.status = $${cParams.length}`); }
@@ -487,21 +524,20 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         const p = `$${cParams.length}`;
         cConds.push(`(wo.work_order_no::text ILIKE ${p} OR wo.customer_po::text ILIKE ${p} OR co.id::text ILIKE ${p})`);
       }
-      const { rows: doneRows } = await client.query(`
+      ({ rows: doneRows } = await client.query(`
         SELECT co.id, co.markers, wo.work_order_no, wo.customer_po, wo.customer_name
           FROM cut_orders co
           JOIN work_orders wo ON wo.id = co.work_order_id
          WHERE ${cConds.join(' AND ')}
-      `, cParams);
+      `, cParams));
+      }
 
-      const fromDay = allDates ? null : startDate;
-      const toDay = allDates ? null : endDate;
       const completedByDay = new Map(); // day -> { day, marcadas, pieces, orders: Map }
       for (const row of doneRows) {
         asArray(row.markers).forEach((m, i) => {
           if (!m || m.done !== true || !m.completedAt) return;
           const day = localDay(m.completedAt);
-          if (!day || (fromDay && day < fromDay) || (toDay && day > toDay)) return;
+          if (!inRange(day)) return;
           const pieces = markerPieces(m);
           const d = completedByDay.get(day) || { day, marcadas: 0, pieces: 0, orders: new Map() };
           d.marcadas += 1;
@@ -537,7 +573,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
 
       res.json({
         success: true,
-        range: { startDate, endDate, allDates },
+        range: { startDate, endDate, allDates, dateBy: byCompleted ? 'completed' : 'cut_date' },
         search: search || null,
         summary,
         byStatus: STATUSES.map((s) => byStatus[s]).filter((r) => r.orders > 0),
