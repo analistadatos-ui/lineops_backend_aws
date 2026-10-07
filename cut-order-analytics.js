@@ -47,7 +47,7 @@
 // 'corte' is here so the cutting floor's own Dashboard tab can read it.
 const ALLOWED_ROLES = ['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'admin', 'planner', 'corte'];
 
-const STATUSES = ['pending', 'in_progress', 'completed', 'cancelled'];
+const STATUSES = ['pending', 'in_progress', 'awaiting_verification', 'completed', 'cancelled'];
 
 // Order matters: this is the order the board draws them in, left to right.
 const STAGES = ['planning', 'ready', 'cutting', 'verification', 'verified', 'cancelled'];
@@ -167,6 +167,28 @@ function stageOf({ row, markers, planned, cut, remaining, status }) {
   return markers.length ? 'ready' : 'planning';
 }
 
+// Piezas de una marcada: el total guardado, o la suma de sus líneas
+// (pieces, o paneles × piezas por panel). Igual que markerTotal del front.
+function markerPieces(m) {
+  if (m && m.totalPieces != null && m.totalPieces !== '') return num(m.totalPieces);
+  return asArray(m && m.lines).reduce(
+    (s, l) => s + (l.pieces != null && l.pieces !== '' ? num(l.pieces) : num(l.panels) * num(l.perPanel)),
+    0
+  );
+}
+
+// `completedAt` se guarda en UTC (toISOString). El día que cuenta es el de la
+// planta, así que lo pasamos a su zona horaria antes de agrupar: una marcada
+// completada a las 7 pm en CDMX no debe caer en el día siguiente.
+const PLANT_TZ = process.env.CUT_TZ || 'America/Mexico_City';
+const plantDay = new Intl.DateTimeFormat('en-CA', {
+  timeZone: PLANT_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+});
+function localDay(ts) {
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? null : plantDay.format(d); // "YYYY-MM-DD"
+}
+
 // Does cut_orders actually have the verification columns yet? Cached per process
 // so we ask the catalog once, not on every request.
 let VERIFY_COLS = null;
@@ -284,6 +306,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         // raw status counters (kept for anything still reading them)
         pending_orders: 0,
         in_progress_orders: 0,
+        awaiting_verification_orders: 0,
         completed_orders: 0,
         cancelled_orders: 0,
         // stage counters — these are the ones the board shows
@@ -451,6 +474,67 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         ? Math.round((summary.verified_orders / summary.total_orders) * 100)
         : 0;
 
+      // ---- Marcadas completadas por día ------------------------------------
+      // Independiente de cut_date: una marcada cuenta el día en que el
+      // supervisor la completó (marker.completedAt), aunque la orden de corte
+      // se haya creado semanas antes. Por eso es una consulta aparte, sin el
+      // filtro de fechas; el rango se aplica abajo sobre completedAt.
+      const cParams = [];
+      const cConds = [`co.status <> 'cancelled'`, `co.markers::text LIKE '%completedAt%'`];
+      if (statusFilter) { cParams.push(statusFilter); cConds.push(`co.status = $${cParams.length}`); }
+      if (search) {
+        cParams.push(`%${search.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+        const p = `$${cParams.length}`;
+        cConds.push(`(wo.work_order_no::text ILIKE ${p} OR wo.customer_po::text ILIKE ${p} OR co.id::text ILIKE ${p})`);
+      }
+      const { rows: doneRows } = await client.query(`
+        SELECT co.id, co.markers, wo.work_order_no, wo.customer_po, wo.customer_name
+          FROM cut_orders co
+          JOIN work_orders wo ON wo.id = co.work_order_id
+         WHERE ${cConds.join(' AND ')}
+      `, cParams);
+
+      const fromDay = allDates ? null : startDate;
+      const toDay = allDates ? null : endDate;
+      const completedByDay = new Map(); // day -> { day, marcadas, pieces, orders: Map }
+      for (const row of doneRows) {
+        asArray(row.markers).forEach((m, i) => {
+          if (!m || m.done !== true || !m.completedAt) return;
+          const day = localDay(m.completedAt);
+          if (!day || (fromDay && day < fromDay) || (toDay && day > toDay)) return;
+          const pieces = markerPieces(m);
+          const d = completedByDay.get(day) || { day, marcadas: 0, pieces: 0, orders: new Map() };
+          d.marcadas += 1;
+          d.pieces += pieces;
+          const o = d.orders.get(row.id) || {
+            cut_order_id: row.id,
+            work_order_no: row.work_order_no,
+            customer_po: row.customer_po,
+            customer_name: row.customer_name,
+            marcadas: 0,
+            pieces: 0,
+            markers: [],
+          };
+          o.marcadas += 1;
+          o.pieces += pieces;
+          o.markers.push(m.name || `Marcada ${i + 1}`);
+          d.orders.set(row.id, o);
+          completedByDay.set(day, d);
+        });
+      }
+      const byCompletedDay = [...completedByDay.values()]
+        .sort((a, b) => (a.day < b.day ? -1 : 1))
+        .map((d) => ({
+          day: d.day,
+          marcadas: d.marcadas,
+          pieces: d.pieces,
+          orders: [...d.orders.values()].sort((a, b) => b.marcadas - a.marcadas || a.cut_order_id - b.cut_order_id),
+        }));
+      const completedOrderIds = new Set(byCompletedDay.flatMap((d) => d.orders.map((o) => o.cut_order_id)));
+      summary.completed_marcadas_in_range = byCompletedDay.reduce((s, d) => s + d.marcadas, 0);
+      summary.completed_pieces_in_range = byCompletedDay.reduce((s, d) => s + d.pieces, 0);
+      summary.completed_marcadas_orders = completedOrderIds.size;
+
       res.json({
         success: true,
         range: { startDate, endDate, allDates },
@@ -461,6 +545,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         byTalla: [...byTalla.values()].sort((a, b) => cmpTalla(a.talla, b.talla)),
         byFabric: [...byFabric.values()].sort((a, b) => b.quantity - a.quantity),
         byDay: [...byDay.values()].sort((a, b) => (a.day < b.day ? -1 : 1)),
+        byCompletedDay,
         detail,
       });
     } catch (err) {
