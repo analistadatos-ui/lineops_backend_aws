@@ -6077,7 +6077,8 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
 // --------------------------------------------------------------
 
 const requireSupervisor = (req, res, next) => {
-  if (req.user.role !== "supervisor" && req.user.role !== "soporte_it" && req.user.role !== "skyrina" && req.user.role !== "master") {
+  if (req.user.role !== "supervisor" && req.user.role !== "soporte_it" && req.user.role !== "skyrina" 
+    && req.user.role !== "master" && req.user.role !== "planner") {
     return res.status(403).json({
       success: false,
       error: "Access denied. Supervisor, IT Support, Skyrina, or Master role required.",
