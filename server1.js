@@ -5776,6 +5776,60 @@ app.post("/api/quality/inspection", authenticateToken, requireQualityInspector, 
   }
 });
 
+
+/**
+ * POST /api/quality/inspections/bulk-delete
+ * Body: { ids: [inspectionId, ...] }
+ * Deletes several inspections at once (defect entries are removed by ON DELETE CASCADE).
+ * Quality inspector accounts can only delete their own inspections; ids that
+ * don't exist or belong to someone else are skipped and reported as skippedCount.
+ */
+app.post("/api/quality/inspections/bulk-delete", authenticateToken, requireQualityInspector, async (req, res) => {
+  const ids = Array.isArray(req.body?.ids)
+    ? [...new Set(req.body.ids.map((id) => String(id).trim()).filter((id) => /^\d+$/.test(id)))]
+    : [];
+  if (ids.length === 0) {
+    return res.status(400).json({ success: false, error: "No inspection ids provided" });
+  }
+  if (ids.length > 500) {
+    return res.status(400).json({ success: false, error: "Too many ids (max 500 per request)" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const params = [ids];
+    let ownerFilter = "";
+    if (req.user.role === 'quality_inspector') {
+      params.push(String(req.user.id));
+      ownerFilter = ` AND inspector_user_id::text = $${params.length}`;
+    }
+
+    const result = await client.query(
+      `DELETE FROM quality_inspections WHERE id = ANY($1::bigint[])${ownerFilter} RETURNING id`,
+      params
+    );
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      deletedCount: result.rowCount,
+      deletedIds: result.rows.map((r) => r.id),
+      skippedCount: ids.length - result.rowCount,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error bulk deleting inspections:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
 /**
  * DELETE /api/quality/inspection/:inspectionId
  * Delete an inspection
