@@ -725,10 +725,78 @@ function registerWorkOrders(app, deps) {
 
       const pending = out.filter((r) => r.is_past && r.balance > 0);
 
+      // ---- Produccion FUERA DE PLAN (opt-in: ?includeUnplanned=true) --------
+      // Piezas que el piso reporto para la orden en una (linea, dia) SIN celda
+      // activa en el tablero: la linea empezo antes del plan, cosio un sabado,
+      // o la asignacion se cancelo/movio. El query de arriba parte de las celdas,
+      // asi que esas piezas no salen en ninguna fila y el desglose por linea no
+      // cuadra con produced_quantity de la orden. Se regresan como filas extra
+      // con assigned = 0 y unplanned = true. Opt-in para no cambiar lo que
+      // reciben el Plan Board y los demas consumidores.
+      let unplanned = [];
+      if (req.query.includeUnplanned === "true" && !onlyPending) {
+        const uParams = [];
+        const uWhere = [];
+        if (from) { uParams.push(from); uWhere.push(`lr.run_date >= $${uParams.length}::date`); }
+        if (to)   { uParams.push(to);   uWhere.push(`lr.run_date <= $${uParams.length}::date`); }
+        if (workOrderId) { uParams.push(parseInt(workOrderId, 10)); uWhere.push(`wo.id = $${uParams.length}`); }
+        if (lineNo)      { uParams.push(String(lineNo));            uWhere.push(`lr.line_no = $${uParams.length}`); }
+
+        const uRes = await client.query(
+          `
+          SELECT wo.id AS work_order_id, wo.work_order_no, wo.style_description, wo.customer_name,
+                 lr.line_no,
+                 to_char(lr.run_date, 'YYYY-MM-DD') AS assigned_date,
+                 COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced,
+                 MAX(se.updated_at) AS last_reported_at
+            FROM work_orders wo
+            JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+            JOIN operation_sewed_entries se ON se.run_id = lr.id
+            JOIN operator_operations oo     ON oo.id = se.operation_id
+           WHERE NOT EXISTS (
+                   SELECT 1 FROM line_assignments la
+                    WHERE la.work_order_id = wo.id
+                      AND la.line_no       = lr.line_no
+                      AND la.assigned_date = lr.run_date
+                      AND la.status NOT IN ('cancelled', 'rejected')
+                 )
+                 ${uWhere.length ? "AND " + uWhere.join(" AND ") : ""}
+           GROUP BY wo.id, lr.line_no, lr.run_date
+          HAVING COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) > 0
+           ORDER BY lr.run_date DESC, lr.line_no
+          `,
+          uParams
+        );
+
+        unplanned = uRes.rows.map((r) => ({
+          work_order_id: Number(r.work_order_id),
+          work_order_no: r.work_order_no,
+          style_description: r.style_description,
+          customer_name: r.customer_name,
+          line_no: r.line_no,
+          assigned_date: r.assigned_date,
+          assigned: 0,
+          produced: Number(r.produced) || 0,
+          balance: 0,
+          over: Number(r.produced) || 0,
+          pct: 100,
+          assignment_ids: [],
+          colors: [],
+          run_linked: true,
+          runs_on_day: 0,
+          shared_day: false,
+          is_past: true,
+          is_today: false,
+          last_reported_at: r.last_reported_at,
+          state: "unplanned",
+          unplanned: true,
+        }));
+      }
+
       res.json({
         success: true,
         resolved: true,
-        rows: onlyPending ? pending : out,
+        rows: onlyPending ? pending : out.concat(unplanned),
         totals: {
           cells: out.length,
           pendingCells: pending.length,
