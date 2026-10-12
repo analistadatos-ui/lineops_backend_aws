@@ -591,6 +591,223 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       client.release();
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Desglose de UN corte, para el panel lateral del tablero:
+  //   GET /api/cut-orders/analytics/breakdown?id=123
+  //   -> { order, totals, sizes, markers, fabrics }
+  //
+  // Por talla: planeado, piezas en marcadas, paneles, cortado, restante.
+  // Por marcada: paneles, piezas por panel, piezas totales, tallas, si está
+  // cerrada y cuándo. `to_jsonb(co)` evita tronar si alguna columna opcional
+  // (fabrics, priority, verified_at…) todavía no existe en esta base.
+  // ---------------------------------------------------------------------------
+  app.get('/api/cut-orders/analytics/breakdown', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+
+      if (!ALLOWED_ROLES.includes(req.user?.role)) {
+        return res.status(403).json({ success: false, error: 'Access denied' });
+      }
+      const id = parseInt(req.query.id, 10);
+      if (!id) return res.status(400).json({ success: false, error: 'Falta el id del corte' });
+
+      const { rows } = await client.query(`
+        SELECT to_jsonb(co) AS co,
+               to_char(co.cut_date, 'YYYY-MM-DD') AS cut_day,
+               wo.work_order_no,
+               wo.customer_name,
+               wo.customer_po,
+               wo.style_description,
+               wo.style_code,
+               wo.color AS wo_color
+          FROM cut_orders co
+          JOIN work_orders wo ON wo.id = co.work_order_id
+         WHERE co.id = $1
+      `, [id]);
+      if (!rows.length) return res.status(404).json({ success: false, error: 'Corte no encontrado' });
+
+      const r = rows[0];
+      const co = r.co || {};
+      const row = co; // same field names as the list query (amount_cut, remaining_to_cut, verified_at…)
+      const sp = asArray(co.size_progress);
+      const markers = asArray(co.markers);
+      const planned = num(co.quantity);
+      const cut = cutOf(row, sp);
+      const remaining = remainingOf(row, sp, cut, planned);
+      const status = co.status || 'pending';
+      const stage = stageOf({ row, markers, planned, cut, remaining, status });
+
+      const spByTalla = {};
+      for (const s of sp) {
+        const t = String(s.talla || '').trim().toUpperCase();
+        if (t) spByTalla[t] = s;
+      }
+
+      // ---- Por talla -------------------------------------------------------
+      const sizes = new Map();
+      const sizeOf = (t) => {
+        if (!sizes.has(t)) {
+          sizes.set(t, {
+            talla: t,
+            planned: 0,          // pedido de la talla
+            marker_pieces: 0,    // piezas que traen las marcadas
+            panels: 0,           // paneles de las marcadas que tocan la talla
+            panels_done: 0,      // …de esas, las marcadas cerradas
+            cut: 0,              // piezas cortadas
+            remaining: 0,
+            over: 0,
+            markers: 0,          // en cuántas marcadas aparece
+            sp_panels: null,     // paneles que capturó el cortador (si los hay)
+          });
+        }
+        return sizes.get(t);
+      };
+
+      // Pedido por talla: size_progress manda; si no, la lista `sizes` del corte.
+      for (const s of sp) {
+        const t = String(s.talla || '').trim().toUpperCase();
+        if (!t) continue;
+        const cur = sizeOf(t);
+        const q = num(s.quantity), c = num(s.amountCut);
+        cur.planned += q;
+        cur.cut += c;
+        cur.remaining += s.remaining != null && s.remaining !== '' ? Math.max(num(s.remaining), 0) : Math.max(q - c, 0);
+        cur.over += Math.max(c - q, 0);
+        if (s.panels != null && s.panels !== '') cur.sp_panels = (cur.sp_panels || 0) + num(s.panels);
+      }
+      if (!sp.length) {
+        for (const s of asArray(co.sizes)) {
+          const t = String((s && (s.talla ?? s.size ?? s.size_code)) || '').trim().toUpperCase();
+          if (!t) continue;
+          sizeOf(t).planned += num(s.quantity ?? s.qty ?? s.pieces);
+        }
+      }
+
+      // Marcadas: paneles y piezas por talla.
+      let panelsTotal = 0, panelsDone = 0, markerPiecesTotal = 0, markersDone = 0;
+      const markerOut = markers.map((m, i) => {
+        const mPanels = num(m && m.panels);
+        const done = markerDone(m || {}, spByTalla, stage);
+        const lines = asArray(m && m.lines).map((l) => {
+          const perPanel = num(l.perPanel);
+          const pieces = l.pieces != null && l.pieces !== '' ? num(l.pieces) : mPanels * perPanel;
+          return { talla: String(l.talla || '').trim().toUpperCase(), perPanel, pieces };
+        }).filter((l) => l.talla);
+        const pieces = markerPieces(m || {});
+        const perPanelSum = m && m.piecesPerPanel != null && m.piecesPerPanel !== ''
+          ? num(m.piecesPerPanel)
+          : lines.reduce((s, l) => s + l.perPanel, 0);
+
+        panelsTotal += mPanels;
+        markerPiecesTotal += pieces;
+        if (done) { panelsDone += mPanels; markersDone += 1; }
+
+        const seen = new Set();
+        for (const l of lines) {
+          const cur = sizeOf(l.talla);
+          cur.marker_pieces += l.pieces;
+          if (!seen.has(l.talla)) {
+            // Un panel sirve a varias tallas: se cuenta una vez por marcada.
+            cur.panels += mPanels;
+            if (done) cur.panels_done += mPanels;
+            cur.markers += 1;
+            seen.add(l.talla);
+          }
+        }
+
+        return {
+          index: i + 1,
+          name: (m && m.name) || `Marcada ${i + 1}`,
+          panels: mPanels,
+          pieces_per_panel: perPanelSum,
+          pieces,
+          done,
+          completed_at: (m && m.completedAt) || null,
+          completed_day: m && m.completedAt ? localDay(m.completedAt) : null,
+          efficiency: m && m.efficiency != null && m.efficiency !== '' && num(m.efficiency) > 0 ? num(m.efficiency) : null,
+          length: m && m.length != null && m.length !== '' ? num(m.length) : null,
+          lines: lines.sort((a, b) => cmpTalla(a.talla, b.talla)),
+        };
+      });
+
+      // Sin size_progress: el pedido sale de las marcadas, y lo cortado de las
+      // marcadas cerradas (es lo único que de verdad pasó por la mesa).
+      const cutSource = sp.length ? 'size_progress' : (markers.length ? 'markers' : 'order');
+      for (const s of sizes.values()) {
+        if (!sp.length) {
+          if (!s.planned) s.planned = s.marker_pieces;
+          const doneHere = markerOut
+            .filter((m) => m.done)
+            .reduce((acc, m) => acc + m.lines.filter((l) => l.talla === s.talla).reduce((x, l) => x + l.pieces, 0), 0);
+          s.cut = doneHere;
+          s.remaining = Math.max(s.planned - s.cut, 0);
+          s.over = Math.max(s.cut - s.planned, 0);
+        }
+        // Paneles: las marcadas mandan; si no hay, lo que capturó el cortador.
+        if (!s.panels && s.sp_panels != null) s.panels = s.sp_panels;
+        s.progress = s.planned > 0 ? Math.min(Math.round((s.cut / s.planned) * 100), 100) : (s.cut > 0 ? 100 : 0);
+        delete s.sp_panels;
+      }
+      const sizeList = [...sizes.values()].sort((a, b) => cmpTalla(a.talla, b.talla));
+
+      if (!panelsTotal && co.panels != null) panelsTotal = num(co.panels);
+      const eff = markerEfficiencyStats(markers);
+
+      res.json({
+        success: true,
+        order: {
+          id: co.id,
+          work_order_no: r.work_order_no,
+          customer_name: r.customer_name,
+          customer_po: r.customer_po,
+          style: co.style_no || r.style_code || r.style_description || null,
+          style_description: r.style_description || null,
+          color: co.color || r.wo_color || null,
+          cut_date: r.cut_day,
+          fabric: co.fabric || null,
+          fabric_code: co.fabric_code || null,
+          total_length: co.total_length != null ? num(co.total_length) : null,
+          status,
+          stage,
+          priority: co.priority || 'normal',
+          verified_at: co.verified_at || null,
+          verified_by: co.verified_by || null,
+          verification_notes: co.verification_notes || null,
+          notes: co.notes || null,
+        },
+        totals: {
+          planned,
+          cut,
+          remaining,
+          over: Math.max(cut - planned, 0),
+          progress: planned > 0 ? Math.min(Math.round((cut / planned) * 100), 100) : (cut > 0 ? 100 : 0),
+          panels: panelsTotal,
+          panels_done: panelsDone,
+          marker_pieces: markerPiecesTotal,
+          marcadas: markers.length,
+          marcadas_done: markersDone,
+          efficiency_avg: eff.avg,
+          sizes: sizeList.length,
+          cut_source: cutSource,
+        },
+        sizes: sizeList,
+        markers: markerOut,
+        fabrics: asArray(co.fabrics).map((f) => ({
+          name: f.name || null,
+          code: f.code || null,
+          yield: f.yield != null && f.yield !== '' ? num(f.yield) : null,
+          total_length: f.totalLength != null && f.totalLength !== '' ? num(f.totalLength) : null,
+        })),
+      });
+    } catch (err) {
+      console.error('❌ Error fetching cut-order breakdown:', err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
 }
 
 module.exports = registerCutOrderAnalytics;
