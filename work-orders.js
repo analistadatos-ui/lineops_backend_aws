@@ -57,6 +57,8 @@
 const { createSetInTx } = require("./order-sets");
 // Bloqueo de semanas del Plan Board por el CEO (ver plan-week-locks.js).
 const planWeekLocks = require("./plan-week-locks");
+// Cierre manual de ordenes: regla del % producido + permiso/alerta del CEO.
+const orderClose = require("./order-close");
 
 // --- Startup migration: both breakdown tables ----------------------------
 async function initSchema({ pool, setSchema }) {
@@ -436,6 +438,8 @@ function registerWorkOrders(app, deps) {
       // PRODUCED_SUBQUERY se interpola abajo: hay que resolverlo ANTES de armar
       // el string de la consulta, o se cuela el literal 0.
       await ensureProducedResolved(client);
+      // closed_at / close_mode se leen abajo: las columnas deben existir.
+      await orderClose.ensureSchema(client);
       const { status, lineNo, startDate, endDate } = req.query;
 
       let query = `
@@ -450,6 +454,8 @@ function registerWorkOrders(app, deps) {
           wo.fabric_name, wo.fabric_code, wo.yield_per_piece,
           wo.created_at, wo.updated_at,wo.season,wo.status,
           wo.created_by,
+          -- Cierre manual (order-close.js): planner | ceo | ceo_approved
+          wo.closed_at, wo.close_mode,
           -- CONJUNTO: NULL en una PO suelta. La tabla lo usa solo para pintar
           -- la insignia; produccion sigue viendo una PO normal.
           wo.set_id, wo.set_component, wo.set_ratio,
@@ -1535,6 +1541,8 @@ function registerWorkOrders(app, deps) {
       if (status !== undefined && !VALID_STATUSES.includes(status)) {
         return res.status(400).json({ success: false, error: `Invalid status. Must be one of: ${VALID_STATUSES.join(", ")}` });
       }
+      // Fuera de la transaccion: las columnas closed_* deben existir antes.
+      if (status !== undefined) await orderClose.ensureSchema(client);
 
       await client.query("BEGIN");
 
@@ -1544,6 +1552,22 @@ function registerWorkOrders(app, deps) {
         return res.status(404).json({ success: false, error: "Work order not found" });
       }
       const wo = cur.rows[0];
+
+      // Completar desde el modal de edicion pasa por la MISMA regla que el boton
+      // "Completar" de Estado de Ordenes; si no, este PUT seria la puerta trasera.
+      let closeEv = null;
+      if (status === "completed" && wo.status !== "completed") {
+        closeEv = await orderClose.evaluateClose(client, id);
+        if (!orderClose.isApprover(req.user) && !closeEv.meetsRule) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({
+            success: false,
+            needsApproval: true,
+            check: closeEv,
+            error: `Producido ${closeEv.pct ?? 0}% de lo asignado (mínimo ${closeEv.thresholdPct}%). Solicita permiso al CEO desde Estado de Órdenes.`,
+          });
+        }
+      }
 
       const set = {};   // column -> value
 
@@ -1559,6 +1583,13 @@ function registerWorkOrders(app, deps) {
       }
       if (styleDescription !== undefined) set.style_description = txt(styleDescription) || wo.style_description;
       if (status !== undefined) set.status = status;
+      // Reabrir una orden cerrada a mano borra la marca de cierre, para que el
+      // recalculo de estados la vuelva a manejar.
+      if (status !== undefined && status !== "completed") {
+        set.closed_at = null;
+        set.closed_by = null;
+        set.close_mode = null;
+      }
       if (season !== undefined) set.season = txt(season);
       if (samMinutes !== undefined) set.sam_minutes = num(samMinutes);
 
@@ -1769,6 +1800,15 @@ function registerWorkOrders(app, deps) {
           [...cols.map((c) => set[c]), id]
         );
         workOrder = upd.rows[0];
+      }
+
+      // Traza del cierre manual (+ alerta al CEO si lo cerro el planeador).
+      if (closeEv) {
+        await orderClose.applyClose(client, {
+          ev: closeEv,
+          user: req.user,
+          mode: orderClose.isApprover(req.user) ? "ceo" : "planner",
+        });
       }
 
       await client.query("COMMIT");

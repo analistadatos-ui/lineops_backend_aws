@@ -683,6 +683,7 @@ await registerBom.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
 await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
 await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
+await registerOrderClose.initSchema({ pool, setSchema });   // ✅ cierre manual (después de work_orders)
 await planWeekLocks.initSchema({ pool, setSchema });   // 🔒 después de line_assignments
 await registerPlanRebalance.initSchema({ pool, setSchema }); // ⚖️ plan_board_snapshots
 
@@ -1075,6 +1076,13 @@ registerWorkOrders(app, {
 });
 const registerMechanicsSummary = require("./mecanics-summary");
 registerMechanicsSummary(app, authenticateToken);
+
+
+// ✅ Cierre manual de ordenes: boton "Completar" en Estado de Ordenes, regla del
+// % producido, solicitudes de permiso al CEO y alertas de cierre.
+const registerOrderClose = require("./order-close");
+registerOrderClose(app, { authenticateToken, pool, setSchema });
+
 
 const registerSupermarketPlan = require("./supermarket-plan");
 registerSupermarketPlan(app, {
@@ -10881,16 +10889,21 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
 
 /**
  * PUT /api/work-orders/:id/status
- * Update work order status
+ * Update work order status.
+ * 'completed' goes through the manual-close rule (order-close.js):
+ *   - produced >= threshold % of assigned -> closes + alert to CEO
+ *   - below threshold                     -> 403 needsApproval (request CEO permission)
+ *   - CEO / master                        -> closes directly
+ * Any other status reopens the order and clears the manual-close mark.
  */
 app.put("/api/work-orders/:id/status", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
-    
+
     const { id } = req.params;
     const { status } = req.body;
-    
+
     const validStatuses = ['pending', 'assigned', 'in_progress', 'completed', 'cancelled'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({
@@ -10898,21 +10911,32 @@ app.put("/api/work-orders/:id/status", authenticateToken, async (req, res) => {
         error: "Invalid status. Must be one of: " + validStatuses.join(', '),
       });
     }
-    
+
+    // Completar a mano pasa por la regla de cierre (order-close.js): permiso
+    // del CEO por debajo del umbral, alerta al CEO por encima.
+    if (status === "completed") {
+      const r = await registerOrderClose.closeOrRefuse(client, {
+        workOrderId: id, user: req.user, reason: req.body?.reason,
+      });
+      return res.status(r.httpStatus).json(r.body);
+    }
+
+    await registerOrderClose.ensureSchema(client);
+    // Cualquier otro estado reabre la orden: se borra la marca de cierre manual.
     const result = await client.query(
       `
       UPDATE work_orders
-      SET status = $1, updated_at = NOW()
+      SET status = $1, closed_at = NULL, closed_by = NULL, close_mode = NULL, updated_at = NOW()
       WHERE id = $2
       RETURNING id, work_order_no, status
       `,
       [status, id]
     );
-    
+
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, error: "Work order not found" });
     }
-    
+
     res.json({
       success: true,
       message: "Work order status updated",
@@ -10930,16 +10954,21 @@ app.put("/api/work-orders/:id/status", authenticateToken, async (req, res) => {
  * DELETE /api/work-orders/:id
  * Soft delete a work order
  */
+
 /**
  * POST /api/work-orders/recalculate-status
  * Recomputes each work order's status from its actual line assignments:
  * pending (nothing assigned) -> assigned (partially) -> in_progress (a line has started)
  * -> completed (fully assigned and every assignment is completed).
+ * Orders closed manually (Completar button / CEO approval) are skipped,
+ * otherwise a short-closed order would be reopened.
  */
 app.post("/api/work-orders/recalculate-status", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
+    // closed_at must exist before the query below uses it.
+    await registerOrderClose.ensureSchema(client);
     await client.query("BEGIN");
 
     const orders = await client.query(`
@@ -10954,6 +10983,9 @@ app.post("/api/work-orders/recalculate-status", authenticateToken, async (req, r
       FROM work_orders wo
       LEFT JOIN line_assignments la ON la.work_order_id = wo.id
       WHERE wo.status != 'cancelled'
+        -- Cerradas a mano (boton Completar / permiso del CEO): no se recalculan,
+        -- o una orden cerrada corta volveria a abrirse.
+        AND wo.closed_at IS NULL
       GROUP BY wo.id
     `);
 
@@ -10984,7 +11016,7 @@ app.post("/api/work-orders/recalculate-status", authenticateToken, async (req, r
 
     res.json({ success: true, message: `Recalculated status for ${orders.rows.length} work orders`, updated });
   } catch (err) {
-    await client.query("ROLLBACK");
+    await client.query("ROLLBACK").catch(() => {});
     logger.error("❌ Error recalculating work order statuses:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
