@@ -756,6 +756,27 @@ const seedDefaultUsers = async (client) => {
 // ----------------------------------------------------------------------
 // 7. AUTHENTICATION MIDDLEWARE
 // ----------------------------------------------------------------------
+
+// 🏭 ROLE ALIASES
+// A role listed here gets EXACTLY the same permissions as the role it maps to,
+// in every endpoint and every module (all of them go through authenticateToken
+// and read req.user.role). The real role is kept in req.user.actual_role so the
+// frontend can show its own panel.
+//   factory_director → master (CEO): same screens, same approvals, same locks.
+const ROLE_ALIASES = {
+  factory_director: "master",
+};
+
+const applyRoleAlias = (user) => {
+  if (user && ROLE_ALIASES[user.role]) {
+    user.actual_role = user.role;
+    user.role = ROLE_ALIASES[user.role];
+  } else if (user) {
+    user.actual_role = user.role;
+  }
+  return user;
+};
+
 const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
@@ -780,7 +801,7 @@ const authenticateToken = async (req, res, next) => {
         logger.warn("Authentication failed: user not found or inactive", { userId: decoded.id });
         return res.status(401).json({ success: false, error: "User not found or inactive" });
       }
-      req.user = userResult.rows[0];
+      req.user = applyRoleAlias(userResult.rows[0]);
       next();
     } finally {
       client.release();
@@ -896,8 +917,9 @@ app.post(
       );
 
       delete user.password_hash;
+      applyRoleAlias(user); // factory_director → role "master" + actual_role
 
-      logger.info("Login successful", { username: user.username, role: user.role });
+      logger.info("Login successful", { username: user.username, role: user.role, actual_role: user.actual_role });
 
       res.json({
         success: true,
@@ -10443,7 +10465,7 @@ app.post(
   validate([
     body("username").notEmpty().withMessage("Username required"),
     body("password").isLength({ min: 8 }).withMessage("Password must be at least 8 characters"),
-    body("role").isIn(["engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "master"]).withMessage("Invalid role"),
+    body("role").isIn(["engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "master", "factory_director"]).withMessage("Invalid role"),
     body("line_number").if(body("role").equals("line_leader")).isInt({ min: 1, max: 26 }).withMessage("Line number 1-26 required for line leader"),
   ]),
   async (req, res, next) => {
