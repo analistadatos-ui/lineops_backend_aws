@@ -57,8 +57,6 @@
 const { createSetInTx } = require("./order-sets");
 // Bloqueo de semanas del Plan Board por el CEO (ver plan-week-locks.js).
 const planWeekLocks = require("./plan-week-locks");
-// Cierre manual de ordenes: regla del % producido + permiso/alerta del CEO.
-const orderClose = require("./order-close");
 
 // --- Startup migration: both breakdown tables ----------------------------
 async function initSchema({ pool, setSchema }) {
@@ -120,8 +118,14 @@ async function initSchema({ pool, setSchema }) {
     // Uniqueness must include estilo: the same color+talla can appear under two
     // different estilos within one PO. Drop the older (wo,talla,color) index and
     // recreate it with estilo so those legitimate rows don't collide.
+    // Item code del cliente (Nike): una misma PO se reparte entre varios
+    // destinos y cada uno trae su item code, asi que la misma talla+color+estilo
+    // puede repetirse en una PO con item codes distintos. NULL = sin item code.
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS item_code VARCHAR(40);");
     await client.query("DROP INDEX IF EXISTS idx_work_order_lines_unique;");
-    await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_order_lines_unique ON work_order_lines(work_order_id, talla, color, estilo);");
+    // COALESCE: en un indice unico dos NULL no chocan, y una PO sin item codes
+    // debe seguir sin poder repetir talla+color+estilo.
+    await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_order_lines_unique ON work_order_lines(work_order_id, talla, color, estilo, (COALESCE(item_code, '')));");
     console.log("✅ work_order_lines table ready in prod_db_schema");
 
     // Per-PO customer purchase-order reference (nullable).
@@ -201,6 +205,7 @@ const LINES_SUBQUERY = `
              'color', l.color,
              'estilo', l.estilo,
              'customerPo', l.customer_po,
+             'itemCode', l.item_code,
              'commitmentDate', to_char(l.commitment_date, 'YYYY-MM-DD'),
              'fabricName', l.fabric_name,
              'fabricCode', l.fabric_code,
@@ -209,7 +214,7 @@ const LINES_SUBQUERY = `
              'packingQty', l.packing_qty,
              'skuQty', l.sku_qty,
              'quantity', l.quantity
-           ) ORDER BY l.color, l.talla)
+           ) ORDER BY l.color, COALESCE(l.item_code, ''), l.talla)
     FROM work_order_lines l WHERE l.work_order_id = wo.id
   ), '[]') AS lines
 `;
@@ -438,8 +443,6 @@ function registerWorkOrders(app, deps) {
       // PRODUCED_SUBQUERY se interpola abajo: hay que resolverlo ANTES de armar
       // el string de la consulta, o se cuela el literal 0.
       await ensureProducedResolved(client);
-      // closed_at / close_mode se leen abajo: las columnas deben existir.
-      await orderClose.ensureSchema(client);
       const { status, lineNo, startDate, endDate } = req.query;
 
       let query = `
@@ -454,8 +457,6 @@ function registerWorkOrders(app, deps) {
           wo.fabric_name, wo.fabric_code, wo.yield_per_piece,
           wo.created_at, wo.updated_at,wo.season,wo.status,
           wo.created_by,
-          -- Cierre manual (order-close.js): planner | ceo | ceo_approved
-          wo.closed_at, wo.close_mode,
           -- CONJUNTO: NULL en una PO suelta. La tabla lo usa solo para pintar
           -- la insignia; produccion sigue viendo una PO normal.
           wo.set_id, wo.set_component, wo.set_ratio,
@@ -725,78 +726,10 @@ function registerWorkOrders(app, deps) {
 
       const pending = out.filter((r) => r.is_past && r.balance > 0);
 
-      // ---- Produccion FUERA DE PLAN (opt-in: ?includeUnplanned=true) --------
-      // Piezas que el piso reporto para la orden en una (linea, dia) SIN celda
-      // activa en el tablero: la linea empezo antes del plan, cosio un sabado,
-      // o la asignacion se cancelo/movio. El query de arriba parte de las celdas,
-      // asi que esas piezas no salen en ninguna fila y el desglose por linea no
-      // cuadra con produced_quantity de la orden. Se regresan como filas extra
-      // con assigned = 0 y unplanned = true. Opt-in para no cambiar lo que
-      // reciben el Plan Board y los demas consumidores.
-      let unplanned = [];
-      if (req.query.includeUnplanned === "true" && !onlyPending) {
-        const uParams = [];
-        const uWhere = [];
-        if (from) { uParams.push(from); uWhere.push(`lr.run_date >= $${uParams.length}::date`); }
-        if (to)   { uParams.push(to);   uWhere.push(`lr.run_date <= $${uParams.length}::date`); }
-        if (workOrderId) { uParams.push(parseInt(workOrderId, 10)); uWhere.push(`wo.id = $${uParams.length}`); }
-        if (lineNo)      { uParams.push(String(lineNo));            uWhere.push(`lr.line_no = $${uParams.length}`); }
-
-        const uRes = await client.query(
-          `
-          SELECT wo.id AS work_order_id, wo.work_order_no, wo.style_description, wo.customer_name,
-                 lr.line_no,
-                 to_char(lr.run_date, 'YYYY-MM-DD') AS assigned_date,
-                 COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced,
-                 MAX(se.updated_at) AS last_reported_at
-            FROM work_orders wo
-            JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
-            JOIN operation_sewed_entries se ON se.run_id = lr.id
-            JOIN operator_operations oo     ON oo.id = se.operation_id
-           WHERE NOT EXISTS (
-                   SELECT 1 FROM line_assignments la
-                    WHERE la.work_order_id = wo.id
-                      AND la.line_no       = lr.line_no
-                      AND la.assigned_date = lr.run_date
-                      AND la.status NOT IN ('cancelled', 'rejected')
-                 )
-                 ${uWhere.length ? "AND " + uWhere.join(" AND ") : ""}
-           GROUP BY wo.id, lr.line_no, lr.run_date
-          HAVING COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) > 0
-           ORDER BY lr.run_date DESC, lr.line_no
-          `,
-          uParams
-        );
-
-        unplanned = uRes.rows.map((r) => ({
-          work_order_id: Number(r.work_order_id),
-          work_order_no: r.work_order_no,
-          style_description: r.style_description,
-          customer_name: r.customer_name,
-          line_no: r.line_no,
-          assigned_date: r.assigned_date,
-          assigned: 0,
-          produced: Number(r.produced) || 0,
-          balance: 0,
-          over: Number(r.produced) || 0,
-          pct: 100,
-          assignment_ids: [],
-          colors: [],
-          run_linked: true,
-          runs_on_day: 0,
-          shared_day: false,
-          is_past: true,
-          is_today: false,
-          last_reported_at: r.last_reported_at,
-          state: "unplanned",
-          unplanned: true,
-        }));
-      }
-
       res.json({
         success: true,
         resolved: true,
-        rows: onlyPending ? pending : out.concat(unplanned),
+        rows: onlyPending ? pending : out,
         totals: {
           cells: out.length,
           pendingCells: pending.length,
@@ -1135,6 +1068,10 @@ function registerWorkOrders(app, deps) {
         const n = parseFloat(v);
         return !isFinite(n) || n <= 0 ? 1 : n;
       };
+      const itemCodeOf = (v) => {
+        const t = txt(v);
+        return t ? t.toUpperCase().slice(0, 40) : null;
+      };
 
       // Una prenda suelta es "un conjunto de un solo componente": asi el resto
       // del handler tiene UN solo camino en vez de dos.
@@ -1171,6 +1108,7 @@ function registerWorkOrders(app, deps) {
               color: up(l.color, 3),
               estilo: up(l.estilo, 6) || defEst,
               customerPo: txt(l.customerPo),
+              itemCode: itemCodeOf(l.itemCode),
               commitmentDate: (l.commitmentDate || fb.commitmentDate || "").toString().slice(0, 10) || null,
               fabrics,
               // Representative (first-tela) scalars for the header/list views.
@@ -1321,7 +1259,11 @@ function registerWorkOrders(app, deps) {
             };
             byKey.set(key, bucket);
           }
-          const dup = bucket.cells.find((x) => x.talla === cell.talla);
+          // Misma talla Y mismo item code -> se suman. Distinto item code
+          // (Nike: otro destino) -> linea aparte de la misma PO.
+          const dup = bucket.cells.find(
+            (x) => x.talla === cell.talla && (x.itemCode || "") === (cell.itemCode || "")
+          );
           if (dup) {
             dup.quantity += cell.quantity;
             dup.fabrics = unionFabrics(dup.fabrics, cell.fabrics);
@@ -1510,13 +1452,13 @@ function registerWorkOrders(app, deps) {
             `INSERT INTO work_order_lines
                (work_order_id, master_code_id, talla, color, estilo, customer_po,
                 commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics,
-                packing_qty, sku_qty)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+                packing_qty, sku_qty, item_code)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
             [workOrder.id, codeToId[code], cell.talla, cell.color, cell.estilo,
              cell.customerPo || null, cell.commitmentDate || null, cell.fabricName || null,
              cell.fabricCode || null, cell.yieldPerPiece, cell.quantity,
              JSON.stringify(cell.fabrics || []),
-             cell.packingQty ?? 0, cell.skuQty ?? 0]
+             cell.packingQty ?? 0, cell.skuQty ?? 0, cell.itemCode || null]
           );
         }
 
@@ -1609,8 +1551,6 @@ function registerWorkOrders(app, deps) {
       if (status !== undefined && !VALID_STATUSES.includes(status)) {
         return res.status(400).json({ success: false, error: `Invalid status. Must be one of: ${VALID_STATUSES.join(", ")}` });
       }
-      // Fuera de la transaccion: las columnas closed_* deben existir antes.
-      if (status !== undefined) await orderClose.ensureSchema(client);
 
       await client.query("BEGIN");
 
@@ -1620,22 +1560,6 @@ function registerWorkOrders(app, deps) {
         return res.status(404).json({ success: false, error: "Work order not found" });
       }
       const wo = cur.rows[0];
-
-      // Completar desde el modal de edicion pasa por la MISMA regla que el boton
-      // "Completar" de Estado de Ordenes; si no, este PUT seria la puerta trasera.
-      let closeEv = null;
-      if (status === "completed" && wo.status !== "completed") {
-        closeEv = await orderClose.evaluateClose(client, id);
-        if (!orderClose.isApprover(req.user) && !closeEv.meetsRule) {
-          await client.query("ROLLBACK");
-          return res.status(403).json({
-            success: false,
-            needsApproval: true,
-            check: closeEv,
-            error: `Producido ${closeEv.pct ?? 0}% de lo asignado (mínimo ${closeEv.thresholdPct}%). Solicita permiso al CEO desde Estado de Órdenes.`,
-          });
-        }
-      }
 
       const set = {};   // column -> value
 
@@ -1651,13 +1575,6 @@ function registerWorkOrders(app, deps) {
       }
       if (styleDescription !== undefined) set.style_description = txt(styleDescription) || wo.style_description;
       if (status !== undefined) set.status = status;
-      // Reabrir una orden cerrada a mano borra la marca de cierre, para que el
-      // recalculo de estados la vuelva a manejar.
-      if (status !== undefined && status !== "completed") {
-        set.closed_at = null;
-        set.closed_by = null;
-        set.close_mode = null;
-      }
       if (season !== undefined) set.season = txt(season);
       if (samMinutes !== undefined) set.sam_minutes = num(samMinutes);
 
@@ -1679,6 +1596,7 @@ function registerWorkOrders(app, deps) {
               color: up(l.color, 3),
               estilo: up(l.estilo, 6),
               customerPo: txt(l.customerPo),
+              itemCode: txt(l.itemCode) ? txt(l.itemCode).toUpperCase().slice(0, 40) : null,
               commitmentDate: (l.commitmentDate || "").toString().slice(0, 10) || null,
               fabrics,
               fabricName: primary.name || null,
@@ -1705,13 +1623,13 @@ function registerWorkOrders(app, deps) {
           await client.query("ROLLBACK");
           return res.status(400).json({ success: false, error: `Falta el estilo cliente (6 caracteres) para el color ${badEstilo.color || "?"}` });
         }
-        // One PO cannot hold the same talla+color+estilo twice (unique index).
+        // One PO cannot hold the same talla+color+estilo+item code twice (unique index).
         const dupKey = new Set();
         for (const c of cells) {
-          const k = `${c.talla}|${c.color}|${c.estilo}`;
+          const k = `${c.talla}|${c.color}|${c.estilo}|${c.itemCode || ""}`;
           if (dupKey.has(k)) {
             await client.query("ROLLBACK");
-            return res.status(400).json({ success: false, error: `Línea repetida: ${c.color} · ${c.estilo} · talla ${c.talla}. Un color+estilo repetido necesita su propia orden.` });
+            return res.status(400).json({ success: false, error: `Línea repetida: ${c.color} · ${c.estilo} · talla ${c.talla}${c.itemCode ? ` · item ${c.itemCode}` : ""}. Usa otro item code o una orden aparte.` });
           }
           dupKey.add(k);
         }
@@ -1774,13 +1692,13 @@ function registerWorkOrders(app, deps) {
             `INSERT INTO work_order_lines
                (work_order_id, master_code_id, talla, color, estilo, customer_po,
                 commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics,
-                packing_qty, sku_qty)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+                packing_qty, sku_qty, item_code)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
             [id, codeToId[code], cell.talla, cell.color, cell.estilo,
              cell.customerPo, cell.commitmentDate, cell.fabricName,
              cell.fabricCode, cell.yieldPerPiece, cell.quantity,
              JSON.stringify(cell.fabrics || []),
-             cell.packingQty ?? 0, cell.skuQty ?? 0]
+             cell.packingQty ?? 0, cell.skuQty ?? 0, cell.itemCode]
           );
         }
 
@@ -1868,15 +1786,6 @@ function registerWorkOrders(app, deps) {
           [...cols.map((c) => set[c]), id]
         );
         workOrder = upd.rows[0];
-      }
-
-      // Traza del cierre manual (+ alerta al CEO si lo cerro el planeador).
-      if (closeEv) {
-        await orderClose.applyClose(client, {
-          ev: closeEv,
-          user: req.user,
-          mode: orderClose.isApprover(req.user) ? "ceo" : "planner",
-        });
       }
 
       await client.query("COMMIT");
