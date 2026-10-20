@@ -1206,7 +1206,9 @@ function registerWorkOrders(app, deps) {
       }
 
       // ------------------------------------------------------------------
-      // ONE PO PER (color + estilo + customer PO + delivery date).
+      // ONE PO PER (color + estilo + customer PO + delivery date + item code).
+      // Item code (Nike: un destino) siempre separa: dos lineas identicas con
+      // distinto item code son dos POs.
       // Whatever grouping the client sent — a single `lines` payload or an
       // `orders` array — is re-bucketed here so every distinct combination of
       // color, estilo cliente, PO cliente and fecha de entrega becomes its own
@@ -1223,7 +1225,7 @@ function registerWorkOrders(app, deps) {
       // se fusionarian en UNA sola PO y despues chocarian contra el indice
       // unico (work_order_id, talla, color, estilo).
       const bucketKey = (c) =>
-        [c.styleCode || "", c.color, c.estilo, c.customerPo || "", c.commitmentDate || ""].join("\u0001");
+        [c.styleCode || "", c.color, c.estilo, c.customerPo || "", c.commitmentDate || "", c.itemCode || ""].join("\u0001");
       const unionFabrics = (a = [], b = []) => {
         const out = [];
         const seen = new Set();
