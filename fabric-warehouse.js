@@ -204,6 +204,53 @@ function cleanScan(raw) {
   return t.trim();
 }
 
+// Spot / container labels can be printed in many ways. This returns the
+// candidate codes found in what the PDA read, in the order to try them:
+//   "A01", "a-01", "LUGAR: A01", "Contenedor F01", "CONT-F01"
+//   "https://…/ubicaciones/A01", "https://…?code=F01"
+//   {"lugar":"A01","contenedor":"F01"}   (JSON: both are returned)
+//   "A01|F01"                             (both are returned)
+// expect "box" puts container-looking codes first; otherwise spots first.
+const LABEL_WORDS = /^(?:LUGAR|UBICACION|UBICACIÓN|UBIC|LOCATION|LOC|POSICION|POSICIÓN|POS|SPOT|CONTENEDOR|CONTAINER|CONT|BOX|CAJA)\b[\s:#=._-]*/i;
+const BOX_KEYS = ["contenedor", "container", "box", "caja", "cont"];
+const SPOT_KEYS = ["lugar", "ubicacion", "location", "loc", "spot", "posicion", "pos"];
+function labelCandidates(raw, expect) {
+  let t = cleanScan(raw);
+  if (!t) return [];
+  const out = [];
+  const push = (v, kind = null) => {
+    const x = String(v ?? "").trim().replace(LABEL_WORDS, "").trim();
+    if (x && x.length <= 40 && !out.some((o) => o.code === x)) out.push({ code: x, kind });
+  };
+  if (t.startsWith("{")) {
+    try {
+      const j = JSON.parse(t);
+      const lower = Object.fromEntries(Object.entries(j || {}).map(([k, v]) => [k.toLowerCase(), v]));
+      for (const k of BOX_KEYS) if (typeof lower[k] === "string" || typeof lower[k] === "number") push(lower[k], "box");
+      for (const k of SPOT_KEYS) if (typeof lower[k] === "string" || typeof lower[k] === "number") push(lower[k], "spot");
+      for (const k of ["code", "codigo", "id", "label", "qr"]) if (typeof lower[k] === "string") push(lower[k]);
+    } catch { /* not JSON */ }
+  } else if (/^https?:\/\//i.test(t)) {
+    try {
+      const u = new URL(t);
+      for (const k of ["code", "codigo", "c", "box", "contenedor", "lugar", "location", "id"]) {
+        const v = u.searchParams.get(k);
+        if (v) push(v, BOX_KEYS.includes(k) ? "box" : SPOT_KEYS.includes(k) ? "spot" : null);
+      }
+      const seg = u.pathname.split("/").filter(Boolean).pop();
+      if (seg) push(decodeURIComponent(seg));
+    } catch { /* bad URL */ }
+  } else if (t.includes("|")) {
+    const parts = t.split("|").map((x) => x.trim()).filter(Boolean);
+    if (parts.length <= 3 && parts.every((x) => x.replace(LABEL_WORDS, "").length <= 12)) parts.forEach((x) => push(x));
+  } else {
+    push(t);
+  }
+  const looksBox = (c) => c.kind === "box" || (c.kind == null && new RegExp(`^${BOX_PREFIX}[\\s-]*\\d{1,3}$`, "i").test(c.code));
+  out.sort((a, b) => (expect === "box" ? looksBox(b) - looksBox(a) : looksBox(a) - looksBox(b)));
+  return out;
+}
+
 function parseRollScan(raw) {
   const text = cleanScan(raw);
   if (!text) return null;
@@ -324,6 +371,12 @@ async function initSchema({ pool, setSchema }) {
 
     // Weight Unit and Gramaje (added after the first 23 fields). Rolls loaded
     // before keep their Skytex data in «raw», so their values are filled in here.
+    // Reconciliation: a roll received without a Skytex request (source = 'scan')
+    // stays on the dashboard until it is requested (it is then linked) or
+    // someone marks it as reviewed with a note.
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS unrequested_reviewed_at TIMESTAMPTZ;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS unrequested_reviewed_by BIGINT;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS unrequested_note TEXT;");
     await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS weight_unit VARCHAR(20);");
     await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS weight_gsm VARCHAR(40);");
     await client.query(`
@@ -870,25 +923,63 @@ function registerFabricWarehouse(app, deps) {
   //                     | { kind: "unknown_box", code } (only when expect = "box")
   //                     | null (treat it as a roll barcode)
   async function classifyCode(client, raw, expect) {
-    const text = cleanScan(raw);
-    if (!text || text.length > 40 || text.startsWith("{") || text.includes("|")) return null;
-    const norm = text.toUpperCase().replace(/[^A-Z0-9]/g, "");
-    if (!norm || /^\d{6,}$/.test(norm)) return null; // long numbers are roll barcodes
-    const code = normBox(text);
-    const b = await client.query(
-      `SELECT id FROM fabric_boxes
-        WHERE is_active AND (UPPER(code) = $1 OR regexp_replace(UPPER(code), '[^A-Z0-9]', '', 'g') = $2)
-        LIMIT 1`,
-      [code, norm]
-    );
-    if (b.rows.length) return { kind: "box", box: await boxInfo(client, b.rows[0].id) };
-    const loc = await resolveLocation(client, text, norm);
-    if (loc) return { kind: "location", location: await locationInfo(client, loc) };
-    if (expect === "box" && /^[A-Z]{1,4}\d{1,4}$/.test(code)) {
-      return { kind: "invalid_box", code, error: `${code} no es uno de los ${BOX_COUNT} contenedores (${BOX_CATALOG.first}–${BOX_CATALOG.last}).` };
+    // A label printed with a custom QR text (fabric_locations.qr_code) wins.
+    const whole = cleanScan(raw);
+    if (whole && whole.length <= 120) {
+      const q = await client.query(`SELECT id FROM fabric_locations WHERE UPPER(qr_code) = UPPER($1) LIMIT 1`, [whole]);
+      if (q.rows.length) return { kind: "location", location: await locationInfo(client, q.rows[0].id) };
+    }
+    const cands = labelCandidates(raw, expect);
+    for (const c of cands) {
+      const text = c.code;
+      const norm = text.toUpperCase().replace(/[^A-Z0-9]/g, "");
+      if (!norm || /^\d{6,}$/.test(norm)) continue; // long numbers are roll barcodes
+      const code = normBox(text);
+      if (c.kind !== "spot") {
+        const b = await client.query(
+          `SELECT id FROM fabric_boxes
+            WHERE is_active AND (UPPER(code) = $1 OR regexp_replace(UPPER(code), '[^A-Z0-9]', '', 'g') = $2)
+            LIMIT 1`,
+          [code, norm]
+        );
+        if (b.rows.length) return { kind: "box", box: await boxInfo(client, b.rows[0].id) };
+      }
+      if (c.kind !== "box") {
+        const loc = await resolveLocation(client, text, norm);
+        if (loc) return { kind: "location", location: await locationInfo(client, loc) };
+      }
+    }
+    if (expect === "box") {
+      const c = cands.find((x) => /^[A-Z]{1,4}\d{1,4}$/.test(normBox(x.code) || ""));
+      if (c) {
+        const code = normBox(c.code);
+        return { kind: "invalid_box", code, error: `${code} no es uno de los ${BOX_COUNT} contenedores (${BOX_CATALOG.first}–${BOX_CATALOG.last}).` };
+      }
     }
     return null;
   }
+
+  // Scanner test: what did the PDA send and what does the system understand?
+  // Nothing is saved. Body: { raw, expect? }
+  app.post(`${BASE}/scan-test`, authenticateToken, withClient(async (req, res, client) => {
+    const raw = String(req.body?.raw ?? "");
+    const hit = await classifyCode(client, raw, req.body?.expect);
+    let roll = null;
+    if (!hit) {
+      const f = await findScannedRoll(client, raw);
+      roll = f.error ? { error: f.error } : { roll_no: f.scan.roll_no, found: f.rows.length, status: f.rows[0]?.status || null };
+    }
+    res.json({
+      success: true,
+      cleaned: cleanScan(raw),
+      candidates: labelCandidates(raw, req.body?.expect).map((c) => c.code),
+      kind: hit?.kind || (roll && !roll.error ? "roll" : "unknown"),
+      box: hit?.box ? { code: hit.box.code, location_code: hit.box.location_code } : null,
+      location: hit?.location ? { code: hit.location.code, box_code: hit.location.box_code } : null,
+      invalid: hit?.kind === "invalid_box" ? hit.error : null,
+      roll,
+    });
+  }));
 
   // Finds the roll behind a scanned barcode. → { scan, rows } | { error }
   async function findScannedRoll(client, raw, statusSql = `r.status <> 'cancelled'`) {
@@ -1745,6 +1836,100 @@ function registerFabricWarehouse(app, deps) {
     });
   }));
 
+  // ======================================================================
+  //  RECONCILIATION: requested from Skytex  vs  received (scanned)
+  // ======================================================================
+  // GET /reconciliation?days=60&po=
+  //   Scope: every roll requested from Skytex that is still pending, plus the
+  //   ones requested in the last `days` days (received or not).
+  //   • byPo        per PO: requested / received / pending / overdue
+  //   • pending     requested but not received yet (oldest arrival first)
+  //   • unrequested received in the warehouse WITHOUT a Skytex request
+  //                 (open = not reviewed yet; reviewed = with a note)
+  // A roll counts as received once it was scanned in (in_stock, at
+  // inspection or already returned to the supplier).
+  app.get(`${BASE}/reconciliation`, authenticateToken, withClient(async (req, res, client) => {
+    const days = Math.max(1, Math.min(3650, parseInt(req.query.days, 10) || 60));
+    const po = str(req.query.po);
+    const params = [days];
+    let poSql = "";
+    if (po) { params.push(po); poSql = ` AND COALESCE(r.po_number, 'Sin PO') = $${params.length}`; }
+    const scope = `r.source = 'skytex' AND r.status <> 'cancelled'
+                   AND (r.status IN ('requested','assigned') OR r.requested_at >= now() - make_interval(days => $1))${poSql}`;
+    const RECEIVED = `r.status IN ('in_stock','at_inspection','returned')`;
+
+    const byPo = await client.query(
+      `SELECT COALESCE(r.po_number, 'Sin PO') AS po_number,
+              COUNT(*)::int AS requested,
+              COUNT(*) FILTER (WHERE ${RECEIVED})::int AS received,
+              COUNT(*) FILTER (WHERE r.status IN ('requested','assigned'))::int AS pending,
+              COUNT(*) FILTER (WHERE r.status IN ('requested','assigned') AND r.arrival_date < CURRENT_DATE)::int AS overdue,
+              COALESCE(SUM(r.yards), 0) AS yards_requested,
+              COALESCE(SUM(r.yards) FILTER (WHERE ${RECEIVED}), 0) AS yards_received,
+              MIN(r.arrival_date) FILTER (WHERE r.status IN ('requested','assigned')) AS next_arrival,
+              MAX(r.received_at) AS last_received_at,
+              MIN(r.requested_at) AS first_requested_at
+         FROM fabric_rolls r
+        WHERE ${scope}
+        GROUP BY 1
+        ORDER BY COUNT(*) FILTER (WHERE r.status IN ('requested','assigned')) DESC, MAX(r.requested_at) DESC`,
+      params
+    );
+    const pending = await client.query(
+      `${ROLL_SELECT}
+        WHERE ${scope} AND r.status IN ('requested','assigned')
+        ORDER BY r.arrival_date NULLS LAST, r.po_number, r.roll_no
+        LIMIT 2000`,
+      params
+    );
+    const unreq = await client.query(
+      `${ROLL_SELECT.replace("FROM fabric_rolls r", `,
+              ru.full_name AS received_by_name, rv.full_name AS reviewed_by_name
+         FROM fabric_rolls r
+         LEFT JOIN users ru ON ru.id = r.received_by
+         LEFT JOIN users rv ON rv.id = r.unrequested_reviewed_by`)}
+        WHERE r.source = 'scan' AND r.status <> 'cancelled'
+        ORDER BY (r.unrequested_reviewed_at IS NULL) DESC, r.received_at DESC NULLS LAST
+        LIMIT 1000`
+    );
+    const rows = byPo.rows.map((x) => ({
+      ...x, yards_requested: Number(x.yards_requested), yards_received: Number(x.yards_received),
+    }));
+    const sum = (k) => rows.reduce((a, x) => a + Number(x[k] || 0), 0);
+    const open = unreq.rows.filter((r) => !r.unrequested_reviewed_at);
+    res.json({
+      success: true, days,
+      totals: {
+        requested: sum("requested"), received: sum("received"), pending: sum("pending"), overdue: sum("overdue"),
+        yardsRequested: sum("yards_requested"), yardsReceived: sum("yards_received"),
+        unrequested: open.length, unrequestedReviewed: unreq.rows.length - open.length,
+      },
+      byPo: rows,
+      pending: pending.rows,
+      unrequested: unreq.rows,
+    });
+  }));
+
+  // Mark a roll received without request as reviewed (with a note), or undo it.
+  // Body: { note, undo? }
+  app.post(`${BASE}/rolls/:id/review-unrequested`, authenticateToken, withClient(async (req, res, client) => {
+    const undo = req.body?.undo === true;
+    const note = str(req.body?.note);
+    if (!undo && !note) return fail(res, 400, "Escriba qué se revisó (por ejemplo: «Skytex confirma que pertenece a la PO 1218108»).");
+    const { rows } = await client.query(
+      `UPDATE fabric_rolls
+          SET unrequested_reviewed_at = CASE WHEN $2 THEN NULL ELSE now() END,
+              unrequested_reviewed_by = CASE WHEN $2 THEN NULL ELSE $3::bigint END,
+              unrequested_note        = CASE WHEN $2 THEN NULL ELSE $4 END,
+              updated_at = now()
+        WHERE id = $1 AND source = 'scan'
+        RETURNING id`,
+      [req.params.id, undo, req.user?.id ?? null, note || null]
+    );
+    if (!rows.length) return fail(res, 404, "Rollo no encontrado o ya fue solicitado a Skytex.");
+    res.json({ success: true });
+  }));
+
   app.get(`${BASE}/dashboard`, authenticateToken, withClient(async (req, res, client) => {
     // One connection, so the queries run one after another.
     const status = await client.query(
@@ -1764,6 +1949,12 @@ function registerFabricWarehouse(app, deps) {
         WHERE created_at::date = CURRENT_DATE AND type IN ('received','inspection_out','supplier_return')
         GROUP BY type`
     );
+    const recon = await client.query(
+      `SELECT COUNT(*) FILTER (WHERE source = 'scan' AND status <> 'cancelled' AND unrequested_reviewed_at IS NULL)::int AS unrequested,
+              COUNT(*) FILTER (WHERE source = 'skytex' AND status IN ('requested','assigned')
+                                 AND arrival_date IS NOT NULL AND arrival_date < CURRENT_DATE)::int AS overdue
+         FROM fabric_rolls`
+    );
     const by = Object.fromEntries(status.rows.map((r) => [r.status, { rolls: r.rolls, yards: Number(r.yards), meters: Number(r.meters) }]));
     const t = Object.fromEntries(today.rows.map((r) => [r.type, r.n]));
     res.json({
@@ -1774,6 +1965,8 @@ function registerFabricWarehouse(app, deps) {
         aging: { rolls: aging.rows[0].rolls, yards: Number(aging.rows[0].yards) },
         openInspectionRequests: insp.rows[0].n,
         today: { received: t.received || 0, toInspection: t.inspection_out || 0, returned: t.supplier_return || 0 },
+        unrequested: recon.rows[0].unrequested,
+        overdue: recon.rows[0].overdue,
       },
     });
   }));
@@ -1783,6 +1976,7 @@ registerFabricWarehouse.initSchema = initSchema;
 registerFabricWarehouse.normalizeRoll = normalizeRoll;
 registerFabricWarehouse.parseRollScan = parseRollScan;
 registerFabricWarehouse.cleanScan = cleanScan;
+registerFabricWarehouse.labelCandidates = labelCandidates;
 registerFabricWarehouse.BOX_CODES = BOX_CODES;
 registerFabricWarehouse.FIELDS = FIELDS;
 module.exports = registerFabricWarehouse;
