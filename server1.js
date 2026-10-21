@@ -681,6 +681,8 @@ await registerCutOrders.initSchema({ pool, setSchema });
 await registerCutOrderRequests.initSchema({ pool, setSchema });   // solicitudes de corte (después de cut_orders)
 await registerBom.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
+await registerFabricWarehouse.initSchema({ pool, setSchema });
+
 await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
 await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
 await registerOrderClose.initSchema({ pool, setSchema });   // ✅ cierre manual (después de work_orders)
@@ -1075,6 +1077,9 @@ registerMerchantPlan(app, { authenticateToken, pool, setSchema });
 
 const registerFinishedWarehouse = require("./finished-warehouse");
 registerFinishedWarehouse(app, { authenticateToken, pool, setSchema });
+
+const registerFabricWarehouse = require("./fabric-warehouse");
+registerFabricWarehouse(app, { authenticateToken, pool, setSchema });
 
 const registerCutOrders = require("./cut-orders");
 registerCutOrders(app, { authenticateToken, pool, setSchema });
