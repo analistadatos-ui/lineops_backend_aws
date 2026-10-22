@@ -25,10 +25,15 @@
 //   SKYTEX_PO_PARAM     optional, query param Skytex uses for the PO (default "po")
 //
 // Push from Skytex (they call us on every transfer to Skyrina):
-//   POST /api/fabric-warehouse/skytex/transfers
+//   POST https://d23mudpmb3ck8v.cloudfront.net/api/fabric-warehouse/skytex/transfers
+//   (CloudFront → API Gateway → Lambda: max ~5 MB per request — Lambda limit)
 //   FABRIC_SKYTEX_WEBHOOK_KEY   the key Skytex sends as "X-Api-Key: <key>"
 //                               (or "Authorization: Bearer <key>"). Without it
 //                               the endpoint answers 503 (not configured).
+//   FABRIC_ORIGIN_VERIFY        optional: secret that CloudFront adds as the
+//                               custom origin header "X-Origin-Verify". When set,
+//                               calls that skip CloudFront (straight to the
+//                               API Gateway URL) are rejected with 403.
 //   FABRIC_AGING_DAYS   optional, days in stock before a roll is flagged (default 30)
 // Until the API is live, the screen also accepts the test JSON pasted or uploaded
 // (POST /api/fabric-warehouse/skytex/preview) and runs it through the same mapper.
@@ -773,6 +778,11 @@ function registerFabricWarehouse(app, deps) {
   };
 
   app.post(`${BASE}/skytex/transfers`, withClient(async (req, res, client) => {
+    // Only through CloudFront (which adds X-Origin-Verify), never straight to API Gateway.
+    const originSecret = String(process.env.FABRIC_ORIGIN_VERIFY || "").trim();
+    if (originSecret && !sameKey(String(req.get("x-origin-verify") || ""), originSecret)) {
+      return res.status(403).json({ success: false, code: "forbidden", error: "Use the published URL." });
+    }
     const key = webhookKey();
     if (!key) return res.status(503).json({ success: false, code: "not_configured", error: "Webhook not configured on Skyrina side (FABRIC_SKYTEX_WEBHOOK_KEY)." });
     const sent = String(req.get("x-api-key") || "").trim() || String(req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
@@ -904,7 +914,7 @@ function registerFabricWarehouse(app, deps) {
       return res.status(400).json({ success: false, code: "invalid_payload", error: "Body is not valid JSON." });
     }
     if (err.type === "entity.too.large") {
-      return res.status(413).json({ success: false, code: "payload_too_large", error: "Payload too large (max 12 MB per request). Please contact Skyrina." });
+      return res.status(413).json({ success: false, code: "payload_too_large", error: "Payload too large (max 5 MB per request). Please contact Skyrina." });
     }
     return next(err);
   });
