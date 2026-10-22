@@ -54,6 +54,11 @@ const BOX_CATALOG = { prefix: BOX_PREFIX, count: BOX_COUNT, first: BOX_CODES[0],
 // Used as the default for new divisions and for «Lugares por división».
 const SPOTS_PER_DIVISION = Math.max(1, Math.min(99, parseInt(process.env.FABRIC_SPOTS_PER_DIVISION, 10) || 14));
 
+// Skytex sends the TRANSFER date in arrival_date. A roll counts as overdue when
+// it has not arrived arrival_date + FABRIC_TRANSIT_DAYS days later (default 0:
+// arrival_date is the expected arrival). Set it to the usual transit time.
+const TRANSIT_DAYS = Math.max(0, Math.min(90, parseInt(process.env.FABRIC_TRANSIT_DAYS, 10) || 0));
+
 // Maximum rolls one container holds — the same for every container
 // (.env FABRIC_BOX_CAPACITY, default 50). Applied to all containers on startup.
 const BOX_CAPACITY = Math.max(1, Math.min(1000, parseInt(process.env.FABRIC_BOX_CAPACITY, 10) || 50));
@@ -84,7 +89,8 @@ const FIELDS = [
   { key: "fabric_name", label: "Fabric name", aliases: ["nombretela", "tela", "description"] },
   { key: "fabric_type", label: "Tipo de tela", aliases: ["typedetela", "fabrictype", "tipo"] },
   { key: "customer", label: "Cliente", aliases: ["client"] },
-  { key: "arrival_date", label: "Fecha de llegada", aliases: ["arrivaldate", "fechallegada", "eta"], type: "date" },
+  // Skytex sends the transfer date here; Skyrina treats it as the delivery date (fecha de entrega).
+  { key: "arrival_date", label: "Fecha de llegada", aliases: ["arrivaldate", "fechallegada", "eta", "fechadeentrega", "fechaentrega", "deliverydate", "transferdate", "fechadetransferencia"], type: "date" },
   { key: "size", label: "Size", aliases: ["talla"] },
   { key: "item_sku_code", label: "Item SKU code", aliases: ["sku", "skucode", "itemsku"] },
   { key: "purchase_term", label: "Término de compra", aliases: ["purchaseterm", "incoterm", "terms"] },
@@ -790,10 +796,50 @@ function registerFabricWarehouse(app, deps) {
 
     const body = req.body;
     if (!body || typeof body !== "object") return res.status(400).json({ success: false, code: "invalid_payload", error: "Body must be JSON." });
-    const rows = extractArray(body);
-    if (!rows.length) return res.status(400).json({ success: false, code: "invalid_payload", error: "No rolls found (expected an array in \"data\")." });
     const topId = findTransferId(body);
     const event = String(body.event || body.type || "transfer").slice(0, 40);
+
+    // Whole transfer cancelled in Skytex: { "transfer_id": "...", "event": "transfer_cancelled" }
+    // Rolls of that transfer that have not arrived are cancelled; rolls already
+    // received are kept and reported. Sending it again is harmless (idempotent).
+    if (/^(transfer_?)?cancel(led|ed)?$/i.test(event)) {
+      if (!topId) return res.status(400).json({ success: false, code: "invalid_payload", error: "transfer_id is required." });
+      await client.query("BEGIN");
+      const known = (await client.query(`SELECT 1 FROM fabric_skytex_transfers WHERE transfer_id = $1`, [topId])).rows.length > 0;
+      const rs = await client.query(
+        `SELECT id, roll_no, status, location_id FROM fabric_rolls WHERE transfer_id = $1 AND status <> 'cancelled' FOR UPDATE`, [topId]
+      );
+      const out = { transfer_id: topId, event: "transfer_cancelled", found: known || rs.rows.length > 0, cancelled: [], warnings: [] };
+      for (const g of rs.rows) {
+        if (["requested", "assigned"].includes(g.status)) {
+          await client.query(
+            `UPDATE fabric_rolls SET status = 'cancelled', box_id = NULL, location_id = NULL, container_id = NULL, updated_at = now() WHERE id = $1`,
+            [g.id]
+          );
+          await logMove(client, { rollId: g.id, type: "cancelled", from: g.location_id, reference: `Transferencia ${topId}`, reason: "Transferencia cancelada por Skytex" });
+          out.cancelled.push(g.roll_no);
+        } else {
+          out.warnings.push({ roll_no: g.roll_no, warning: `transfer cancelled but roll already ${g.status} at Skyrina; kept` });
+        }
+      }
+      if (!out.found) out.warnings.push({ warning: "unknown transfer_id; nothing to cancel" });
+      await client.query(
+        `INSERT INTO fabric_skytex_transfers (transfer_id, event, roll_count, payload, last_result)
+         VALUES ($1, 'transfer_cancelled', 0, $2, $3)
+         ON CONFLICT (transfer_id) DO UPDATE
+           SET event = 'transfer_cancelled', payload = EXCLUDED.payload, last_result = EXCLUDED.last_result,
+               last_received_at = now(), times_received = fabric_skytex_transfers.times_received + 1`,
+        [topId, JSON.stringify(body), JSON.stringify(out)]
+      );
+      await client.query("COMMIT");
+      return res.json({ success: true, ...out });
+    }
+
+    const rows = extractArray(body);
+    if (!rows.length) {
+      return res.status(400).json({ success: false, code: "invalid_payload",
+        error: "No rolls found (expected an array in \"data\"). To cancel a whole transfer send event \"transfer_cancelled\"." });
+    }
 
     // Group by transfer_id (top level, or per roll)
     const groups = new Map();
@@ -2081,7 +2127,7 @@ function registerFabricWarehouse(app, deps) {
               COUNT(*)::int AS requested,
               COUNT(*) FILTER (WHERE ${RECEIVED})::int AS received,
               COUNT(*) FILTER (WHERE r.status IN ('requested','assigned'))::int AS pending,
-              COUNT(*) FILTER (WHERE r.status IN ('requested','assigned') AND r.arrival_date < CURRENT_DATE)::int AS overdue,
+              COUNT(*) FILTER (WHERE r.status IN ('requested','assigned') AND r.arrival_date + ${TRANSIT_DAYS} < CURRENT_DATE)::int AS overdue,
               COALESCE(SUM(r.yards), 0) AS yards_requested,
               COALESCE(SUM(r.yards) FILTER (WHERE ${RECEIVED}), 0) AS yards_received,
               MIN(r.arrival_date) FILTER (WHERE r.status IN ('requested','assigned')) AS next_arrival,
@@ -2116,7 +2162,7 @@ function registerFabricWarehouse(app, deps) {
     const sum = (k) => rows.reduce((a, x) => a + Number(x[k] || 0), 0);
     const open = unreq.rows.filter((r) => !r.unrequested_reviewed_at);
     res.json({
-      success: true, days,
+      success: true, days, transitDays: TRANSIT_DAYS,
       totals: {
         requested: sum("requested"), received: sum("received"), pending: sum("pending"), overdue: sum("overdue"),
         yardsRequested: sum("yards_requested"), yardsReceived: sum("yards_received"),
@@ -2170,7 +2216,7 @@ function registerFabricWarehouse(app, deps) {
     const recon = await client.query(
       `SELECT COUNT(*) FILTER (WHERE source = 'scan' AND status <> 'cancelled' AND unrequested_reviewed_at IS NULL)::int AS unrequested,
               COUNT(*) FILTER (WHERE source = 'skytex' AND status IN ('requested','assigned')
-                                 AND arrival_date IS NOT NULL AND arrival_date < CURRENT_DATE)::int AS overdue
+                                 AND arrival_date IS NOT NULL AND arrival_date + ${TRANSIT_DAYS} < CURRENT_DATE)::int AS overdue
          FROM fabric_rolls`
     );
     const by = Object.fromEntries(status.rows.map((r) => [r.status, { rolls: r.rolls, yards: Number(r.yards), meters: Number(r.meters) }]));
