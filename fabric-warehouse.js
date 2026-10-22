@@ -965,13 +965,45 @@ function registerFabricWarehouse(app, deps) {
     return next(err);
   });
 
-  // Log of transfers pushed by Skytex (for the warehouse / support).
+  // Transfers pushed by Skytex, newest first, with how their rolls are doing.
+  //   GET /skytex/transfers?days=90
   app.get(`${BASE}/skytex/transfers`, authenticateToken, withClient(async (req, res, client) => {
+    const days = Math.max(1, Math.min(3650, parseInt(req.query.days, 10) || 90));
     const { rows } = await client.query(
-      `SELECT transfer_id, event, first_received_at, last_received_at, times_received, roll_count, last_result
-         FROM fabric_skytex_transfers ORDER BY last_received_at DESC LIMIT 200`
+      `SELECT t.transfer_id, t.event, t.first_received_at, t.last_received_at, t.times_received, t.roll_count,
+              t.last_result,
+              COUNT(r.id)::int AS rolls,
+              COUNT(r.id) FILTER (WHERE r.status = 'requested')::int AS en_skytex,
+              COUNT(r.id) FILTER (WHERE r.status = 'assigned')::int AS reserved,
+              COUNT(r.id) FILTER (WHERE r.status IN ('in_stock','at_inspection','returned'))::int AS received,
+              COUNT(r.id) FILTER (WHERE r.status = 'cancelled')::int AS cancelled,
+              COALESCE(SUM(r.yards) FILTER (WHERE r.status <> 'cancelled'), 0) AS yards,
+              to_char(MIN(r.arrival_date) FILTER (WHERE r.status IN ('requested','assigned')), 'YYYY-MM-DD') AS next_delivery,
+              COUNT(r.id) FILTER (WHERE r.status IN ('requested','assigned') AND r.arrival_date + ${TRANSIT_DAYS} < CURRENT_DATE)::int AS overdue,
+              string_agg(DISTINCT r.po_number, ', ') AS po_numbers
+         FROM fabric_skytex_transfers t
+         LEFT JOIN fabric_rolls r ON r.transfer_id = t.transfer_id
+        WHERE t.last_received_at >= now() - make_interval(days => $1)
+           OR EXISTS (SELECT 1 FROM fabric_rolls p WHERE p.transfer_id = t.transfer_id AND p.status IN ('requested','assigned'))
+        GROUP BY t.transfer_id
+        ORDER BY t.last_received_at DESC
+        LIMIT 500`,
+      [days]
     );
-    res.json({ success: true, transfers: rows });
+    res.json({
+      success: true, days,
+      transfers: rows.map((x) => ({ ...x, yards: Number(x.yards), warnings: (x.last_result?.warnings || []).length })),
+    });
+  }));
+
+  // The rolls of one transfer (every status, including cancelled).
+  app.get(`${BASE}/skytex/transfers/:id/rolls`, authenticateToken, withClient(async (req, res, client) => {
+    const t = await client.query(`SELECT transfer_id, event, last_result FROM fabric_skytex_transfers WHERE transfer_id = $1`, [req.params.id]);
+    if (!t.rows.length) return fail(res, 404, "Transferencia no encontrada.");
+    const { rows } = await client.query(
+      `${ROLL_SELECT} WHERE r.transfer_id = $1 ORDER BY r.po_number NULLS LAST, r.roll_no`, [req.params.id]
+    );
+    res.json({ success: true, transfer: t.rows[0], rolls: rows });
   }));
 
   // ======================================================================
