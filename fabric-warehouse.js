@@ -23,11 +23,18 @@
 //   SKYTEX_API_TOKEN    optional, sent as "Authorization: Bearer <token>"
 //   SKYTEX_API_KEY      optional, sent in the header SKYTEX_API_KEY_HEADER (default x-api-key)
 //   SKYTEX_PO_PARAM     optional, query param Skytex uses for the PO (default "po")
+//
+// Push from Skytex (they call us on every transfer to Skyrina):
+//   POST /api/fabric-warehouse/skytex/transfers
+//   FABRIC_SKYTEX_WEBHOOK_KEY   the key Skytex sends as "X-Api-Key: <key>"
+//                               (or "Authorization: Bearer <key>"). Without it
+//                               the endpoint answers 503 (not configured).
 //   FABRIC_AGING_DAYS   optional, days in stock before a roll is flagged (default 30)
 // Until the API is live, the screen also accepts the test JSON pasted or uploaded
 // (POST /api/fabric-warehouse/skytex/preview) and runs it through the same mapper.
 // ---------------------------------------------------------------------------
 
+const crypto = require("crypto");
 const AGING_DAYS = Number(process.env.FABRIC_AGING_DAYS) || 30;
 
 // The fixed set of containers that exist in the yard: F01…F80.
@@ -377,6 +384,21 @@ async function initSchema({ pool, setSchema }) {
     await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS unrequested_reviewed_at TIMESTAMPTZ;");
     await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS unrequested_reviewed_by BIGINT;");
     await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS unrequested_note TEXT;");
+    // Transfers pushed by Skytex (one row per transfer_id; resends update it).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS fabric_skytex_transfers(
+        transfer_id VARCHAR(120) PRIMARY KEY,
+        event VARCHAR(40),
+        first_received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        times_received INT NOT NULL DEFAULT 1,
+        roll_count INT NOT NULL DEFAULT 0,
+        payload JSONB,
+        last_result JSONB
+      );
+    `);
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS transfer_id VARCHAR(120);");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_transfer ON fabric_rolls(transfer_id);");
     await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS weight_unit VARCHAR(20);");
     await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS weight_gsm VARCHAR(40);");
     await client.query(`
@@ -634,7 +656,10 @@ function registerFabricWarehouse(app, deps) {
     const rows = source.map((o) => ({ ...normalizeRoll(o), _raw: o }));
     const missing = rows.filter((r) => !r.roll_no).length;
     const valid = rows.filter((r) => r.roll_no);
-    const unmapped = [...new Set(source.flatMap((o) => Object.keys(o || {})).filter((k) => !ALIAS.has(normKey(k))))];
+    // transfer_id / event belong to the push envelope, not to the roll fields.
+    const ENVELOPE = new Set(["transferid", "idtransfer", "idtransferencia", "transferencia", "transfer", "folio", "foliotransferencia", "event", "type"]);
+    const unmapped = [...new Set(source.flatMap((o) => Object.keys(o || {}))
+      .filter((k) => !ALIAS.has(normKey(k)) && !ENVELOPE.has(normKey(k))))];
     res.json({
       success: true,
       source: "file",
@@ -708,6 +733,189 @@ function registerFabricWarehouse(app, deps) {
     }
     await client.query("COMMIT");
     res.json({ success: true, created: created.length, duplicates, linked });
+  }));
+
+  // ======================================================================
+  //  PUSH FROM SKYTEX: POST /skytex/transfers
+  // ======================================================================
+  // Skytex calls this every time it registers a transfer to Skyrina, with the
+  // same JSON as the sample (the 25 agreed fields) plus a transfer_id:
+  //   { "transfer_id": "TR-2026-000123", "event": "transfer", "data": [ {roll}, … ] }
+  // (transfer_id may also come inside each roll.)
+  //
+  // Auth: header "X-Api-Key: <FABRIC_SKYTEX_WEBHOOK_KEY>" (or Authorization: Bearer).
+  //
+  // Idempotent — sending the same transfer_id again (retry or correction):
+  //   • rolls already registered are UPDATED with the new data (never duplicated)
+  //   • new rolls are added (status «En Skytex», ready to reserve a container)
+  //   • rolls of that transfer that are no longer in the resend and have not
+  //     arrived yet are cancelled (reported in the reply); rolls already
+  //     received are never touched
+  //   • a roll scanned on arrival before its data came is linked to it
+  //
+  // Replies: 200 ok (also for resends) · 400 invalid JSON / no transfer_id ·
+  //   401 wrong key · 422 no valid rolls · 503 not configured · 500 our error.
+  //   Retry only on 5xx / network errors; 4xx means the payload must be fixed.
+  const webhookKey = () => String(process.env.FABRIC_SKYTEX_WEBHOOK_KEY || "").trim();
+  const sameKey = (a, b) => {
+    const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+    return x.length === y.length && crypto.timingSafeEqual(x, y);
+  };
+  const TRANSFER_KEYS = ["transferid", "idtransfer", "idtransferencia", "transferencia", "transfer", "folio", "foliotransferencia"];
+  const findTransferId = (obj) => {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+    for (const [k, v] of Object.entries(obj)) {
+      if (TRANSFER_KEYS.includes(normKey(k)) && (typeof v === "string" || typeof v === "number") && String(v).trim()) {
+        return String(v).trim().slice(0, 120);
+      }
+    }
+    return null;
+  };
+
+  app.post(`${BASE}/skytex/transfers`, withClient(async (req, res, client) => {
+    const key = webhookKey();
+    if (!key) return res.status(503).json({ success: false, code: "not_configured", error: "Webhook not configured on Skyrina side (FABRIC_SKYTEX_WEBHOOK_KEY)." });
+    const sent = String(req.get("x-api-key") || "").trim() || String(req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+    if (!sent || !sameKey(sent, key)) return res.status(401).json({ success: false, code: "unauthorized", error: "Invalid or missing API key." });
+
+    const body = req.body;
+    if (!body || typeof body !== "object") return res.status(400).json({ success: false, code: "invalid_payload", error: "Body must be JSON." });
+    const rows = extractArray(body);
+    if (!rows.length) return res.status(400).json({ success: false, code: "invalid_payload", error: "No rolls found (expected an array in \"data\")." });
+    const topId = findTransferId(body);
+    const event = String(body.event || body.type || "transfer").slice(0, 40);
+
+    // Group by transfer_id (top level, or per roll)
+    const groups = new Map();
+    const skipped = [];
+    rows.forEach((raw, index) => {
+      const tid = topId || findTransferId(raw);
+      if (!tid) return skipped.push({ index, reason: "missing transfer_id" });
+      const r = normalizeRoll(raw);
+      if (!r.roll_no) return skipped.push({ index, reason: "missing roll number (Rollo de tela / roll_no)" });
+      if (!groups.has(tid)) groups.set(tid, []);
+      groups.get(tid).push({ r, raw, index });
+    });
+    if (!groups.size) {
+      const status = skipped.every((x) => x.reason === "missing transfer_id") ? 400 : 422;
+      return res.status(status).json({
+        success: false, code: status === 400 ? "invalid_payload" : "no_valid_rolls",
+        error: status === 400 ? "transfer_id is required." : "No valid rolls in the payload.", skipped,
+      });
+    }
+
+    const results = [];
+    await client.query("BEGIN");
+    for (const [tid, items] of groups) {
+      const out = { transfer_id: tid, received: items.length, created: 0, updated: 0, linked: 0, cancelled: [], warnings: [] };
+      const keys = [];
+      const seen = new Set();
+      for (const { r, raw, index } of items) {
+        const k = rollKeyOf(r);
+        if (seen.has(k)) { out.warnings.push({ index, roll_no: r.roll_no, warning: "duplicated in this payload; last one kept" }); }
+        seen.add(k);
+        keys.push(k);
+        const vals = FIELD_KEYS.map((f) => r[f]);
+        const rawJson = JSON.stringify(raw);
+
+        const existing = (await client.query(`SELECT id, status FROM fabric_rolls WHERE skytex_key = $1 FOR UPDATE`, [k])).rows[0];
+        if (existing) {
+          const sets = FIELD_KEYS.map((f, i) => `${f} = COALESCE($${i + 4}, ${f})`).join(", ");
+          await client.query(
+            `UPDATE fabric_rolls
+                SET ${sets}, raw = $2, transfer_id = $3, source = 'skytex',
+                    status = CASE WHEN status = 'cancelled' THEN 'requested' ELSE status END,
+                    requested_at = CASE WHEN status = 'cancelled' THEN now() ELSE requested_at END,
+                    updated_at = now()
+              WHERE id = $1`,
+            [existing.id, rawJson, tid, ...vals]
+          );
+          if (existing.status === "cancelled") {
+            await logMove(client, { rollId: existing.id, type: "requested", reference: `Transferencia ${tid}`, reason: "Reenviado por Skytex" });
+          }
+          out.updated++;
+          continue;
+        }
+        // Scanned on arrival before Skytex sent its data → link it.
+        const scanned = (await client.query(
+          `SELECT id FROM fabric_rolls WHERE source = 'scan' AND UPPER(roll_no) = UPPER($1) LIMIT 1 FOR UPDATE`, [r.roll_no]
+        )).rows[0];
+        if (scanned) {
+          const sets = FIELD_KEYS.map((f, i) => `${f} = COALESCE($${i + 5}, ${f})`).join(", ");
+          await client.query(
+            `UPDATE fabric_rolls SET skytex_key = $2, ${sets}, source = 'skytex', raw = $3, transfer_id = $4, updated_at = now()
+              WHERE id = $1`,
+            [scanned.id, k, rawJson, tid, ...vals]
+          );
+          out.linked++;
+          continue;
+        }
+        const cols = ["skytex_key", ...FIELD_KEYS, "raw", "transfer_id"];
+        const ins = await client.query(
+          `INSERT INTO fabric_rolls (${cols.join(",")}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(",")}) RETURNING id`,
+          [k, ...vals, rawJson, tid]
+        );
+        await logMove(client, { rollId: ins.rows[0].id, type: "requested", reference: `Transferencia ${tid}`, reason: "Recibido de Skytex" });
+        out.created++;
+      }
+
+      // Correction: rolls of this transfer missing from the resend
+      const gone = await client.query(
+        `SELECT id, roll_no, status, location_id FROM fabric_rolls
+          WHERE transfer_id = $1 AND NOT (skytex_key = ANY($2::text[])) AND status <> 'cancelled' FOR UPDATE`,
+        [tid, keys]
+      );
+      for (const g of gone.rows) {
+        if (["requested", "assigned"].includes(g.status)) {
+          await client.query(
+            `UPDATE fabric_rolls SET status = 'cancelled', box_id = NULL, location_id = NULL, container_id = NULL, updated_at = now() WHERE id = $1`,
+            [g.id]
+          );
+          await logMove(client, { rollId: g.id, type: "cancelled", from: g.location_id, reference: `Transferencia ${tid}`, reason: "Ya no viene en el reenvío de Skytex" });
+          out.cancelled.push(g.roll_no);
+        } else {
+          out.warnings.push({ roll_no: g.roll_no, warning: `not in the resend but already ${g.status} at Skyrina; kept` });
+        }
+      }
+
+      const t = await client.query(
+        `INSERT INTO fabric_skytex_transfers (transfer_id, event, roll_count, payload, last_result)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (transfer_id) DO UPDATE
+           SET event = EXCLUDED.event, roll_count = EXCLUDED.roll_count, payload = EXCLUDED.payload,
+               last_result = EXCLUDED.last_result, last_received_at = now(),
+               times_received = fabric_skytex_transfers.times_received + 1
+         RETURNING times_received`,
+        [tid, event, items.length, JSON.stringify(body), JSON.stringify(out)]
+      );
+      out.resend = t.rows[0].times_received > 1;
+      results.push(out);
+    }
+    await client.query("COMMIT");
+    const one = results.length === 1 ? results[0] : null;
+    res.json({ success: true, ...(one || { transfers: results }), skipped });
+  }));
+
+  // Body errors (invalid JSON, too large) happen in the server's JSON parser
+  // before the route: answer them in JSON too, so Skytex can read the reason.
+  app.use(`${BASE}/skytex/transfers`, (err, req, res, next) => {
+    if (!err) return next();
+    if (err.type === "entity.parse.failed") {
+      return res.status(400).json({ success: false, code: "invalid_payload", error: "Body is not valid JSON." });
+    }
+    if (err.type === "entity.too.large") {
+      return res.status(413).json({ success: false, code: "payload_too_large", error: "Payload too large (max 12 MB per request). Please contact Skyrina." });
+    }
+    return next(err);
+  });
+
+  // Log of transfers pushed by Skytex (for the warehouse / support).
+  app.get(`${BASE}/skytex/transfers`, authenticateToken, withClient(async (req, res, client) => {
+    const { rows } = await client.query(
+      `SELECT transfer_id, event, first_received_at, last_received_at, times_received, roll_count, last_result
+         FROM fabric_skytex_transfers ORDER BY last_received_at DESC LIMIT 200`
+    );
+    res.json({ success: true, transfers: rows });
   }));
 
   // ======================================================================
