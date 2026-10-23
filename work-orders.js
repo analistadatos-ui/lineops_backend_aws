@@ -204,7 +204,17 @@ async function initSchema({ pool, setSchema }) {
         seen_by BIGINT REFERENCES users(id) ON DELETE SET NULL
       );
     `);
+    // Bloqueos: el aviso puede quedar sin aplicar (tablero o semana bloqueada).
+    //   status: applied | partial | pending | superseded
+    await client.query("ALTER TABLE plan_change_notices ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'applied';");
+    await client.query("ALTER TABLE plan_change_notices ADD COLUMN IF NOT EXISTS deferred_reason VARCHAR(30);");
+    await client.query("ALTER TABLE plan_change_notices ADD COLUMN IF NOT EXISTS apply_error TEXT;");
+    await client.query("ALTER TABLE plan_change_notices ADD COLUMN IF NOT EXISTS before_snapshot JSONB;");
+    await client.query("ALTER TABLE plan_change_notices ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ;");
+    await client.query("ALTER TABLE plan_change_notices ADD COLUMN IF NOT EXISTS applied_by BIGINT REFERENCES users(id) ON DELETE SET NULL;");
+    await client.query("ALTER TABLE plan_change_notices ADD COLUMN IF NOT EXISTS superseded_by BIGINT;");
     await client.query("CREATE INDEX IF NOT EXISTS idx_plan_change_notices_open ON plan_change_notices(created_at DESC) WHERE seen_at IS NULL;");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_plan_change_notices_unapplied ON plan_change_notices(work_order_id) WHERE status IN ('pending', 'partial');");
     await client.query("CREATE INDEX IF NOT EXISTS idx_plan_change_notices_wo ON plan_change_notices(work_order_id);");
     console.log("\u2705 plan_change_notices table ready in prod_db_schema");
   } finally {
@@ -1553,14 +1563,95 @@ function registerWorkOrders(app, deps) {
                 (SELECT COALESCE(NULLIF(TRIM(u.full_name), ''), u.username)
                    FROM users u WHERE u.id = n.seen_by) AS seen_by_name
            FROM plan_change_notices n
-          ${all ? "" : "WHERE n.seen_at IS NULL"}
-          ORDER BY n.created_at DESC
+          ${all ? "WHERE n.status <> 'superseded'" : "WHERE n.status IN ('pending', 'partial') OR (n.seen_at IS NULL AND n.status <> 'superseded')"}
+          ORDER BY (n.status IN ('pending', 'partial')) DESC, n.created_at DESC
           LIMIT $1`,
         [limit]
       );
       res.json({ success: true, notices: rows });
     } catch (err) {
       console.error("❌ Error fetching plan change notices:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // «Aplicar ahora»: vuelve a correr la sincronizacion de un aviso pendiente
+  // (tablero o semana bloqueada al momento de la edicion) contra la orden tal
+  // como esta HOY. Si el tablero sigue bloqueado responde 423 y no toca nada.
+  app.post("/api/plan-change-notices/:id/apply", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      await client.query("BEGIN");
+      const n = await client.query(
+        "SELECT id, work_order_id, status FROM plan_change_notices WHERE id = $1 FOR UPDATE",
+        [parseInt(req.params.id, 10)]
+      );
+      const notice = n.rows[0];
+      if (!notice) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, error: "Aviso no encontrado" });
+      }
+      if (!["pending", "partial"].includes(notice.status)) {
+        await client.query("ROLLBACK");
+        return res.json({ success: true, status: notice.status, message: "Este aviso ya estaba aplicado." });
+      }
+      if (!notice.work_order_id) {
+        await client.query(
+          "UPDATE plan_change_notices SET status = 'superseded', seen_at = COALESCE(seen_at, NOW()) WHERE id = $1",
+          [notice.id]
+        );
+        await client.query("COMMIT");
+        return res.json({ success: true, status: "superseded", message: "La orden ya no existe." });
+      }
+
+      const lock = await isBoardLocked(client);
+      if (lock.locked) {
+        await client.query("ROLLBACK");
+        return res.status(423).json({
+          success: false, boardLocked: true,
+          error: `🔒 El tablero sigue bloqueado${lock.by ? ` (${lock.by})` : ""}. Desbloquéelo y vuelva a aplicar.`,
+        });
+      }
+
+      await client.query("SELECT id FROM work_orders WHERE id = $1 FOR UPDATE", [notice.work_order_id]);
+      const after = await snapshotOrderForPlan(client, notice.work_order_id);
+      if (!after) {
+        await client.query(
+          "UPDATE plan_change_notices SET status = 'superseded', seen_at = COALESCE(seen_at, NOW()) WHERE id = $1",
+          [notice.id]
+        );
+        await client.query("COMMIT");
+        return res.json({ success: true, status: "superseded", message: "La orden ya no existe." });
+      }
+
+      const planSync = await applyOrderEditToPlan(client, {
+        workOrderId: notice.work_order_id,
+        before: null,                 // se usa la foto del aviso pendiente mas viejo
+        after,
+        user: req.user,
+        onCellEmptied: cleanupOrphanDraftRuns,
+        mode: "apply",
+        applyNoticeId: notice.id,
+      });
+      await client.query("COMMIT");
+
+      const status = planSync.status || "applied";
+      res.json({
+        success: true,
+        status,
+        planSync,
+        message: status === "applied"
+          ? "Cambios aplicados al tablero."
+          : status === "partial"
+          ? "Aplicado en semanas abiertas; quedan celdas en semanas bloqueadas."
+          : (planSync.applyError || "No se pudo aplicar."),
+      });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("❌ Error applying plan change notice:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
       client.release();
@@ -2243,13 +2334,24 @@ async function autoCompleteDay(client, { workOrderId, lineNo, day }) {
 //   2. Cantidad que BAJA (o color eliminado): se recorta lo asignado de mas,
 //      empezando por las celdas 'planned' mas lejanas. Nunca toca celdas de
 //      dias pasados, celdas 'released'/'completed', ni borra una celda que ya
-//      tiene produccion. Lo que no se pudo recortar queda como "excedente" en
-//      el aviso para que el planner lo resuelva a mano.
-//   3. Cantidad que SUBE: no se asigna nada solo; el tablero ya muestra la
-//      diferencia en la bolsa (pool) y el aviso le dice al planner cuanto falta.
-//   4. Se guarda un aviso en plan_change_notices con el detalle de QUE cambio,
-//      que el Plan Board muestra en la campana «Cambios de órdenes».
-// Todo corre dentro de la MISMA transaccion que la edicion del merchant.
+//      tiene produccion.
+//   3. Cantidad que SUBE: no se asigna nada solo; la bolsa (pool) del tablero
+//      muestra la diferencia y el aviso dice cuanto falta.
+//   4. Se guarda un aviso en plan_change_notices con el detalle de QUE cambio.
+//
+// BLOQUEOS — la edicion del merchant SIEMPRE se guarda; el tablero bloqueado
+// NUNCA se modifica:
+//   • Tablero bloqueado (plan_board_lock): no se toca ninguna celda. El aviso
+//     queda 'pending' y el planner lo aplica con «Aplicar ahora» al desbloquear.
+//   • Semana bloqueada por el CEO: se aplica en las semanas abiertas y las
+//     celdas de semanas bloqueadas se saltan. El aviso queda 'partial'.
+//   • Si un trigger de la base rechaza algo de todos modos, solo se deshace la
+//     parte del tablero (SAVEPOINT) y el aviso queda 'pending' con el error.
+//
+// Estados del aviso: applied | partial | pending | superseded.
+// Si una orden ya tiene avisos sin aplicar (pending/partial), la siguiente
+// sincronizacion parte de la foto MAS VIEJA sin aplicar, asi ningun cambio
+// intermedio se pierde, y los avisos viejos quedan 'superseded'.
 // ==========================================================================
 
 const normColor = (c) => String(c == null ? "" : c).trim().toUpperCase();
@@ -2274,6 +2376,7 @@ const PLAN_NOTICE_FIELDS = [
   ["fabric_name", "Tela"],
 ];
 const NUMERIC_NOTICE_FIELDS = new Set(["quantity", "total_to_produce", "warehouse_stock", "extra_quantity", "sam_minutes"]);
+const UNRESOLVED_STATUSES = ["pending", "partial"];
 
 // Foto de la orden: cabecera + cantidad por color + tallas por color.
 async function snapshotOrderForPlan(client, workOrderId) {
@@ -2308,14 +2411,13 @@ async function snapshotOrderForPlan(client, workOrderId) {
       (sig[c] = sig[c] || new Set()).add(`${t}|${String(l.estilo || "").trim()}`);
     }
   } else {
-    let cols = { rows: [] };
-    try {
-      cols = await client.query(
-        "SELECT color, quantity FROM work_order_colors WHERE work_order_id = $1",
-        [workOrderId]
-      );
-    } catch { /* tabla opcional */ }
-    if (cols.rows.length > 0) {
+    // work_order_colors es opcional: se lee dentro de un SAVEPOINT para que un
+    // "tabla no existe" no aborte la transaccion del merchant.
+    const cols = await softStep(client, "pc_snap_colors", () => client.query(
+      "SELECT color, quantity FROM work_order_colors WHERE work_order_id = $1",
+      [workOrderId]
+    ));
+    if (cols && cols.rows.length > 0) {
       source = "colors";
       for (const r of cols.rows) {
         const c = normColor(r.color);
@@ -2329,6 +2431,21 @@ async function snapshotOrderForPlan(client, workOrderId) {
   }
   Object.keys(colorQty).forEach((c) => { colorQty[c] = n2(colorQty[c]); });
   return { header, colorQty, sizes, sig, source };
+}
+
+// La foto se guarda en el aviso (JSONB) para poder aplicarla despues.
+function serializeSnapshot(s) {
+  if (!s) return null;
+  const sig = {};
+  Object.entries(s.sig || {}).forEach(([k, v]) => { sig[k] = [...v]; });
+  return { ...s, sig };
+}
+function deserializeSnapshot(j) {
+  if (!j) return null;
+  const s = typeof j === "string" ? JSON.parse(j) : j;
+  const sig = {};
+  Object.entries(s.sig || {}).forEach(([k, v]) => { sig[k] = new Set(v || []); });
+  return { ...s, sig };
 }
 
 // Empareja colores quitados con colores nuevos: mismo conjunto talla|estilo,
@@ -2351,9 +2468,49 @@ function detectColorRenames(before, after) {
   return pairs;
 }
 
+// Ejecuta fn dentro de un SAVEPOINT: si falla, no aborta la transaccion.
+// Regresa el resultado o null (rethrow=true relanza el error tras deshacer).
+let SP_SEQ = 0;
+async function softStep(client, name, fn, { rethrow = false } = {}) {
+  const sp = `${name}_${++SP_SEQ}`;
+  await client.query(`SAVEPOINT ${sp}`);
+  try {
+    const out = await fn();
+    await client.query(`RELEASE SAVEPOINT ${sp}`);
+    return out;
+  } catch (e) {
+    await client.query(`ROLLBACK TO SAVEPOINT ${sp}`).catch(() => {});
+    if (rethrow) throw e;
+    console.warn(`⚠️  plan-sync ${name}:`, e.message);
+    return null;
+  }
+}
+
+// ¿Tablero completo bloqueado? Sin tabla -> no bloqueado.
+async function isBoardLocked(client) {
+  const r = await softStep(client, "pc_board_lock", () => client.query(
+    "SELECT locked, locked_by FROM prod_db_schema.plan_board_lock WHERE id = 1"
+  ));
+  const row = r?.rows?.[0];
+  return row && row.locked ? { locked: true, by: row.locked_by || null } : { locked: false };
+}
+
+// Semanas bloqueadas por el CEO -> funcion (dia) => bool.
+async function lockedDayChecker(client) {
+  if (typeof planWeekLocks?.lockedWeekSet !== "function" || typeof planWeekLocks?.isLockedDay !== "function") {
+    return () => false;
+  }
+  const set = await softStep(client, "pc_week_locks", () => planWeekLocks.lockedWeekSet(client));
+  if (!set) return () => false;
+  return (day) => {
+    try { return !!planWeekLocks.isLockedDay(set, day); } catch { return false; }
+  };
+}
+
 // Recorta lo asignado (activo) hasta `target`, quitando de las celdas 'planned'
-// mas lejanas primero. color === undefined -> toda la orden.
-async function trimAssignmentsToTarget(client, workOrderId, { color, target, onCellEmptied }) {
+// mas lejanas primero. color === undefined -> toda la orden. Las celdas de
+// semanas bloqueadas se saltan y se reportan en lockedCells.
+async function trimAssignmentsToTarget(client, workOrderId, { color, target, onCellEmptied, isLockedDay }) {
   const params = [workOrderId];
   let colorSql = "";
   if (color !== undefined) {
@@ -2375,25 +2532,30 @@ async function trimAssignmentsToTarget(client, workOrderId, { color, target, onC
   const assigned = rows.reduce((s, r) => s + (Number(r.assigned_quantity) || 0), 0);
   let excess = n2(assigned - Math.max(Number(target) || 0, 0));
   const trimmed = [];
-  if (excess <= 0) return { assigned: n2(assigned), trimmed, unresolved: 0 };
+  const lockedCells = [];
+  if (excess <= 0) return { assigned: n2(assigned), trimmed, lockedCells, unresolved: 0 };
 
   for (const r of rows) {
     if (excess <= 0) break;
     if (r.status !== "planned" || !r.is_open) continue;   // solo celdas futuras/hoy sin liberar
     const qty = Number(r.assigned_quantity) || 0;
     if (qty <= 0) continue;
+    if (isLockedDay && isLockedDay(r.day)) {               // 🔒 semana bloqueada por el CEO
+      lockedCells.push({ id: Number(r.id), line_no: String(r.line_no), day: r.day, color: r.color || null, qty: n2(qty) });
+      continue;
+    }
 
     // Una celda con produccion nunca se borra (mismo criterio que DELETE).
     let produced = Number(r.produced_quantity) || 0;
     if (produced <= 0) {
-      const p = await client.query(
+      const p = await softStep(client, "pc_cell_prod", () => client.query(
         `SELECT COALESCE(SUM(se.sewed_qty), 0) AS produced
            FROM line_runs lr
            JOIN operation_sewed_entries se ON se.run_id = lr.id
           WHERE lr.line_no = $1 AND lr.run_date = $2::date`,
         [String(r.line_no), r.day]
-      ).catch(() => ({ rows: [{ produced: 0 }] }));
-      produced = Number(p.rows[0]?.produced) || 0;
+      ));
+      produced = Number(p?.rows?.[0]?.produced) || 0;
     }
 
     const take = Math.min(excess, produced > 0 ? Math.max(qty - 1, 0) : qty);
@@ -2413,38 +2575,20 @@ async function trimAssignmentsToTarget(client, workOrderId, { color, target, onC
     trimmed.push({ id: Number(r.id), line_no: String(r.line_no), day: r.day, color: r.color || null, from: n2(qty), to: left });
     excess = n2(excess - take);
   }
-  return { assigned: n2(assigned), trimmed, unresolved: Math.max(excess, 0) };
+  return { assigned: n2(assigned), trimmed, lockedCells, unresolved: Math.max(excess, 0) };
 }
 
-// Columnas reales de merchant_week_plan (vive en merchant-plan.js). Se lee una
-// vez; si la tabla no existe el plan del merchant simplemente no se toca.
+// Columnas reales de merchant_week_plan (vive en merchant-plan.js).
 let MWP_COLS = null;
 async function merchantPlanColumns(client) {
   if (MWP_COLS) return MWP_COLS;
-  try {
-    const r = await client.query(
-      `SELECT column_name FROM information_schema.columns
-        WHERE table_name = 'merchant_week_plan' AND table_schema = current_schema()`
-    );
-    MWP_COLS = new Set(r.rows.map((x) => x.column_name));
-  } catch {
-    MWP_COLS = new Set();
-  }
+  const r = await softStep(client, "pc_mwp_cols", () => client.query(
+    `SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'merchant_week_plan' AND table_schema = current_schema()`
+  ));
+  if (!r) return new Set();     // no se cachea un fallo pasajero
+  MWP_COLS = new Set(r.rows.map((x) => x.column_name));
   return MWP_COLS;
-}
-
-// Ejecuta fn dentro de un SAVEPOINT: si falla, no aborta la edicion del merchant.
-async function softStep(client, name, fn) {
-  await client.query(`SAVEPOINT ${name}`);
-  try {
-    const out = await fn();
-    await client.query(`RELEASE SAVEPOINT ${name}`);
-    return out;
-  } catch (e) {
-    await client.query(`ROLLBACK TO SAVEPOINT ${name}`).catch(() => {});
-    console.warn(`⚠️  plan-sync ${name}:`, e.message);
-    return null;
-  }
 }
 
 async function activeAssignedTotal(client, workOrderId) {
@@ -2457,38 +2601,87 @@ async function activeAssignedTotal(client, workOrderId) {
   return { cells: r.rows[0].n, total: n2(r.rows[0].total) };
 }
 
-// Aplica la edicion al tablero y deja el aviso. Llamar DENTRO de la transaccion,
-// despues de escribir work_orders / work_order_lines y antes del COMMIT.
-async function applyOrderEditToPlan(client, { workOrderId, before, after, user, onCellEmptied }) {
-  const result = { onBoard: false, changes: [], noticeId: null, summary: null };
-  if (!before || !after) return result;
-  const woId = Number(workOrderId);
-
-  const start = await activeAssignedTotal(client, woId);
-  if (start.cells === 0) return result;   // la orden no esta en el tablero
-  result.onBoard = true;
-
+// Lista de cambios (solo lectura, sin tocar el tablero).
+function diffOrderSnapshots(before, after) {
   const changes = [];
-  const mwp = await merchantPlanColumns(client);
-
-  // -- 1. Renombres de color ------------------------------------------------
-  // Con "header" no hay desglose: el color de la cabecera es el de las celdas.
   const renames = before.source === "header" && after.source === "header"
     ? (normColor(before.header.color) !== normColor(after.header.color)
         ? [[normColor(before.header.color), normColor(after.header.color)]] : [])
     : detectColorRenames(before, after);
+  for (const [from, to] of renames) changes.push({ kind: "color_renamed", from, to });
 
-  for (const [from, to] of renames) {
+  const renamedFrom = new Map(renames.map(([f, t]) => [t, f]));   // nuevo -> viejo
+  const renamedOld = new Set(renames.map(([f]) => f));
+  const allColors = [...new Set([
+    ...Object.keys(after.colorQty),
+    ...Object.keys(before.colorQty).filter((c) => !renamedOld.has(c)),
+  ])];
+  const colorPlan = [];   // { color, oldQ, newQ }
+
+  for (const c of allColors) {
+    const oldKey = renamedFrom.get(c) || c;
+    const oldQ = n2(before.colorQty[oldKey] || 0);
+    const newQ = n2(after.colorQty[c] || 0);
+    colorPlan.push({ color: c, oldQ, newQ });
+    if (oldQ !== newQ) {
+      if (!(oldKey in before.colorQty)) changes.push({ kind: "color_added", color: c, to: newQ });
+      else if (!(c in after.colorQty)) changes.push({ kind: "color_removed", color: c, from: oldQ });
+      else changes.push({ kind: "qty_changed", color: c, from: oldQ, to: newQ });
+    }
+    const so = before.sizes?.[oldKey] || {};
+    const sn = after.sizes?.[c] || {};
+    const sizeDiff = [...new Set([...Object.keys(so), ...Object.keys(sn)])]
+      .map((t) => ({ talla: t, from: n2(so[t] || 0), to: n2(sn[t] || 0) }))
+      .filter((x) => x.from !== x.to);
+    if (sizeDiff.length && (oldKey in before.colorQty) && (c in after.colorQty)) {
+      changes.push({ kind: "sizes_changed", color: c, sizes: sizeDiff });
+    }
+  }
+
+  for (const [field, label] of PLAN_NOTICE_FIELDS) {
+    let a = before.header[field];
+    let b = after.header[field];
+    if (NUMERIC_NOTICE_FIELDS.has(field)) {
+      a = a == null ? null : n2(a);
+      b = b == null ? null : n2(b);
+    } else {
+      a = a == null ? "" : String(a).trim();
+      b = b == null ? "" : String(b).trim();
+    }
+    if (a !== b) changes.push({ kind: "field_changed", field, label, from: a, to: b });
+  }
+
+  const targetBefore = n2(Number(before.header.total_to_produce) || Number(before.header.quantity) || 0);
+  const targetAfter = n2(Number(after.header.total_to_produce) || Number(after.header.quantity) || 0);
+  return { changes, renames, colorPlan, targetBefore, targetAfter };
+}
+
+// Escribe el diff en el tablero. Lanza si un trigger rechaza algo.
+async function writeDiffToBoard(client, woId, diff, after, { onCellEmptied, isLockedDay }) {
+  const mwp = await merchantPlanColumns(client);
+  const renameResults = [];
+  const trims = [];
+  const lockedCells = [];
+  let unresolvedTotal = 0;
+
+  // 1. Renombres de color.
+  for (const [from, to] of diff.renames) {
     const toLabel = after.source === "header" ? (after.header.color || null) : to;
     const cells = (await client.query(
-      `SELECT id, line_no, assigned_date, status, assigned_quantity
+      `SELECT id, line_no, assigned_date, to_char(assigned_date, 'YYYY-MM-DD') AS day,
+              status, assigned_quantity, color
          FROM line_assignments
         WHERE work_order_id = $1 AND status NOT IN ('cancelled', 'rejected')
           AND UPPER(TRIM(COALESCE(color, ''))) = $2
         FOR UPDATE`,
       [woId, from]
     )).rows;
+    let moved = 0;
     for (const c of cells) {
+      if (isLockedDay(c.day)) {   // 🔒 se queda con el color viejo hasta que se desbloquee
+        lockedCells.push({ id: Number(c.id), line_no: String(c.line_no), day: c.day, color: c.color || null, qty: n2(c.assigned_quantity), action: `color ${from} → ${to}` });
+        continue;
+      }
       if (c.status === "planned") {
         // Indice unico: una sola fila 'planned' por orden+linea+dia+color.
         const clash = await client.query(
@@ -2504,67 +2697,37 @@ async function applyOrderEditToPlan(client, { workOrderId, before, after, user, 
             [clash.rows[0].id, c.assigned_quantity]
           );
           await client.query("DELETE FROM line_assignments WHERE id = $1", [c.id]);
+          moved++;
           continue;
         }
       }
-      await client.query(
-        "UPDATE line_assignments SET color = $2, updated_at = NOW() WHERE id = $1",
-        [c.id, toLabel]
-      );
+      await client.query("UPDATE line_assignments SET color = $2, updated_at = NOW() WHERE id = $1", [c.id, toLabel]);
+      moved++;
     }
     if (mwp.has("color") && mwp.has("work_order_id")) {
       await softStep(client, "pc_mwp_color", () => client.query(
-        `UPDATE merchant_week_plan SET color = $3
+        `UPDATE merchant_week_plan SET color = $3::text
           WHERE work_order_id = $1 AND UPPER(TRIM(COALESCE(color, ''))) = $2
             AND NOT EXISTS (SELECT 1 FROM merchant_week_plan p2
                              WHERE p2.work_order_id = $1
-                               AND UPPER(TRIM(COALESCE(p2.color, ''))) = $3)`,
+                               AND UPPER(TRIM(COALESCE(p2.color, ''))) = $3::text)`,
         [woId, from, to]
       ));
     }
-    changes.push({ kind: "color_renamed", from, to, cells: cells.length });
+    renameResults.push({ from, to, cells: moved });
   }
-  const renamedFrom = new Map(renames.map(([f, t]) => [t, f]));   // nuevo -> viejo
-  const renamedOld = new Set(renames.map(([f]) => f));
 
-  // -- 2. Cantidades y tallas por color -------------------------------------
-  const colorsNow = Object.keys(after.colorQty);
-  const allColors = new Set([...colorsNow, ...Object.keys(before.colorQty).filter((c) => !renamedOld.has(c))]);
-  const trims = [];
-  let unresolvedTotal = 0;
-
-  for (const c of allColors) {
-    const oldKey = renamedFrom.get(c) || c;
-    const oldQ = n2(before.colorQty[oldKey] || 0);
-    const newQ = n2(after.colorQty[c] || 0);
-    if (oldQ !== newQ) {
-      if (!(oldKey in before.colorQty)) changes.push({ kind: "color_added", color: c, to: newQ });
-      else if (!(c in after.colorQty)) changes.push({ kind: "color_removed", color: c, from: oldQ });
-      else changes.push({ kind: "qty_changed", color: c, from: oldQ, to: newQ });
-    }
-
-    // Tallas (solo informativo).
-    const so = before.sizes[oldKey] || {};
-    const sn = after.sizes[c] || {};
-    const tallas = [...new Set([...Object.keys(so), ...Object.keys(sn)])];
-    const sizeDiff = tallas
-      .map((t) => ({ talla: t, from: n2(so[t] || 0), to: n2(sn[t] || 0) }))
-      .filter((x) => x.from !== x.to);
-    if (sizeDiff.length && (oldKey in before.colorQty) && (c in after.colorQty)) {
-      changes.push({ kind: "sizes_changed", color: c, sizes: sizeDiff });
-    }
-
-    // Bajo la cantidad del color -> recortar lo asignado de ese color.
+  // 2. Cantidad por color.
+  for (const { color: c, oldQ, newQ } of diff.colorPlan) {
     if (newQ < oldQ && after.source !== "header") {
-      const t = await trimAssignmentsToTarget(client, woId, { color: c, target: newQ, onCellEmptied });
+      const t = await trimAssignmentsToTarget(client, woId, { color: c, target: newQ, onCellEmptied, isLockedDay });
+      lockedCells.push(...t.lockedCells.map((x) => ({ ...x, action: "recorte" })));
       if (t.trimmed.length || t.unresolved > 0) {
         trims.push({ color: c, target: newQ, cells: t.trimmed, unresolved: t.unresolved });
         unresolvedTotal += t.unresolved;
       }
     }
-
-    // Plan semanal del merchant: cantidad por color, si la tabla la guarda.
-    if (oldQ !== newQ && mwp.has("quantity") && mwp.has("color") && mwp.has("work_order_id")) {
+    if (oldQ !== newQ && newQ > 0 && mwp.has("quantity") && mwp.has("color") && mwp.has("work_order_id")) {
       await softStep(client, "pc_mwp_qty", async () => {
         const rows = (await client.query(
           `SELECT id, quantity FROM merchant_week_plan
@@ -2573,7 +2736,6 @@ async function applyOrderEditToPlan(client, { workOrderId, before, after, user, 
           [woId, c]
         )).rows;
         if (!rows.length) return;
-        if (newQ <= 0) return;   // color eliminado: la fila se deja (el merchant decide)
         const sum = rows.reduce((s, r) => s + (Number(r.quantity) || 0), 0);
         let given = 0;
         for (let i = 0; i < rows.length; i++) {
@@ -2587,35 +2749,17 @@ async function applyOrderEditToPlan(client, { workOrderId, before, after, user, 
     }
   }
 
-  // -- 3. Meta de la orden (total_to_produce) -------------------------------
-  const targetBefore = n2(Number(before.header.total_to_produce) || Number(before.header.quantity) || 0);
-  const targetAfter = n2(Number(after.header.total_to_produce) || Number(after.header.quantity) || 0);
-  if (targetAfter < targetBefore) {
-    const t = await trimAssignmentsToTarget(client, woId, { target: targetAfter, onCellEmptied });
+  // 3. Meta de la orden (total_to_produce).
+  if (diff.targetAfter < diff.targetBefore) {
+    const t = await trimAssignmentsToTarget(client, woId, { target: diff.targetAfter, onCellEmptied, isLockedDay });
+    lockedCells.push(...t.lockedCells.map((x) => ({ ...x, action: "recorte" })));
     if (t.trimmed.length || t.unresolved > 0) {
-      trims.push({ color: null, target: targetAfter, cells: t.trimmed, unresolved: t.unresolved });
+      trims.push({ color: null, target: diff.targetAfter, cells: t.trimmed, unresolved: t.unresolved });
       unresolvedTotal = Math.max(unresolvedTotal, t.unresolved);
     }
   }
-  if (trims.length) changes.push({ kind: "cells_trimmed", groups: trims, unresolved: n2(unresolvedTotal) });
 
-  // -- 4. Campos de cabecera ------------------------------------------------
-  for (const [field, label] of PLAN_NOTICE_FIELDS) {
-    let a = before.header[field];
-    let b = after.header[field];
-    if (NUMERIC_NOTICE_FIELDS.has(field)) {
-      a = a == null ? null : n2(a);
-      b = b == null ? null : n2(b);
-    } else {
-      a = a == null ? "" : String(a).trim();
-      b = b == null ? "" : String(b).trim();
-    }
-    if (a !== b) changes.push({ kind: "field_changed", field, label, from: a, to: b });
-  }
-
-  if (changes.length === 0) return result;
-
-  // -- 5. Estado de la orden -------------------------------------------------
+  // 4. Estado de la orden.
   const end = await activeAssignedTotal(client, woId);
   if (end.cells === 0) {
     await client.query(
@@ -2624,8 +2768,103 @@ async function applyOrderEditToPlan(client, { workOrderId, before, after, user, 
     );
   }
 
-  // -- 6. Aviso para el planner ----------------------------------------------
-  const pending = n2(Math.max(targetAfter - end.total, 0));
+  // Una celda puede aparecer dos veces (recorte por color y por meta).
+  const seen = new Set();
+  const lockedUnique = lockedCells.filter((x) => {
+    const k = `${x.id}|${x.action}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  return { renameResults, trims, lockedCells: lockedUnique, unresolvedTotal: n2(unresolvedTotal), end };
+}
+
+// Aplica la edicion al tablero y deja (o actualiza) el aviso. Llamar DENTRO de
+// la transaccion, despues de escribir work_orders / work_order_lines y antes
+// del COMMIT. Nunca lanza por un bloqueo: la edicion del merchant se guarda.
+//
+//   mode 'edit'  -> llamada desde las rutas de edicion del merchant (crea aviso)
+//   mode 'apply' -> «Aplicar ahora» del planner (actualiza applyNoticeId)
+async function applyOrderEditToPlan(client, {
+  workOrderId, before, after, user, onCellEmptied, mode = "edit", applyNoticeId = null,
+}) {
+  const result = { onBoard: false, status: null, changes: [], noticeId: null, summary: null };
+  const woId = Number(workOrderId);
+  if (!after) return result;
+
+  // Avisos de esta orden que aun no se aplicaron: la sincronizacion parte de
+  // la foto MAS VIEJA para no perder ningun cambio intermedio.
+  const unresolved = (await client.query(
+    `SELECT id, before_snapshot FROM plan_change_notices
+      WHERE work_order_id = $1 AND status = ANY($2::text[])
+      ORDER BY created_at ASC, id ASC
+      FOR UPDATE`,
+    [woId, UNRESOLVED_STATUSES]
+  )).rows;
+  const oldest = unresolved.find((r) => r.before_snapshot);
+  const base = oldest ? deserializeSnapshot(oldest.before_snapshot) : before;
+  if (!base) return result;
+
+  const start = await activeAssignedTotal(client, woId);
+  const diff = diffOrderSnapshots(base, after);
+
+  // Nada en el tablero, o nada que reportar: cerrar los avisos viejos y salir.
+  if (start.cells === 0 || diff.changes.length === 0) {
+    if (unresolved.length) {
+      await client.query(
+        `UPDATE plan_change_notices
+            SET status = CASE WHEN id = $3::bigint THEN 'applied' ELSE 'superseded' END,
+                applied_at = NOW(), applied_by = $2, seen_at = COALESCE(seen_at, NOW())
+          WHERE id = ANY($1::bigint[])`,
+        [unresolved.map((r) => r.id), user?.id ?? null, mode === "apply" && applyNoticeId ? Number(applyNoticeId) : null]
+      );
+    }
+    result.onBoard = start.cells > 0;
+    result.status = "applied";
+    return result;
+  }
+  result.onBoard = true;
+
+  // ---- ¿se puede escribir en el tablero? ---------------------------------
+  const board = await isBoardLocked(client);
+  const isLockedDay = await lockedDayChecker(client);
+  let status = "applied";
+  let deferredReason = null;
+  let applyError = null;
+  let w = null;
+
+  if (board.locked) {
+    status = "pending";
+    deferredReason = "board_locked";
+  } else {
+    try {
+      w = await softStep(client, "pc_board_write",
+        () => writeDiffToBoard(client, woId, diff, after, { onCellEmptied, isLockedDay }),
+        { rethrow: true });
+      if (w.lockedCells.length) { status = "partial"; deferredReason = "week_locked"; }
+    } catch (e) {
+      // Un trigger (bloqueo u otra regla) rechazo la escritura: se deshizo SOLO
+      // la parte del tablero; la edicion del merchant sigue en pie.
+      status = "pending";
+      deferredReason = /lock|bloque/i.test(e.message) ? "board_locked" : "error";
+      applyError = e.message;
+      w = null;
+    }
+  }
+
+  // ---- armar la lista de cambios para el aviso ---------------------------
+  const changes = diff.changes.map((ch) => {
+    if (ch.kind !== "color_renamed") return ch;
+    const r = w?.renameResults.find((x) => x.from === ch.from && x.to === ch.to);
+    return { ...ch, cells: r ? r.cells : 0 };
+  });
+  if (w?.trims.length) changes.push({ kind: "cells_trimmed", groups: w.trims, unresolved: w.unresolvedTotal });
+  if (w?.lockedCells.length) changes.push({ kind: "locked_week_cells", cells: w.lockedCells });
+
+  const end = w ? w.end : start;
+  const pending = n2(Math.max(diff.targetAfter - end.total, 0));
+  const unresolvedExcess = w ? w.unresolvedTotal : 0;
+
   const parts = [];
   for (const ch of changes) {
     if (ch.kind === "color_renamed") parts.push(`color ${ch.from} → ${ch.to}`);
@@ -2634,35 +2873,82 @@ async function applyOrderEditToPlan(client, { workOrderId, before, after, user, 
     else if (ch.kind === "color_removed") parts.push(`color ${ch.color} eliminado`);
   }
   if (!parts.length) parts.push("datos de la orden actualizados");
-  const summary =
-    `${after.header.work_order_no}: ${parts.join(" · ")}. ` +
-    `Asignado ${start.total} → ${end.total} de ${targetAfter} pzas` +
-    (pending > 0 ? ` · faltan ${pending} por asignar` : "") +
-    (unresolvedTotal > 0 ? ` · ${unresolvedTotal} pzas de más que no se pudieron recortar solas` : "");
+  let summary = `${after.header.work_order_no}: ${parts.join(" · ")}. `;
+  if (status === "pending") {
+    summary += deferredReason === "board_locked"
+      ? "🔒 Tablero bloqueado: el tablero NO se modificó. Aplíquelo al desbloquear."
+      : "No se pudo ajustar el tablero automáticamente. Aplíquelo o ajústelo a mano.";
+  } else {
+    summary += `Asignado ${start.total} → ${end.total} de ${diff.targetAfter} pzas` +
+      (pending > 0 ? ` · faltan ${pending} por asignar` : "") +
+      (unresolvedExcess > 0 ? ` · ${unresolvedExcess} pzas de más que no se pudieron recortar solas` : "") +
+      (status === "partial" ? ` · 🔒 ${w.lockedCells.length} celda(s) en semanas bloqueadas sin cambiar` : "");
+  }
 
   const changedByName = user?.full_name || user?.username || user?.name || null;
-  const ins = await client.query(
-    `INSERT INTO plan_change_notices
-       (work_order_id, work_order_no, customer_name, style_code, changes, summary,
-        assigned_before, assigned_after, target_before, target_after, pending_to_assign,
-        unresolved_excess, changed_by, changed_by_name)
-     VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13,
-             COALESCE($14, (SELECT COALESCE(NULLIF(TRIM(u.full_name), ''), u.username) FROM users u WHERE u.id = $13)))
-     RETURNING id`,
-    [woId, after.header.work_order_no, after.header.customer_name || null,
-     after.header.style_code || after.header.estilo || null,
-     JSON.stringify(changes), summary,
-     start.total, end.total, targetBefore, targetAfter, pending, n2(unresolvedTotal),
-     user?.id ?? null, changedByName]
-  );
+  const values = [
+    woId, after.header.work_order_no, after.header.customer_name || null,
+    after.header.style_code || after.header.estilo || null,
+    JSON.stringify(changes), summary,
+    start.total, end.total, diff.targetBefore, diff.targetAfter, pending, n2(unresolvedExcess),
+    status, deferredReason, applyError,
+    JSON.stringify(serializeSnapshot(base)),
+  ];
 
-  result.changes = changes;
-  result.noticeId = Number(ins.rows[0].id);
-  result.summary = summary;
-  result.assignedBefore = start.total;
-  result.assignedAfter = end.total;
-  result.pendingToAssign = pending;
-  result.unresolvedExcess = n2(unresolvedTotal);
+  let noticeId;
+  if (mode === "apply" && applyNoticeId) {
+    // «Aplicar ahora»: se reescribe el aviso que el planner toco.
+    await client.query(
+      `UPDATE plan_change_notices
+          SET work_order_no = $2, customer_name = $3, style_code = $4, changes = $5::jsonb, summary = $6,
+              assigned_before = $7, assigned_after = $8, target_before = $9, target_after = $10,
+              pending_to_assign = $11, unresolved_excess = $12, status = $13::text, deferred_reason = $14,
+              apply_error = $15, before_snapshot = $16::jsonb,
+              applied_at = CASE WHEN $13::text = 'applied' THEN NOW() ELSE applied_at END,
+              applied_by = CASE WHEN $13::text = 'applied' THEN $18 ELSE applied_by END
+        WHERE id = $17 AND work_order_id = $1`,
+      [...values, applyNoticeId, user?.id ?? null]
+    );
+    noticeId = Number(applyNoticeId);
+  } else {
+    const ins = await client.query(
+      `INSERT INTO plan_change_notices
+         (work_order_id, work_order_no, customer_name, style_code, changes, summary,
+          assigned_before, assigned_after, target_before, target_after, pending_to_assign,
+          unresolved_excess, status, deferred_reason, apply_error, before_snapshot,
+          changed_by, changed_by_name, applied_at)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13::text,$14,$15,$16::jsonb,$17,
+               COALESCE($18, (SELECT COALESCE(NULLIF(TRIM(u.full_name), ''), u.username) FROM users u WHERE u.id = $17)),
+               CASE WHEN $13::text = 'applied' THEN NOW() ELSE NULL END)
+       RETURNING id`,
+      [...values, user?.id ?? null, changedByName]
+    );
+    noticeId = Number(ins.rows[0].id);
+  }
+
+  // Los avisos viejos sin aplicar quedan cubiertos por este.
+  const olderIds = unresolved.map((r) => Number(r.id)).filter((id) => id !== noticeId);
+  if (olderIds.length) {
+    await client.query(
+      `UPDATE plan_change_notices
+          SET status = 'superseded', superseded_by = $2, seen_at = COALESCE(seen_at, NOW())
+        WHERE id = ANY($1::bigint[])`,
+      [olderIds, noticeId]
+    );
+  }
+
+  Object.assign(result, {
+    status,
+    deferredReason,
+    applyError,
+    changes,
+    noticeId,
+    summary,
+    assignedBefore: start.total,
+    assignedAfter: end.total,
+    pendingToAssign: pending,
+    unresolvedExcess: n2(unresolvedExcess),
+  });
   return result;
 }
 
