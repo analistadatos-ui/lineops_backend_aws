@@ -1099,7 +1099,8 @@ registerWorkOrders(app, {
   generatePresignedGetUrl,
    uploadBufferToS3,      // add
   makeStylePhotoKey,     // add
-  deleteFromS3,          // ← add this line
+  deleteFromS3,
+  cleanupOrphanDraftRuns,          // ← add this line
 });
 const registerMechanicsSummary = require("./mecanics-summary");
 registerMechanicsSummary(app, authenticateToken);
@@ -10722,10 +10723,23 @@ app.post("/api/fabrics", authenticateToken, async (req, res) => {
  */
 app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
   const client = await pool.connect();
+  let inTx = false;
   try {
     await setSchema(client);
     
     const { id } = req.params;
+
+    // Transaccion + foto ANTES: si la orden ya esta en el Plan Board, un cambio
+    // de color/cantidad se refleja en las celdas y genera aviso al planner.
+    await client.query("BEGIN");
+    inTx = true;
+    const lockRes = await client.query("SELECT id FROM work_orders WHERE id = $1 FOR UPDATE", [id]);
+    if (lockRes.rows.length === 0) {
+      await client.query("ROLLBACK"); inTx = false;
+      return res.status(404).json({ success: false, error: "Work order not found" });
+    }
+    const planBefore = await registerWorkOrders.snapshotOrderForPlan(client, id);
+
     const {
       totalQuantity,
       warehouseStock,
@@ -10745,12 +10759,11 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
       masterCodeId,
       samMinutes,
       customerPo,
-      fabricName,        // ← new
-      fabricCode,        // ← new
+      fabricName,
+      fabricCode,
       yieldPerPiece,
     } = req.body;
     
-    // Build update query dynamically
     const updates = [];
     const values = [];
     let paramIndex = 1;
@@ -10763,6 +10776,7 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
     if (customerId !== undefined) {
       const customerResult = await client.query("SELECT name FROM customers WHERE id = $1", [parseInt(customerId)]);
       if (customerResult.rows.length === 0) {
+        await client.query("ROLLBACK"); inTx = false;
         return res.status(400).json({ success: false, error: "Customer not found" });
       }
       updates.push(`customer_id = $${paramIndex++}`);
@@ -10796,11 +10810,9 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
       values.push(customerPo || null);
     }
 
-    // Header copy of the line-level fabric/yield, kept for the PO list view.
     if (fabricName !== undefined) {
       updates.push(`fabric_name = $${paramIndex++}`);
       values.push(fabricName || null);
-      // keep the legacy display column in sync
       updates.push(`fabric_supplier = $${paramIndex++}`);
       values.push(fabricName || null);
     }
@@ -10877,36 +10889,43 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
     updates.push(`updated_at = NOW()`);
     
     if (updates.length === 1) {
-      return res.status(400).json({
-        success: false,
-        error: "No fields to update",
-      });
+      await client.query("ROLLBACK"); inTx = false;
+      return res.status(400).json({ success: false, error: "No fields to update" });
     }
     
     values.push(id);
     
-    const query = `
-      UPDATE work_orders 
-      SET ${updates.join(", ")}
-      WHERE id = $${paramIndex}
-      RETURNING *
-    `;
-    
-    const result = await client.query(query, values);
+    const result = await client.query(
+      `UPDATE work_orders SET ${updates.join(", ")} WHERE id = $${paramIndex} RETURNING *`,
+      values
+    );
     
     if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: "Work order not found",
-      });
+      await client.query("ROLLBACK"); inTx = false;
+      return res.status(404).json({ success: false, error: "Work order not found" });
     }
+
+    // Plan Board: sincroniza celdas asignadas y deja aviso al planner.
+    const planAfter = await registerWorkOrders.snapshotOrderForPlan(client, id);
+    const planSync = await registerWorkOrders.applyOrderEditToPlan(client, {
+      workOrderId: id,
+      before: planBefore,
+      after: planAfter,
+      user: req.user,
+      onCellEmptied: cleanupOrphanDraftRuns,
+    });
+
+    await client.query("COMMIT");
+    inTx = false;
     
     res.json({
       success: true,
       message: "Work order updated successfully",
       workOrder: result.rows[0],
+      planSync,
     });
   } catch (err) {
+    if (inTx) await client.query("ROLLBACK").catch(() => {});
     logger.error("❌ Error updating work order:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
