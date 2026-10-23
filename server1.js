@@ -8051,6 +8051,266 @@ app.get("/api/skyrina/available-lines", authenticateToken, async (req, res) => {
 
 
 /**
+ * GET /api/skyrina/style-production-detail?style=X&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&customer=Y
+ * Everything the ActualEfficiency.jsx style side panel needs for ONE style:
+ *   - days   : every (day, line) the style ran — ALL TIME, so the panel can
+ *              switch between "period" and "full history" without a refetch
+ *   - lines  : per line, first/last production day, produced, efficiency and
+ *              whether it ended or still has planned days (line_assignments)
+ *   - orders : the work orders behind the style with total to produce,
+ *              produced, pending and status
+ *   - totals : totals over those orders + produced inside the selected period
+ * Efficiency uses the same SAM formula and the same one-crew rule
+ * (MAX target / MAX capacity per day+line+style) as style-performance.
+ */
+app.get("/api/skyrina/style-production-detail", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { style, startDate, endDate, customer } = req.query;
+    if (!style || !startDate || !endDate) {
+      return res.status(400).json({ success: false, error: "style, startDate and endDate parameters required" });
+    }
+    if (!['skyrina', 'engineer', 'supervisor', 'soporte_it', 'master'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+
+    const params = [style];
+    let customerFilter = "";
+    if (customer && customer !== 'all') {
+      params.push(customer);
+      customerFilter = ` AND wo.customer_name = $${params.length}`;
+    }
+
+    // ---- 1. production per (day, line, work order) for this style ----------
+    const daysSql = `
+      WITH style_runs AS (
+        SELECT lr.id AS run_id, lr.run_date, lr.line_no, lr.color, lr.work_order_id,
+               lr.sam_minutes::float8 AS sam,
+               lr.target_pcs::float8  AS target_pcs,
+               (lr.operators_count * lr.working_hours * 60)::float8 AS avail
+          FROM line_runs lr
+          LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
+         WHERE lr.style = $1${customerFilter}
+      ),
+      run_packed AS (
+        SELECT sr.run_id, COALESCE(SUM(se.sewed_qty), 0)::float8 AS packed
+          FROM style_runs sr
+          JOIN run_operators ro       ON ro.run_id = sr.run_id
+          JOIN operator_operations oo ON oo.run_operator_id = ro.id
+          LEFT JOIN operation_sewed_entries se ON se.operation_id = oo.id
+         WHERE (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+         GROUP BY sr.run_id
+      )
+      SELECT to_char(sr.run_date, 'YYYY-MM-DD') AS date,
+             sr.line_no,
+             sr.work_order_id,
+             SUM(COALESCE(rp.packed, 0))          AS produced,
+             SUM(COALESCE(rp.packed, 0) * sr.sam) AS sam_output,
+             MAX(sr.target_pcs)                   AS target,
+             MAX(sr.avail)                        AS avail,
+             STRING_AGG(DISTINCT NULLIF(sr.color, ''), ', ') AS colors
+        FROM style_runs sr
+        LEFT JOIN run_packed rp ON rp.run_id = sr.run_id
+       GROUP BY sr.run_date, sr.line_no, sr.work_order_id
+       ORDER BY sr.run_date, sr.line_no
+    `;
+    const { rows: rawRows } = await client.query(daysSql, params);
+
+    // ---- 2. work orders behind the style --------------------------------
+    const ordersSql = `
+      SELECT wo.id, wo.work_order_no, wo.customer_name, wo.color, wo.status,
+             to_char(wo.commitment_date, 'YYYY-MM-DD') AS commitment_date,
+             COALESCE(wo.total_to_produce, wo.quantity, 0)::float8 AS total_to_produce
+        FROM work_orders wo
+       WHERE wo.status <> 'cancelled'
+         AND (wo.estilo = $1
+              OR wo.id IN (SELECT work_order_id FROM line_runs
+                            WHERE style = $1 AND work_order_id IS NOT NULL))${customerFilter}
+       ORDER BY wo.commitment_date NULLS LAST, wo.work_order_no
+    `;
+    const { rows: orderRows } = await client.query(ordersSql, params);
+    const orderIds = orderRows.map((o) => Number(o.id));
+
+    // ---- 3. planned line days for those orders ---------------------------
+    let assignRows = [];
+    if (orderIds.length) {
+      ({ rows: assignRows } = await client.query(
+        `SELECT la.work_order_id, la.line_no,
+                to_char(la.assigned_date, 'YYYY-MM-DD') AS date,
+                la.status, la.assigned_quantity::float8 AS qty
+           FROM line_assignments la
+          WHERE la.work_order_id = ANY($1)
+            AND la.status NOT IN ('cancelled', 'rejected')`,
+        [orderIds]
+      ));
+    }
+
+    // Plant-local "today" (same rule as realtime-summary).
+    const p = Object.fromEntries(
+      new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit',
+      }).formatToParts(new Date()).map((x) => [x.type, x.value])
+    );
+    const today = `${p.year}-${p.month}-${p.day}`;
+
+    // ---- fold rows into (day, line) — one crew per day+line ----------------
+    const dayMap = new Map();
+    const producedByOrder = new Map();
+    const lastDayByOrder = new Map();
+    for (const r of rawRows) {
+      const key = `${r.date}|${r.line_no}`;
+      let d = dayMap.get(key);
+      if (!d) {
+        d = { date: r.date, lineNo: String(r.line_no), produced: 0, samOutput: 0,
+              target: 0, availableMinutes: 0, colors: new Set(), orders: new Set() };
+        dayMap.set(key, d);
+      }
+      const produced = Number(r.produced) || 0;
+      d.produced += produced;
+      d.samOutput += Number(r.sam_output) || 0;
+      d.target = Math.max(d.target, Number(r.target) || 0);
+      d.availableMinutes = Math.max(d.availableMinutes, Number(r.avail) || 0);
+      String(r.colors || '').split(', ').filter(Boolean).forEach((c) => d.colors.add(c));
+      if (r.work_order_id != null) {
+        const wo = Number(r.work_order_id);
+        d.orders.add(wo);
+        producedByOrder.set(wo, (producedByOrder.get(wo) || 0) + produced);
+        if (produced > 0 && (!lastDayByOrder.get(wo) || r.date > lastDayByOrder.get(wo))) {
+          lastDayByOrder.set(wo, r.date);
+        }
+      }
+    }
+
+    const woNo = new Map(orderRows.map((o) => [Number(o.id), o.work_order_no]));
+    const days = [...dayMap.values()].map((d) => ({
+      date: d.date,
+      lineNo: d.lineNo,
+      produced: d.produced,
+      target: d.target,
+      samOutput: d.samOutput,
+      availableMinutes: d.availableMinutes,
+      efficiency: d.availableMinutes > 0 ? (d.samOutput / d.availableMinutes) * 100 : null,
+      colors: [...d.colors].join(', '),
+      orders: [...d.orders].map((id) => woNo.get(id)).filter(Boolean),
+    }));
+
+    // ---- per line ----------------------------------------------------------
+    const lineMap = new Map();
+    const lineOf = (no) => {
+      const k = String(no);
+      if (!lineMap.has(k)) {
+        lineMap.set(k, { lineNo: k, produced: 0, samOutput: 0, availableMinutes: 0,
+                         firstDate: null, lastDate: null, daysRun: 0,
+                         assigned: 0, plannedAhead: 0, nextDate: null, lastPlannedDate: null });
+      }
+      return lineMap.get(k);
+    };
+    for (const d of days) {
+      const l = lineOf(d.lineNo);
+      l.produced += d.produced;
+      l.samOutput += d.samOutput;
+      l.availableMinutes += d.availableMinutes;
+      l.daysRun += 1;
+      if (d.produced > 0) {
+        if (!l.firstDate || d.date < l.firstDate) l.firstDate = d.date;
+        if (!l.lastDate || d.date > l.lastDate) l.lastDate = d.date;
+      }
+    }
+    for (const a of assignRows) {
+      const l = lineOf(a.line_no);
+      l.assigned += Number(a.qty) || 0;
+      if (!l.lastPlannedDate || a.date > l.lastPlannedDate) l.lastPlannedDate = a.date;
+      if (a.status === 'planned' && a.date >= today) {
+        l.plannedAhead += Number(a.qty) || 0;
+        if (!l.nextDate || a.date < l.nextDate) l.nextDate = a.date;
+      }
+    }
+    const lines = [...lineMap.values()]
+      .map((l) => {
+        let status;
+        if (l.plannedAhead > 0) status = l.produced > 0 ? 'in_progress' : 'scheduled';
+        else if (l.produced > 0) status = 'ended';
+        else status = 'pending';
+        return {
+          lineNo: l.lineNo,
+          produced: l.produced,
+          efficiency: l.availableMinutes > 0 ? (l.samOutput / l.availableMinutes) * 100 : null,
+          firstDate: l.firstDate,
+          lastDate: l.lastDate,
+          daysRun: l.daysRun,
+          assigned: l.assigned,
+          pending: l.assigned > 0 ? Math.max(l.assigned - l.produced, 0) : null,
+          nextDate: l.nextDate,
+          lastPlannedDate: l.lastPlannedDate,
+          status,
+        };
+      })
+      .sort((a, b) => (parseInt(a.lineNo, 10) || 0) - (parseInt(b.lineNo, 10) || 0));
+
+    // ---- per order ---------------------------------------------------------
+    // NOTE: total_to_produce belongs to the whole work order. Produced counts the
+    // runs of THIS style linked to the order, so an order that mixes several
+    // estilos will show its other estilos as still pending here.
+    const orders = orderRows.map((o) => {
+      const id = Number(o.id);
+      const total = Number(o.total_to_produce) || 0;
+      const produced = producedByOrder.get(id) || 0;
+      return {
+        id,
+        workOrderNo: o.work_order_no,
+        customer: o.customer_name,
+        color: o.color,
+        status: o.status,
+        commitmentDate: o.commitment_date,
+        totalToProduce: total,
+        produced,
+        pending: Math.max(total - produced, 0),
+        lastProductionDate: lastDayByOrder.get(id) || null,
+        lines: [...new Set(assignRows.filter((a) => Number(a.work_order_id) === id).map((a) => String(a.line_no)))]
+          .sort((a, b) => (parseInt(a, 10) || 0) - (parseInt(b, 10) || 0)),
+      };
+    });
+
+    // ---- totals --------------------------------------------------------------
+    const inPeriod = days.filter((d) => d.date >= startDate && d.date <= endDate);
+    const sum = (arr, k) => arr.reduce((a, x) => a + (Number(x[k]) || 0), 0);
+    const periodAvail = sum(inPeriod, 'availableMinutes');
+    const totalToProduce = sum(orders, 'totalToProduce');
+    const producedOrders = sum(orders, 'produced');
+
+    res.json({
+      success: true,
+      style,
+      today,
+      period: { startDate, endDate },
+      totals: {
+        totalToProduce: orders.length ? totalToProduce : null,
+        producedAllTime: sum(days, 'produced'),
+        producedOnOrders: producedOrders,
+        pending: orders.length ? Math.max(totalToProduce - producedOrders, 0) : null,
+        producedInPeriod: sum(inPeriod, 'produced'),
+        targetInPeriod: sum(inPeriod, 'target'),
+        efficiencyInPeriod: periodAvail > 0 ? (sum(inPeriod, 'samOutput') / periodAvail) * 100 : null,
+        firstDate: days.find((d) => d.produced > 0)?.date || null,
+        lastDate: [...days].reverse().find((d) => d.produced > 0)?.date || null,
+      },
+      lines,
+      orders,
+      days,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching style production detail:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+/**
  * GET /api/skyrina/available-customers?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
  * Distinct customers that have runs in the range, resolved through the run's
  * work order: line_runs.work_order_id -> work_orders.customer_name.
