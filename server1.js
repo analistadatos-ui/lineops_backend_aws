@@ -1004,6 +1004,10 @@ app.post(
       const { ip: clientIp, source: ipSource } = getClientIpInfo(req);
 logger.info("Login successful", { username: user.username, role: user.role, actual_role: user.actual_role, ip: clientIp, ipSource });
 
+       if (OFFICE_IPS.length > 0 && !isOfficeIp(clientIp)) {
+        securityLog("login_outside_office", req, { username: user.username, role: user.role });
+      }
+
       res.json({
         success: true,
         message: "Login successful",
