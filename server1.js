@@ -779,6 +779,33 @@ const applyRoleAlias = (user) => {
   return user;
 };
 
+// 🔐 SECURITY EVENTS (read by CloudWatch metric filters → alarms)
+const OFFICE_IPS = (process.env.OFFICE_IPS || "")
+  .split(",")
+  .map((ip) => ip.trim())
+  .filter(Boolean);
+
+const getClientIp = (req) =>
+  req.requestContext?.identity?.sourceIp ||
+  req.requestContext?.http?.sourceIp ||
+  req.apiGateway?.event?.requestContext?.identity?.sourceIp ||
+  req.apiGateway?.event?.requestContext?.http?.sourceIp ||
+  req.ip;
+
+const isOfficeIp = (ip) => {
+  if (!ip) return false;
+  return OFFICE_IPS.includes(ip.replace(/^::ffff:/, ""));
+};
+
+const securityLog = (event, req, meta = {}) => {
+  logger.warn(`SECURITY ${event}`, {
+    ip: getClientIp(req),
+    userAgent: req.headers["user-agent"],
+    path: req.originalUrl,
+    ...meta,
+  });
+};
+
 const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
@@ -809,9 +836,13 @@ const authenticateToken = async (req, res, next) => {
       client.release();
     }
   } catch (err) {
-    logger.warn("Authentication failed: invalid token", { error: err.message });
-    return res.status(403).json({ success: false, error: "Invalid or expired token" });
+  if (err.name === "TokenExpiredError") {
+    logger.info("Authentication failed: token expired", { ip: getClientIp(req) });
+  } else {
+    securityLog("token_invalid", req, { error: err.message });
   }
+  return res.status(403).json({ success: false, error: "Invalid or expired token" });
+}
 };
 
 const allowRoles = (...roles) => (req, res, next) => {
@@ -901,14 +932,14 @@ app.post(
       );
 
       if (userResult.rows.length === 0) {
-        logger.warn("Login failed: user not found", { username });
+        securityLog("login_failed", req, { username, reason: "user_not_found" });
         return res.status(401).json({ success: false, error: "Invalid username or password" });
       }
 
       const user = userResult.rows[0];
       const isValidPassword = await bcrypt.compare(password, user.password_hash);
       if (!isValidPassword) {
-        logger.warn("Login failed: invalid password", { username });
+        securityLog("login_failed", req, { username, reason: "invalid_password" });
         return res.status(401).json({ success: false, error: "Invalid username or password" });
       }
 
@@ -921,7 +952,11 @@ app.post(
       delete user.password_hash;
       applyRoleAlias(user); // factory_director → role "master" + actual_role
 
-      logger.info("Login successful", { username: user.username, role: user.role, actual_role: user.actual_role });
+      const clientIp = getClientIp(req);
+logger.info("Login successful", { username: user.username, role: user.role, actual_role: user.actual_role, ip: clientIp });
+if (OFFICE_IPS.length > 0 && !isOfficeIp(clientIp)) {
+  securityLog("login_outside_office", req, { username: user.username, role: user.role });
+}
 
       res.json({
         success: true,
