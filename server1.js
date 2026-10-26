@@ -785,12 +785,61 @@ const OFFICE_IPS = (process.env.OFFICE_IPS || "")
   .map((ip) => ip.trim())
   .filter(Boolean);
 
-const getClientIp = (req) =>
-  req.requestContext?.identity?.sourceIp ||
-  req.requestContext?.http?.sourceIp ||
-  req.apiGateway?.event?.requestContext?.identity?.sourceIp ||
-  req.apiGateway?.event?.requestContext?.http?.sourceIp ||
-  req.ip;
+// Real client IP on Lambda. Different Express wrappers put it in different
+// places, so check all of them. Returns { ip, source }.
+const parseJsonHeader = (value, uriEncoded = false) => {
+  if (!value) return null;
+  try {
+    return JSON.parse(uriEncoded ? decodeURIComponent(value) : value);
+  } catch (e) {
+    return null;
+  }
+};
+
+let getCurrentInvoke = null;
+for (const mod of ["@codegenie/serverless-express", "@vendia/serverless-express"]) {
+  try {
+    getCurrentInvoke = require(mod).getCurrentInvoke;
+    if (getCurrentInvoke) break;
+  } catch (e) { /* not installed */ }
+}
+
+const ipFromContext = (ctx) =>
+  ctx?.identity?.sourceIp || ctx?.http?.sourceIp || null;
+
+const getClientIpInfo = (req) => {
+  // 1. serverless-http
+  let ip = ipFromContext(req.requestContext) || ipFromContext(req.apiGateway?.event?.requestContext);
+  if (ip) return { ip, source: "serverless-http" };
+
+  // 2. @vendia / @codegenie serverless-express (v4+)
+  if (getCurrentInvoke) {
+    try {
+      ip = ipFromContext(getCurrentInvoke()?.event?.requestContext);
+      if (ip) return { ip, source: "serverless-express" };
+    } catch (e) { /* ignore */ }
+  }
+
+  // 3. aws-serverless-express (v3) — event passed as URI-encoded header
+  ip = ipFromContext(parseJsonHeader(req.headers["x-apigateway-event"], true)?.requestContext);
+  if (ip) return { ip, source: "x-apigateway-event" };
+
+  // 4. AWS Lambda Web Adapter
+  ip = ipFromContext(parseJsonHeader(req.headers["x-amzn-request-context"]));
+  if (ip) return { ip, source: "x-amzn-request-context" };
+
+  // 5. X-Forwarded-For set by API Gateway / Function URL — AWS appends the
+  //    real caller IP last, so take the LAST entry (earlier ones can be faked).
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) {
+    const parts = String(xff).split(",").map((p) => p.trim()).filter(Boolean);
+    if (parts.length) return { ip: parts[parts.length - 1], source: "x-forwarded-for" };
+  }
+
+  return { ip: req.ip, source: "req.ip" };
+};
+
+const getClientIp = (req) => getClientIpInfo(req).ip;
 
 const isOfficeIp = (ip) => {
   if (!ip) return false;
@@ -952,11 +1001,8 @@ app.post(
       delete user.password_hash;
       applyRoleAlias(user); // factory_director → role "master" + actual_role
 
-      const clientIp = getClientIp(req);
-logger.info("Login successful", { username: user.username, role: user.role, actual_role: user.actual_role, ip: clientIp });
-if (OFFICE_IPS.length > 0 && !isOfficeIp(clientIp)) {
-  securityLog("login_outside_office", req, { username: user.username, role: user.role });
-}
+      const { ip: clientIp, source: ipSource } = getClientIpInfo(req);
+logger.info("Login successful", { username: user.username, role: user.role, actual_role: user.actual_role, ip: clientIp, ipSource });
 
       res.json({
         success: true,
