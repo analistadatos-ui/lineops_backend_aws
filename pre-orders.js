@@ -546,11 +546,18 @@ function registerPreOrders(app, deps) {
     const client = await pool.connect();
     try {
       await setSchema(client);
+      // Una sola transacción: el cambio de estado y la liberación de holds se
+      // guardan juntos. Las partes "best-effort" van en SAVEPOINTs, así un error
+      // en una NO aborta la transacción ni salta las demás.
+      await client.query("BEGIN");
       const cur = await client.query(
         `SELECT work_order_ids, work_order_nos, pieces, converted_pieces,
                 to_char(planned_week,'YYYY-MM-DD') AS planned_week
-           FROM pre_orders WHERE id = $1`, [id]);
-      if (cur.rows.length === 0) return res.status(404).json({ success: false, error: "Pre-orden no encontrada" });
+           FROM pre_orders WHERE id = $1 FOR UPDATE`, [id]);
+      if (cur.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, error: "Pre-orden no encontrada" });
+      }
 
       const prevIds = cur.rows[0].work_order_ids || [];
       const prevNos = (cur.rows[0].work_order_nos || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -578,43 +585,61 @@ function registerPreOrders(app, deps) {
         [id, mergedIds, mergedNos.join(", ") || null, req.user?.id ?? null, newStatus, newConvertedPieces, isFinal]
       );
 
-      // Hereda la semana del tablero a las POs nuevas. Nunca tumba la conversión.
-      let planned = 0;
-      try {
-        if (isFinal) {
-          // Comportamiento de siempre: borra la ficha PRE y suelta todos los holds.
-          planned = await carryPlanToWorkOrders(client, id, mergedIds, cur.rows[0].planned_week, { finalize: true });
-          await client.query("UPDATE pre_orders SET planned_week = NULL WHERE id = $1", [id]);
-          // Protegido por si el módulo pre-order-holds aún no está desplegado.
-          try {
-            // 🔒 Las reservas en semanas bloqueadas se quedan; se sueltan solas
-            // cuando el CEO desbloquea esa semana (plan-week-locks.js).
-            await client.query(
-              `DELETE FROM pre_order_day_holds
-                WHERE pre_order_id = $1 AND ${notInLockedWeekSql("assigned_date")}`,
-              [id]
-            );
-          } catch (e) {
-            console.warn("\u26a0\ufe0f  no se pudieron soltar los holds de la pre-orden", id, e.message);
-          }
-        } else {
-          // Parcial: mete las POs nuevas al tablero SIN borrar la ficha PRE, y
-          // encoge la ficha + los holds por lo que ya salió. Conserva planned_week
-          // para que el resto siga reservando su semana.
-          planned = await carryPlanToWorkOrders(client, id, mergedIds, cur.rows[0].planned_week,
-            { finalize: false, convertedPieces });
-          try {
-            await shrinkPreOrderHolds(client, id, convertedPieces);
-          } catch (e) {
-            console.warn("\u26a0\ufe0f  no se pudieron encoger los holds de la pre-orden", id, e.message);
-          }
+      // Paso best-effort aislado en su propio SAVEPOINT.
+      const step = async (name, fn) => {
+        await client.query(`SAVEPOINT ${name}`);
+        try {
+          const out = await fn();
+          await client.query(`RELEASE SAVEPOINT ${name}`);
+          return out;
+        } catch (e) {
+          await client.query(`ROLLBACK TO SAVEPOINT ${name}`);
+          console.warn(`\u26a0\ufe0f  convert pre-orden ${id} [${name}] falló:`, e.message);
+          return undefined;
         }
-      } catch (e) {
-        console.warn("\u26a0\ufe0f  plan carry-over falló para pre-orden", id, e.message);
+      };
+
+      // 1) PRIMERO los holds del Plan Board. Antes iban DESPUÉS de heredar el
+      //    plan del merchant y dentro del mismo try: si la herencia fallaba, los
+      //    holds nunca se soltaban y la PRE seguía pintada en el tablero.
+      //    🔒 Las reservas en semanas bloqueadas por el CEO se quedan; se sueltan
+      //    cuando se desbloquea esa semana (plan-week-locks.js).
+      let releasedHolds = 0;
+      if (isFinal) {
+        releasedHolds = (await step("release_holds", async () => {
+          const r = await client.query(
+            `DELETE FROM pre_order_day_holds
+              WHERE pre_order_id = $1 AND ${notInLockedWeekSql("assigned_date")}`,
+            [id]
+          );
+          return r.rowCount;
+        })) || 0;
+      } else {
+        await step("shrink_holds", () => shrinkPreOrderHolds(client, id, convertedPieces));
       }
 
-      res.json({ success: true, preOrder: rows[0], plannedRows: planned, partial: !isFinal });
+      // 2) Después, heredar la semana del tablero del merchant a las POs nuevas.
+      const planned = (await step("carry_plan", async () => {
+        if (isFinal) {
+          const n = await carryPlanToWorkOrders(client, id, mergedIds, cur.rows[0].planned_week, { finalize: true });
+          await client.query("UPDATE pre_orders SET planned_week = NULL WHERE id = $1", [id]);
+          return n;
+        }
+        return carryPlanToWorkOrders(client, id, mergedIds, cur.rows[0].planned_week,
+          { finalize: false, convertedPieces });
+      })) || 0;
+
+      // Holds que quedaron por estar en semana bloqueada (para avisar al wizard).
+      const kept = await client.query(
+        "SELECT COUNT(*)::int AS n FROM pre_order_day_holds WHERE pre_order_id = $1", [id]);
+
+      await client.query("COMMIT");
+      res.json({
+        success: true, preOrder: rows[0], plannedRows: planned, partial: !isFinal,
+        releasedHolds, holdsKeptInLockedWeeks: isFinal ? kept.rows[0].n : 0,
+      });
     } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
       console.error("\u274c POST /api/pre-orders/:id/convert:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {

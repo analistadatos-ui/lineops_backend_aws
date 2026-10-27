@@ -6924,10 +6924,13 @@ app.get("/api/planning/available-lines", authenticateToken, async (req, res) => 
     // ── add: pre-order holds occupy capacity too ──
     try {
       const heldResult = await client.query(
-        `SELECT line_no, COALESCE(SUM(quantity), 0) AS held
-           FROM pre_order_day_holds
-          WHERE assigned_date = $1
-          GROUP BY line_no`,
+        `SELECT h.line_no, COALESCE(SUM(h.quantity), 0) AS held
+           FROM pre_order_day_holds h
+           LEFT JOIN pre_orders p ON p.id = h.pre_order_id
+          WHERE h.assigned_date = $1
+            -- PRE convertida/cancelada: su PO real ya ocupa la línea; no contar doble.
+            AND COALESCE(p.status, 'pending') NOT IN ('converted','cancelled')
+          GROUP BY h.line_no`,
         [date]
       );
       heldResult.rows.forEach((r) => {

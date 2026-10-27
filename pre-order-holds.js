@@ -119,10 +119,21 @@ function registerPreOrderHolds(app, deps) {
                 h.updated_at,
                 -- Fecha de entrega de la pre-orden: viaja con cada reserva para
                 -- que el tablero marque a tiempo / atrasada sin otra consulta.
-                to_char(p.target_date, 'YYYY-MM-DD') AS target_date
+                to_char(p.target_date, 'YYYY-MM-DD') AS target_date,
+                -- Estado de la pre-orden y POs en que se convirtió: el tablero
+                -- etiqueta una reserva que quedó en semana bloqueada como
+                -- "PRE → SKM####" en vez de una PRE viva.
+                p.status AS pre_status, p.work_order_nos
            FROM pre_order_day_holds h
            LEFT JOIN pre_orders p ON p.id = h.pre_order_id
-          ${where.length ? "WHERE " + where.map((w) => "h." + w).join(" AND ") : ""}
+          WHERE ${[
+            // Una PRE convertida o cancelada ya no reserva nada. Su reserva solo
+            // sobrevive en una semana bloqueada por el CEO (se suelta al
+            // desbloquear); fuera de eso es un huérfano y no se pinta.
+            `(COALESCE(p.status, 'pending') NOT IN ('converted','cancelled')
+              OR NOT ${planWeekLocks.notInLockedWeekSql("h.assigned_date")})`,
+            ...where.map((w) => "h." + w),
+          ].join(" AND ")}
           ORDER BY h.assigned_date, h.line_no, h.pre_order_no`,
         params
       );
@@ -177,6 +188,27 @@ function registerPreOrderHolds(app, deps) {
       // Serialize writers on this line-day so two drops can't both take the
       // last free pieces.
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`hold|${String(lineNo).trim()}|${assignedDate}`]);
+
+      // Una PRE convertida o cancelada ya no puede reservar (ni por mover una
+      // celda vieja ni por deshacer): el planner debe asignar la PO real.
+      const st = await client.query(
+        "SELECT status, work_order_nos FROM pre_orders WHERE id = $1",
+        [parseInt(preOrderId, 10)]
+      );
+      if (!st.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, error: "Pre-orden no encontrada" });
+      }
+      if (["converted", "cancelled"].includes(st.rows[0].status)) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          success: false,
+          code: "PRE_ORDER_CLOSED",
+          error: st.rows[0].status === "converted"
+            ? `Esta pre-orden ya se convirtió en ${st.rows[0].work_order_nos || "PO"}. Asigne la PO real.`
+            : "Esta pre-orden fue cancelada.",
+        });
+      }
 
       // Style of the hold: what the board sent, else the pre-order's own.
       let style = plannerStyleParams.normStyle(b.styleCode ?? b.style_code ?? "") ||
