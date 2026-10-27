@@ -13,6 +13,7 @@ const winston = require("winston");
 const fs = require("fs");
 const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl, generatePresignedPutUrl } = require("./s3-raw");
 const planWeekLocks = require("./plan-week-locks"); // 🔒 bloqueo de semanas del Plan Board (CEO)
+const itControlPanel = require("./it-control-panel"); // 🖥️ Panel de TI: bitácora + usuarios
 // ----------------------------------------------------------------------
 // 1. LOGGER (Winston)
 // ----------------------------------------------------------------------
@@ -713,6 +714,9 @@ await registerPlanRebalance.initSchema({ pool, setSchema }); // ⚖️ plan_boar
 
     await client.query("COMMIT");
     logger.info("✅ Migrations completed successfully.");
+
+    await itControlPanel.initSchema({ pool, setSchema }); // 🖥️ después del COMMIT
+
   } catch (err) {
     await client.query("ROLLBACK");
     logger.error("❌ Migration failed", { error: err.message, stack: err.stack });
@@ -956,6 +960,14 @@ app.get("/api/health", async (req, res, next) => {
     client.release();
   }
 });
+
+// 🖥️ Bitácora: ANTES de todas las rutas, para ver inicios/cierres de sesión y cambios.
+app.use("/api/", itControlPanel.activityTracker({
+  pool,
+  logger,
+  getClientIp: (req) => getClientIp(req),
+  verifyToken: (t) => jwt.verify(t, JWT_SECRET),
+}));
 
 // ----------------------------------------------------------------------
 // 11. AUTHENTICATION ENDPOINTS
@@ -1210,6 +1222,17 @@ registerEfficiencyPermissions(app, { authenticateToken, pool, setSchema });
 
 // 🔒 Bloqueo de semanas del Plan Board. lockerRoles = roles que pueden bloquear.
 planWeekLocks(app, { authenticateToken, pool, setSchema, lockerRoles: ["ceo", "skyrina", "master"] });
+
+
+// 🖥️ Panel de TI. itRoles = quién puede abrirlo.
+itControlPanel(app, {
+  authenticateToken,
+  pool,
+  setSchema,
+  logger,
+  getClientIp: (req) => getClientIp(req),
+  itRoles: ["admin"],
+});
 
 
 // ⚖️ Plan Board: snapshot + redistribución secuencial exacta (misma línea, días reempacados).
