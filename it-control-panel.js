@@ -105,6 +105,14 @@ const SKIP_PATHS = ["/api/health", "/api/activity/track"];
 const IS_CHANGE = `(method IN ('POST','PUT','PATCH','DELETE') AND action NOT IN ('login','login_failed','logout','page_view') AND status_code < 400)`;
 const IS_ERROR = `(status_code >= 400 AND action <> 'login_failed')`;
 
+// --------------------------------------------------------------------------
+// LOGIN LOCK: after MAX_FAILED_LOGINS wrong passwords in a row the account is
+// locked. A correct password does NOT open a locked account; only an admin can
+// unlock it from the IT panel (or by resetting the password there).
+// --------------------------------------------------------------------------
+const MAX_FAILED_LOGINS = Math.max(1, parseInt(process.env.MAX_FAILED_LOGINS || "3", 10) || 3);
+const LOCKED_MESSAGE = "User locked. Please consult with the app admin to remove the lock.";
+
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const USERNAME_RE = /^[A-Za-z0-9._-]{3,50}$/;
 
@@ -238,6 +246,57 @@ function auditEvent(pool, req, getClientIp, { action, module = "it", details, st
 }
 
 // --------------------------------------------------------------------------
+// login lock helpers (used by POST /api/login in server1.js)
+// --------------------------------------------------------------------------
+// Makes sure users.failed_login_attempts / users.locked_at exist, once per
+// process. It only READS information_schema when the columns are there, so a
+// Lambda cold start never takes a lock on users. Resolves true when ready.
+let lockSchemaPromise = null;
+function ensureLoginLockSchema(pool, logger = console) {
+  if (!lockSchemaPromise) {
+    lockSchemaPromise = (async () => {
+      const r = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM information_schema.columns
+          WHERE table_schema = $1 AND table_name = 'users'
+            AND column_name IN ('failed_login_attempts', 'locked_at')`, [SCHEMA]);
+      if (r.rows[0].n < 2) {
+        await pool.query(`ALTER TABLE ${USERS_TABLE} ADD COLUMN IF NOT EXISTS failed_login_attempts INT NOT NULL DEFAULT 0`);
+        await pool.query(`ALTER TABLE ${USERS_TABLE} ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ NULL`);
+        logger.info("Login lock: users.failed_login_attempts / locked_at added");
+      }
+      return true;
+    })().catch((err) => {
+      lockSchemaPromise = null; // try again on the next request
+      logger.error("Login lock: could not prepare users columns — lock disabled for this request", { error: err.message });
+      return false;
+    });
+  }
+  return lockSchemaPromise;
+}
+
+// One more wrong password. Atomic, so parallel attempts can't skip the lock.
+async function recordFailedLogin(db, userId) {
+  const r = await db.query(
+    `UPDATE ${USERS_TABLE}
+        SET failed_login_attempts = failed_login_attempts + 1,
+            locked_at = CASE WHEN locked_at IS NULL AND failed_login_attempts + 1 >= $2 THEN now() ELSE locked_at END
+      WHERE id = $1
+      RETURNING failed_login_attempts, locked_at`, [userId, MAX_FAILED_LOGINS]);
+  const row = r.rows[0] || { failed_login_attempts: 0, locked_at: null };
+  return {
+    attempts: row.failed_login_attempts,
+    locked: row.locked_at != null,
+    remaining: Math.max(0, MAX_FAILED_LOGINS - row.failed_login_attempts),
+  };
+}
+
+// Correct password on an unlocked account: start counting from zero again.
+function clearFailedLogins(db, userId) {
+  return db.query(
+    `UPDATE ${USERS_TABLE} SET failed_login_attempts = 0 WHERE id = $1 AND failed_login_attempts <> 0`, [userId]);
+}
+
+// --------------------------------------------------------------------------
 // schema
 // --------------------------------------------------------------------------
 async function initSchema({ pool, setSchema, roles = DEFAULT_ROLES }) {
@@ -273,6 +332,8 @@ async function initSchema({ pool, setSchema, roles = DEFAULT_ROLES }) {
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ NULL;");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NULL;");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(64) NULL;");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INT NOT NULL DEFAULT 0;");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ NULL;");
 
     // The original chk_role only allows 6 roles, but the app also uses planner,
     // ceo, verificador, factory_director… Rebuild it with every known role PLUS
@@ -356,7 +417,7 @@ function activityTracker({ pool, logger = console, getClientIp = (req) => req.ip
 
       if (path === "/api/login") {
         const ok = res.statusCode < 400;
-        return insertLoginLog(pool, { ...base, username: req.body?.username }, ok);
+        return insertLoginLog(pool, { ...base, username: req.body?.username, details: req.loginLogDetails || null }, ok);
       }
 
       let user = req.user;
@@ -446,6 +507,9 @@ function registerItControlPanel(app, deps) {
   };
   const isMaster = (req) => req.user?.role === "master"; // factory_director is aliased to master
 
+  // Lock columns must exist before the panel reads them (no-op after the first call).
+  const lockReady = async (req, res, next) => { await ensureLoginLockSchema(pool, logger); next(); };
+
   // Each panel request runs in its own transaction with SET LOCAL TIME ZONE, so
   // days are counted in factory time even when setSchema doesn't set the zone,
   // and the zone never leaks to other routes that reuse the pooled connection.
@@ -499,7 +563,7 @@ function registerItControlPanel(app, deps) {
   }));
 
   // ---------------- overview ----------------
-  app.get("/api/it/overview", authenticateToken, requireIt, withClient(async (req, res, client) => {
+  app.get("/api/it/overview", authenticateToken, requireIt, lockReady, withClient(async (req, res, client) => {
     const { from, to } = parseRange(req.query);
     const R = RANGE_SQL(1, 2);
     const [kpi, users, byDay, byModule, online, failed] = await inSeq([
@@ -513,7 +577,8 @@ function registerItControlPanel(app, deps) {
       () => client.query(
         `SELECT COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE is_active)::int AS active,
-                COUNT(*) FILTER (WHERE is_active AND last_seen_at > now() - interval '15 minutes')::int AS online
+                COUNT(*) FILTER (WHERE is_active AND last_seen_at > now() - interval '15 minutes')::int AS online,
+                COUNT(*) FILTER (WHERE is_active AND locked_at IS NOT NULL)::int AS locked
            FROM users`),
       () => client.query(
         `SELECT to_char(d, 'YYYY-MM-DD') AS day,
@@ -546,7 +611,7 @@ function registerItControlPanel(app, deps) {
     ]);
     res.json({
       success: true, from, to,
-      kpis: { ...kpi.rows[0], users_total: users.rows[0].total, users_active: users.rows[0].active, online_now: users.rows[0].online },
+      kpis: { ...kpi.rows[0], users_total: users.rows[0].total, users_active: users.rows[0].active, online_now: users.rows[0].online, users_locked: users.rows[0].locked },
       byDay: byDay.rows, byModule: byModule.rows, online: online.rows, failedLogins: failed.rows,
     });
   }));
@@ -598,11 +663,12 @@ function registerItControlPanel(app, deps) {
   }));
 
   // ---------------- users list with activity ----------------
-  app.get("/api/it/users", authenticateToken, requireIt, withClient(async (req, res, client) => {
+  app.get("/api/it/users", authenticateToken, requireIt, lockReady, withClient(async (req, res, client) => {
     const { from, to } = parseRange(req.query);
     const r = await client.query(
       `SELECT u.id, u.username, u.full_name, u.role, u.line_number, u.is_active, u.created_at,
               u.last_login_at, u.last_seen_at, u.last_login_ip,
+              u.failed_login_attempts, u.locked_at, (u.locked_at IS NOT NULL) AS locked,
               COALESCE(u.is_active AND u.last_seen_at > now() - interval '15 minutes', FALSE) AS online,
               COALESCE(a.logins, 0)::int AS logins,
               COALESCE(a.changes, 0)::int AS changes,
@@ -622,7 +688,7 @@ function registerItControlPanel(app, deps) {
   }));
 
   // ---------------- one user report ----------------
-  app.get("/api/it/users/:id/report", authenticateToken, requireIt, withClient(async (req, res, client) => {
+  app.get("/api/it/users/:id/report", authenticateToken, requireIt, lockReady, withClient(async (req, res, client) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: "Invalid user id" });
     const { from, to } = parseRange(req.query);
@@ -630,8 +696,10 @@ function registerItControlPanel(app, deps) {
     const u = await client.query(
       `SELECT id, username, full_name, role, line_number, is_active, created_at, updated_at,
               last_login_at, last_seen_at, last_login_ip,
+              failed_login_attempts, locked_at, (locked_at IS NOT NULL) AS locked,
               COALESCE(is_active AND last_seen_at > now() - interval '15 minutes', FALSE) AS online
          FROM users WHERE id = $1`, [id]);
+    u.rows[0] && (u.rows[0].max_failed_logins = MAX_FAILED_LOGINS);
     if (!u.rows.length) return res.status(404).json({ success: false, error: "User not found" });
 
     const [byDay, byModule, byAction, recent] = await inSeq([
@@ -762,19 +830,24 @@ function registerItControlPanel(app, deps) {
     }
   }));
 
-  // ---------------- edit user (role, status, name, line, password reset) ----------------
-  app.put("/api/it/users/:id", authenticateToken, requireIt, withClient(async (req, res, client) => {
+  // ---------------- edit user (role, status, name, line, password reset, unlock) ----------------
+  // Body { unlock: true } removes the login lock and resets the failed-attempt counter.
+  // A password reset also removes the lock.
+  app.put("/api/it/users/:id", authenticateToken, requireIt, lockReady, withClient(async (req, res, client) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: "Invalid user id" });
-    const cur = await client.query("SELECT id, username, full_name, role, line_number, is_active FROM users WHERE id = $1", [id]);
+    const cur = await client.query("SELECT id, username, full_name, role, line_number, is_active, failed_login_attempts, locked_at FROM users WHERE id = $1", [id]);
     if (!cur.rows.length) return res.status(404).json({ success: false, error: "User not found" });
     const before = cur.rows[0];
     const self = String(id) === String(req.user.id); // pg returns BIGINT ids as strings
 
-    if (PROTECTED_ROLES.includes(before.role) && !isMaster(req))
+    const b = req.body || {};
+    // 🔒 Unlocking is allowed for EVERY role (master included) from the IT panel.
+    // Any other change to a protected account still needs a master.
+    const unlockOnly = b.unlock === true && Object.keys(b).every((k) => k === "unlock");
+    if (PROTECTED_ROLES.includes(before.role) && !isMaster(req) && !unlockOnly)
       return res.status(403).json({ success: false, error: "Only a master account can edit this user." });
 
-    const b = req.body || {};
     const sets = [], vals = [], changes = {};
     const set = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
 
@@ -813,15 +886,25 @@ function registerItControlPanel(app, deps) {
       if (p.length < 8 || p.length > 72) return res.status(400).json({ success: false, field: "password", error: "Password must be 8–72 characters." });
       set("password_hash", await bcrypt.hash(p, 10)); changes.password = "reset";
     }
+    const wantsUnlock = b.unlock === true || changes.password; // both happen only in the IT panel
+    if (wantsUnlock && (before.locked_at || before.failed_login_attempts > 0)) {
+      set("failed_login_attempts", 0);
+      set("locked_at", null);
+      if (before.locked_at) changes.lock = { from: "locked", to: "unlocked" };
+    }
+    if (b.unlock === true && !before.locked_at && !sets.length)
+      return res.status(400).json({ success: false, error: "This user is not locked." });
 
     if (!sets.length) return res.status(400).json({ success: false, error: "Nothing changed." });
     vals.push(id);
     const r = await client.query(
       `UPDATE users SET ${sets.join(", ")}, updated_at = now() WHERE id = $${vals.length}
-       RETURNING id, username, full_name, role, line_number, is_active, created_at, updated_at, last_login_at, last_seen_at`, vals);
+       RETURNING id, username, full_name, role, line_number, is_active, created_at, updated_at, last_login_at, last_seen_at,
+                 failed_login_attempts, locked_at, (locked_at IS NOT NULL) AS locked`, vals);
 
     const keys = Object.keys(changes);
-    const action = keys.length === 1 && changes.password ? "password_reset"
+    const action = changes.password && keys.every((k) => k === "password" || k === "lock") ? "password_reset"
+      : keys.length === 1 && changes.lock ? "user_unlocked"
       : keys.length === 1 && changes.is_active ? (changes.is_active.to ? "user_activated" : "user_deactivated")
       : keys.length === 1 && changes.role ? "role_changed"
       : "user_updated";
@@ -860,4 +943,11 @@ registerItControlPanel.initSchema = initSchema;
 registerItControlPanel.activityTracker = activityTracker;
 registerItControlPanel.DEFAULT_ROLES = DEFAULT_ROLES;
 registerItControlPanel.PROTECTED_ROLES = PROTECTED_ROLES;
+registerItControlPanel.loginLock = {
+  MAX_FAILED_LOGINS,
+  LOCKED_MESSAGE,
+  ensureSchema: ensureLoginLockSchema,
+  recordFailure: recordFailedLogin,
+  clear: clearFailedLogins,
+};
 module.exports = registerItControlPanel;

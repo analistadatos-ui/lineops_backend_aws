@@ -557,6 +557,7 @@ await client.query(`
     CONSTRAINT chk_assignment_status CHECK (status IN ('planned', 'released', 'completed', 'cancelled'))
   );
 `);
+
 console.log("✅ line_assignments table ready in prod_db_schema");
 
 await client.query(`
@@ -977,8 +978,15 @@ app.post(
       await setSchema(client);
       const { username, password } = req.body;
 
+      // 🔒 Login lock: columns ready? (false only if the DB refused to add them)
+      const lock = itControlPanel.loginLock;
+      const lockOn = await lock.ensureSchema(pool, logger);
+      const lockCols = lockOn
+        ? "failed_login_attempts, locked_at"
+        : "0 AS failed_login_attempts, NULL::timestamptz AS locked_at";
+
       const userResult = await client.query(
-        `SELECT id, username, password_hash, role, line_number, full_name, is_active
+        `SELECT id, username, password_hash, role, line_number, full_name, is_active, ${lockCols}
          FROM users
          WHERE username = $1 AND is_active = TRUE`,
         [username]
@@ -990,11 +998,43 @@ app.post(
       }
 
       const user = userResult.rows[0];
+      const lockedReply = () =>
+        res.status(423).json({ success: false, locked: true, code: "ACCOUNT_LOCKED", error: lock.LOCKED_MESSAGE });
+
+      // Already locked → refuse even if the password is right (any role, master included).
+      // Only the IT control panel can unlock.
+      if (user.locked_at) {
+        securityLog("login_failed", req, { username, reason: "account_locked" });
+        req.loginLogDetails = { reason: "account_locked" };
+        return lockedReply();
+      }
+
       const isValidPassword = await bcrypt.compare(password, user.password_hash);
       if (!isValidPassword) {
-        securityLog("login_failed", req, { username, reason: "invalid_password" });
-        return res.status(401).json({ success: false, error: "Invalid username or password" });
+        if (!lockOn) {
+          securityLog("login_failed", req, { username, reason: "invalid_password" });
+          return res.status(401).json({ success: false, error: "Invalid username or password" });
+        }
+        const f = await lock.recordFailure(client, user.id);
+        if (f.locked) {
+          securityLog("account_locked", req, { username, attempts: f.attempts });
+          logger.warn("🔒 Account locked after failed logins", { username, attempts: f.attempts });
+          req.loginLogDetails = { reason: "locked_now", attempts: f.attempts };
+          return lockedReply();
+        }
+        securityLog("login_failed", req, { username, reason: "invalid_password", attempts: f.attempts });
+        req.loginLogDetails = { reason: "invalid_password", attempts: f.attempts };
+        return res.status(401).json({
+          success: false,
+          attemptsLeft: f.remaining,
+          error: `Invalid username or password. ${f.remaining} attempt${f.remaining === 1 ? "" : "s"} left before the user is locked.`,
+        });
       }
+
+      // Correct password: reset the counter and keep the lock columns out of the response.
+      if (lockOn && user.failed_login_attempts > 0) await lock.clear(client, user.id);
+      delete user.failed_login_attempts;
+      delete user.locked_at;
 
       const token = jwt.sign(
         { id: user.id, username: user.username, role: user.role },
@@ -1006,9 +1046,9 @@ app.post(
       applyRoleAlias(user); // factory_director → role "master" + actual_role
 
       const { ip: clientIp, source: ipSource } = getClientIpInfo(req);
-logger.info("Login successful", { username: user.username, role: user.role, actual_role: user.actual_role, ip: clientIp, ipSource });
+      logger.info("Login successful", { username: user.username, role: user.role, actual_role: user.actual_role, ip: clientIp, ipSource });
 
-       if (OFFICE_IPS.length > 0 && !isOfficeIp(clientIp)) {
+      if (OFFICE_IPS.length > 0 && !isOfficeIp(clientIp)) {
         securityLog("login_outside_office", req, { username: user.username, role: user.role });
       }
 
