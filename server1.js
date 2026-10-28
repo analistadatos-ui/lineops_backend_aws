@@ -42,6 +42,19 @@ const app = express();
 
 app.set("trust proxy", 2);
 
+// Block requests that didn't come through CloudFront
+const crypto = require("crypto");
+const ORIGIN_SECRET = process.env.FABRIC_ORIGIN_VERIFY || "";
+
+app.use("/api/", (req, res, next) => {
+  const got = Buffer.from(String(req.headers["x-origin-verify"] || ""));
+  const want = Buffer.from(ORIGIN_SECRET);
+  if (!ORIGIN_SECRET || got.length !== want.length || !crypto.timingSafeEqual(got, want)) {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  next();
+});
+
 app.get("/api/_debug/ip", (req, res) => {
   res.json({
     ip: req.ip,
@@ -824,34 +837,10 @@ const ipFromContext = (ctx) =>
   ctx?.identity?.sourceIp || ctx?.http?.sourceIp || null;
 
 const getClientIpInfo = (req) => {
-  // 1. serverless-http
-  let ip = ipFromContext(req.requestContext) || ipFromContext(req.apiGateway?.event?.requestContext);
-  if (ip) return { ip, source: "serverless-http" };
-
-  // 2. @vendia / @codegenie serverless-express (v4+)
-  if (getCurrentInvoke) {
-    try {
-      ip = ipFromContext(getCurrentInvoke()?.event?.requestContext);
-      if (ip) return { ip, source: "serverless-express" };
-    } catch (e) { /* ignore */ }
+  const viewer = req.headers["cloudfront-viewer-address"];
+  if (viewer) {
+    return { ip: viewer.slice(0, viewer.lastIndexOf(":")), source: "cloudfront-viewer-address" };
   }
-
-  // 3. aws-serverless-express (v3) — event passed as URI-encoded header
-  ip = ipFromContext(parseJsonHeader(req.headers["x-apigateway-event"], true)?.requestContext);
-  if (ip) return { ip, source: "x-apigateway-event" };
-
-  // 4. AWS Lambda Web Adapter
-  ip = ipFromContext(parseJsonHeader(req.headers["x-amzn-request-context"]));
-  if (ip) return { ip, source: "x-amzn-request-context" };
-
-  // 5. X-Forwarded-For set by API Gateway / Function URL — AWS appends the
-  //    real caller IP last, so take the LAST entry (earlier ones can be faked).
-  const xff = req.headers["x-forwarded-for"];
-  if (xff) {
-    const parts = String(xff).split(",").map((p) => p.trim()).filter(Boolean);
-    if (parts.length) return { ip: parts[parts.length - 1], source: "x-forwarded-for" };
-  }
-
   return { ip: req.ip, source: "req.ip" };
 };
 
