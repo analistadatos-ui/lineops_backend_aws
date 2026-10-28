@@ -55,15 +55,6 @@ app.use("/api/", (req, res, next) => {
   next();
 });
 
-app.get("/api/_debug/ip", (req, res) => {
-  res.json({
-    ip: req.ip,
-    ips: req.ips,
-    xff: req.headers["x-forwarded-for"],
-    viewer: req.headers["cloudfront-viewer-address"],
-    socket: req.socket.remoteAddress,
-  });
-});
 
 app.use(helmet());
 app.set("etag", false);
