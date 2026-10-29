@@ -1974,6 +1974,110 @@ function registerFabricWarehouse(app, deps) {
     res.json({ success: true });
   }));
 
+  // Send rolls straight from stock to inspection (no request). Body: { ids, notes? }
+  // Any open request that already listed one of these rolls is marked as sent for it.
+  app.post(`${BASE}/rolls/send-to-inspection`, authenticateToken, withClient(async (req, res, client) => {
+    const ids = idList(req.body?.ids);
+    if (!ids.length) return fail(res, 400, "Seleccione al menos un rollo.");
+    const note = str(req.body?.notes);
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT id, roll_no, status, location_id FROM fabric_rolls WHERE id = ANY($1::bigint[]) FOR UPDATE`, [ids]
+    );
+    const bad = rows.filter((r) => r.status !== "in_stock");
+    if (bad.length) {
+      await client.query("ROLLBACK");
+      return fail(res, 409, `Estos rollos no están en inventario: ${bad.map((r) => r.roll_no).join(", ")}`);
+    }
+    for (const r of rows) {
+      await client.query(
+        `UPDATE fabric_rolls SET status = 'at_inspection', out_at = now(), updated_at = now() WHERE id = $1`, [r.id]
+      );
+      await logMove(client, { rollId: r.id, type: "inspection_out", from: r.location_id, reason: note, userId: req.user?.id });
+    }
+    const touched = await client.query(
+      `UPDATE fabric_inspection_request_items it SET sent_at = now()
+         FROM fabric_inspection_requests ir
+        WHERE ir.id = it.request_id AND ir.status IN ('open','partial')
+          AND it.sent_at IS NULL AND it.roll_id = ANY($1::bigint[])
+        RETURNING it.request_id`,
+      [rows.map((r) => r.id)]
+    );
+    const reqIds = [...new Set(touched.rows.map((t) => t.request_id))];
+    if (reqIds.length) {
+      await client.query(
+        `UPDATE fabric_inspection_requests ir
+            SET status = CASE WHEN x.pending = 0 THEN 'sent' ELSE 'partial' END,
+                sent_at = CASE WHEN x.pending = 0 THEN now() ELSE ir.sent_at END
+           FROM (SELECT request_id, COUNT(*) FILTER (WHERE sent_at IS NULL)::int AS pending
+                   FROM fabric_inspection_request_items WHERE request_id = ANY($1::bigint[])
+                  GROUP BY request_id) x
+          WHERE ir.id = x.request_id`,
+        [reqIds]
+      );
+    }
+    await client.query("COMMIT");
+    res.json({ success: true, sent: rows.length });
+  }));
+
+  // PDA scan flow for inspection: Lugar → Contenedor → Rollos. Nothing is saved here;
+  // the rolls are sent with /rolls/send-to-inspection once the user confirms.
+  // Body: { raw, step: 'location'|'box'|'roll', locationId?, boxId? }
+  // A spot label scanned at any step answers kind 'location' (start over on that spot).
+  app.post(`${BASE}/inspection/scan`, authenticateToken, withClient(async (req, res, client) => {
+    const raw = String(req.body?.raw ?? "");
+    const step = req.body?.step;
+    if (!cleanScan(raw)) return fail(res, 400, "No se pudo leer el código.");
+
+    if (step === "location") {
+      const hit = await classifyCode(client, raw, "spot");
+      if (hit?.kind === "location") return res.json({ success: true, kind: "location", location: hit.location });
+      if (hit?.kind === "box") return fail(res, 409, `${hit.box.code} es un contenedor. Escanee primero el lugar.`);
+      return fail(res, 404, "No se reconoce el lugar. Escanee la etiqueta del lugar.");
+    }
+
+    if (step === "box") {
+      const locationId = parseInt(req.body?.locationId, 10);
+      if (!locationId) return fail(res, 400, "Escanee primero el lugar.");
+      const hit = await classifyCode(client, raw, "box");
+      if (hit?.kind === "location") return res.json({ success: true, kind: "location", location: hit.location });
+      if (hit?.kind === "invalid_box") return fail(res, 409, hit.error);
+      if (hit?.kind !== "box") return fail(res, 404, "No se reconoce el contenedor.");
+      const B = hit.box;
+      if (String(B.location_id) !== String(locationId)) {
+        return fail(res, 409, B.location_code
+          ? `${B.code} no está en este lugar (está en ${B.location_code}).`
+          : `${B.code} no tiene lugar registrado.`);
+      }
+      return res.json({ success: true, kind: "box", box: B });
+    }
+
+    if (step === "roll") {
+      const boxId = parseInt(req.body?.boxId, 10);
+      if (!boxId) return fail(res, 400, "Escanee primero el lugar y el contenedor.");
+      const hit = await classifyCode(client, raw, null);
+      if (hit?.kind === "location") return res.json({ success: true, kind: "location", location: hit.location });
+      if (hit?.kind === "box") {
+        if (String(hit.box.id) === String(boxId)) return res.json({ success: true, kind: "box", box: hit.box });
+        return fail(res, 409, `Para cambiar a ${hit.box.code}, escanee primero su lugar.`);
+      }
+      const f = await findScannedRoll(client, raw);
+      if (f.error) return fail(res, f.status || 400, f.error);
+      if (!f.rows.length) return fail(res, 404, `No existe el rollo ${f.scan.roll_no}.`);
+      const roll = f.rows.find((r) => String(r.box_id) === String(boxId)) || f.rows[0];
+      if (roll.status === "at_inspection") return fail(res, 409, `${roll.roll_no} ya está en inspección.`);
+      if (roll.status !== "in_stock") return fail(res, 409, `${roll.roll_no} no está en inventario.`);
+      if (String(roll.box_id) !== String(boxId)) {
+        return fail(res, 409, roll.box_code
+          ? `${roll.roll_no} no está en este contenedor (está en ${roll.box_code}).`
+          : `${roll.roll_no} no tiene contenedor registrado.`);
+      }
+      return res.json({ success: true, kind: "roll", roll });
+    }
+
+    return fail(res, 400, "Paso de escaneo no válido.");
+  }));
+
   // Rolls come back from inspection. Body: { ids, result: 'approved'|'rejected', boxId? }
   // Without boxId each roll goes back to its own container (wherever it is now).
   app.post(`${BASE}/rolls/return-from-inspection`, authenticateToken, withClient(async (req, res, client) => {
