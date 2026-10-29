@@ -1747,12 +1747,159 @@ function registerFinishedWarehouse(app, deps) {
     res.json({ success: true, inventory: rows, totalPieces });
   }));
 
+  // ======================================================================
+  //  ESTADO DE RECEPCIÓN por orden (dashboard)
+  // ======================================================================
+  //  GET /api/finished-warehouse/receiving-status?tz=America/Mexico_City
+  //  Por orden activa: asignado (merchant) vs producido (líneas) vs recibido
+  //  (tickets escaneados), fecha de entrega del merchant, ritmo de recepción
+  //  de los últimos 7 días, fecha estimada de término y estado:
+  //    done     recibido >= asignado
+  //    late     ya pasó la fecha de entrega y falta recibir
+  //    risk     al ritmo actual no termina a tiempo (o entrega en ≤ 3 días con
+  //             menos del 80 % recibido)
+  //    ok       va a tiempo
+  //    no_date  el merchant no capturó fecha de entrega
+  //  También: piezas recibidas hoy (total, por hora y por orden) y ayer.
+  app.get("/api/finished-warehouse/receiving-status", authenticateToken, withClient(async (req, res, client) => {
+    const tzRaw = String(req.query.tz || "").trim();
+    let tz = /^[A-Za-z0-9_+\-\/]{1,64}$/.test(tzRaw) ? tzRaw : "UTC";
+    try { await client.query("SELECT now() AT TIME ZONE $1", [tz]); } catch { tz = "UTC"; }
+    const PACE_DAYS = 7;
+
+    const { rows: [{ today }] } = await client.query(
+      `SELECT to_char((now() AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS today`, [tz]
+    );
+
+    // Merchant's delivery date = "Fecha compromiso" (commitment_date, see work-orders.js).
+    // It is captured per line (work_order_lines); work_orders keeps a copy of the
+    // first line's value. The earliest line date wins (the order is late as soon
+    // as its first commitment is missed); the header copy is the fallback.
+    const deliverySql = `COALESCE(
+        (SELECT MIN(l.commitment_date) FROM work_order_lines l WHERE l.work_order_id = wo.id),
+        wo.commitment_date)`;
+
+    // Active orders: not cancelled, with something assigned, and either
+    // something received / produced, or a delivery date in the window.
+    const { rows: orders } = await client.query(
+      `WITH recv AS (
+         SELECT work_order_no,
+                SUM(pieces)::numeric AS received,
+                COUNT(*)::int AS tickets,
+                SUM(pieces) FILTER (WHERE (scanned_at AT TIME ZONE $1)::date = $2::date)::numeric AS today,
+                SUM(pieces) FILTER (WHERE (scanned_at AT TIME ZONE $1)::date >  $2::date - $3::int)::numeric AS recent,
+                MAX(scanned_at) AS last_scan
+           FROM scanned_tickets GROUP BY work_order_no
+       ),
+       asg AS (
+         SELECT work_order_id, SUM(quantity)::numeric AS assigned FROM work_order_lines GROUP BY work_order_id
+       )
+       SELECT wo.id, wo.work_order_no AS po, wo.customer_po AS mo, wo.customer_name,
+              COALESCE(wo.estilo, wo.style_code) AS style, wo.status,
+              to_char(${deliverySql}, 'YYYY-MM-DD') AS delivery_date,
+              COALESCE(asg.assigned, 0) AS assigned,
+              COALESCE(recv.received, 0) AS received,
+              COALESCE(recv.tickets, 0) AS tickets,
+              COALESCE(recv.today, 0) AS received_today,
+              COALESCE(recv.recent, 0) AS received_recent,
+              recv.last_scan
+         FROM work_orders wo
+         LEFT JOIN asg  ON asg.work_order_id = wo.id
+         LEFT JOIN recv ON recv.work_order_no = wo.work_order_no
+        WHERE COALESCE(wo.status, '') <> 'cancelled'
+          AND COALESCE(asg.assigned, 0) > 0
+          AND ( recv.work_order_no IS NOT NULL
+                OR EXISTS (SELECT 1 FROM line_runs lr WHERE lr.work_order_id = wo.id)
+                OR ${deliverySql} BETWEEN $2::date - 30 AND $2::date + 120 )
+        ORDER BY ${deliverySql} ASC NULLS LAST, wo.id DESC
+        LIMIT 400`,
+      [tz, today, PACE_DAYS]
+    );
+
+    // Produced per order (same source as the line-input view).
+    let producedBy = new Map();
+    try {
+      const lineMap = await workOrders.producedByLineForMany(client, orders.map((o) => o.id));
+      producedBy = new Map([...lineMap.entries()].map(([id, lines]) =>
+        [Number(id), lines.reduce((s, l) => s + (Number(l.finished) || 0), 0)]));
+    } catch (e) { console.warn("receiving-status produced:", e.message); }
+
+    const dayMs = 86400000;
+    const todayD = new Date(`${today}T00:00:00Z`);
+    const addDays = (n) => new Date(todayD.getTime() + n * dayMs).toISOString().slice(0, 10);
+
+    const result = orders.map((o) => {
+      const assigned = Math.round(Number(o.assigned) || 0);
+      const received = Math.round(Number(o.received) || 0);
+      const pending = Math.max(0, assigned - received);
+      const pct = assigned > 0 ? Math.min(100, Math.round((received / assigned) * 100)) : 0;
+      const pace = Math.round((Number(o.received_recent) || 0) / PACE_DAYS);   // pzas/día
+      const daysLeft = o.delivery_date ? Math.round((new Date(`${o.delivery_date}T00:00:00Z`) - todayD) / dayMs) : null;
+      const needPerDay = pending > 0 && daysLeft != null ? Math.ceil(pending / Math.max(1, daysLeft + 1)) : 0;
+      const etaDays = pending === 0 ? 0 : pace > 0 ? Math.ceil(pending / pace) : null;
+      const eta = etaDays == null ? null : addDays(etaDays);
+
+      let state;
+      if (pending === 0) state = "done";
+      else if (daysLeft == null) state = "no_date";
+      else if (daysLeft < 0) state = "late";
+      else if ((etaDays == null && daysLeft <= 7) || (etaDays != null && etaDays > daysLeft + 1) || (daysLeft <= 3 && pct < 80)) state = "risk";
+      else state = "ok";
+
+      return {
+        id: o.id, po: o.po, mo: o.mo, customer_name: o.customer_name, style: o.style, status: o.status,
+        delivery_date: o.delivery_date, days_left: daysLeft,
+        assigned, produced: producedBy.get(Number(o.id)) || 0, received, pending, pct,
+        tickets: o.tickets, received_today: Math.round(Number(o.received_today) || 0),
+        pace, need_per_day: needPerDay, eta, last_scan: o.last_scan, state,
+      };
+    });
+
+    // Today: total, per hour, yesterday for comparison.
+    const { rows: [t] } = await client.query(
+      `SELECT COALESCE(SUM(pieces) FILTER (WHERE d = $2::date), 0)::numeric AS today,
+              COUNT(*) FILTER (WHERE d = $2::date)::int AS tickets,
+              COUNT(DISTINCT work_order_no) FILTER (WHERE d = $2::date)::int AS orders,
+              COALESCE(SUM(pieces) FILTER (WHERE d = $2::date - 1), 0)::numeric AS yesterday
+         FROM (SELECT pieces, work_order_no, (scanned_at AT TIME ZONE $1)::date AS d
+                 FROM scanned_tickets
+                WHERE scanned_at > now() - interval '3 days') x`,
+      [tz, today]
+    );
+    const { rows: hours } = await client.query(
+      `SELECT EXTRACT(HOUR FROM scanned_at AT TIME ZONE $1)::int AS hour,
+              SUM(pieces)::numeric AS pieces, COUNT(*)::int AS tickets
+         FROM scanned_tickets
+        WHERE (scanned_at AT TIME ZONE $1)::date = $2::date
+        GROUP BY 1 ORDER BY 1`,
+      [tz, today]
+    );
+
+    const count = (st) => result.filter((o) => o.state === st).length;
+    res.json({
+      success: true,
+      today,
+      deliveryColumn: "work_order_lines.commitment_date",
+      summary: {
+        receivedToday: Math.round(Number(t.today) || 0),
+        ticketsToday: t.tickets,
+        ordersToday: t.orders,
+        receivedYesterday: Math.round(Number(t.yesterday) || 0),
+        late: count("late"), risk: count("risk"), ok: count("ok"), done: count("done"), noDate: count("no_date"),
+        dueThisWeek: result.filter((o) => o.state !== "done" && o.days_left != null && o.days_left >= 0 && o.days_left <= 7).length,
+      },
+      todayByHour: hours.map((h) => ({ hour: h.hour, pieces: Math.round(Number(h.pieces) || 0), tickets: h.tickets })),
+      orders: result,
+    });
+  }));
+
   app.get("/api/finished-warehouse/dashboard", authenticateToken, withClient(async (req, res, client) => {
-    const [lists, boxes, inv, recent] = await Promise.all([
+    const [lists, boxes, inv, recent, pend] = await Promise.all([
       client.query(`SELECT status, COUNT(*)::int AS n FROM pre_packing_lists GROUP BY status`),
       client.query(`SELECT COUNT(*)::int AS n, COALESCE(SUM(quantity),0) AS qty FROM pre_packing_boxes`),
       client.query(`SELECT COALESCE(SUM(quantity),0) AS pieces, COUNT(*)::int AS skus, COALESCE(SUM(box_count),0)::int AS boxes FROM finished_inventory`),
       client.query(`SELECT id, list_no, customer_name, po, mo, status, created_at FROM pre_packing_lists ORDER BY created_at DESC LIMIT 8`),
+      client.query(`SELECT COUNT(*)::int AS n, COALESCE(SUM(pieces),0) AS pieces FROM scanned_tickets WHERE checked_in_at IS NULL`),
     ]);
     const byStatus = Object.fromEntries(lists.rows.map((r) => [r.status, r.n]));
     res.json({
@@ -1762,6 +1909,7 @@ function registerFinishedWarehouse(app, deps) {
         prePacking: { boxes: boxes.rows[0].n, pieces: Number(boxes.rows[0].qty) || 0 },
         inventory: { pieces: Number(inv.rows[0].pieces) || 0, skus: inv.rows[0].skus, boxes: inv.rows[0].boxes },
         recentLists: recent.rows,
+        tickets: { pending: pend.rows[0].n, pendingPieces: Number(pend.rows[0].pieces) || 0 },
       },
     });
   }));
