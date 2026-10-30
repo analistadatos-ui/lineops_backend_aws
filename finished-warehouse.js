@@ -29,6 +29,13 @@ const workOrders = require("./work-orders");
 const SKU_FIELDS = ["customer_code", "po", "style", "color_code", "size_code", "sex", "fabric_code"];
 const skuKeyOf = (b) => SKU_FIELDS.map((f) => String(b[f] ?? "").trim()).join("|");
 
+// Estilo = último tramo del No. de orden: "SKM0062-CYA-DAMTSH02" -> "DAMTSH02".
+// Solo aplica a números con al menos 3 tramos (prefijo-cliente-estilo).
+const styleFromWorkOrder = (no) => {
+  const parts = String(no ?? "").trim().split("-").map((x) => x.trim()).filter(Boolean);
+  return parts.length >= 3 ? parts[parts.length - 1].toUpperCase() : null;
+};
+
 // SheetJS is only needed for Excel export. Load it lazily so the module still
 // boots (and CSV export still works) if the package isn't installed yet.
 let XLSX = null;
@@ -698,19 +705,13 @@ async function initSchema({ pool, setSchema }) {
     // Traza del movimiento hacia el ticket que lo originó (además de list_id/box_id).
     await client.query("ALTER TABLE finished_inventory_movements ADD COLUMN IF NOT EXISTS ticket_id BIGINT;");
 
-    // Estilo: el QR compacto (FGW2) no lo trae, así que se toma de la orden de
-    // trabajo (igual que el pre-empaque: estilo, o style_code si falta). Rellenamos
-    // los tickets ya escaneados que quedaron sin estilo.
+    // Estilo: el QR compacto (FGW2) no lo trae; se toma del No. de orden
+    // (último tramo). Rellenamos datos viejos que quedaron sin estilo.
     try {
-      await client.query(`
-        UPDATE scanned_tickets st
-           SET style = COALESCE(wo.estilo, wo.style_code)
-          FROM work_orders wo
-         WHERE (st.style IS NULL OR st.style = '')
-           AND wo.work_order_no = st.work_order_no
-           AND COALESCE(wo.estilo, wo.style_code) IS NOT NULL`);
+      await backfillStyles(client);
     } catch (e) {
-      console.warn("⚠️ finished-warehouse: no se pudo rellenar el estilo de los tickets:", e.message);
+      try { await client.query("ROLLBACK"); } catch {}
+      console.warn("⚠️ finished-warehouse: no se pudo rellenar el estilo:", e.message);
     }
 
     // Contador de folios por prefijo (p. ej. 'SKM'), incremento atómico para que
@@ -728,11 +729,64 @@ async function initSchema({ pool, setSchema }) {
   }
 }
 
+// Rellena el estilo en tickets escaneados e inventario que quedaron sin él.
+// En inventario el estilo forma parte del sku_key, así que también se recalcula
+// la llave; si ya existe un renglón con la llave nueva, se fusionan (cantidad,
+// cajas, movimientos y tickets apuntan al que queda). Idempotente.
+async function backfillStyles(client) {
+  await client.query("BEGIN");
+
+  const tk = await client.query(
+    `SELECT id, work_order_no FROM scanned_tickets WHERE (style IS NULL OR style = '') AND work_order_no IS NOT NULL`
+  );
+  let tickets = 0;
+  for (const r of tk.rows) {
+    const style = styleFromWorkOrder(r.work_order_no);
+    if (!style) continue;
+    await client.query(`UPDATE scanned_tickets SET style = $2 WHERE id = $1`, [r.id, style]);
+    tickets += 1;
+  }
+
+  const inv = await client.query(
+    `SELECT * FROM finished_inventory WHERE (style IS NULL OR style = '') AND po IS NOT NULL ORDER BY id FOR UPDATE`
+  );
+  let updated = 0, merged = 0;
+  for (const row of inv.rows) {
+    const style = styleFromWorkOrder(row.po);
+    if (!style) continue;
+    const key = skuKeyOf({ ...row, style });
+    const other = await client.query(`SELECT id FROM finished_inventory WHERE sku_key = $1 AND id <> $2`, [key, row.id]);
+    if (other.rows.length) {
+      const target = other.rows[0].id;
+      await client.query(
+        `UPDATE finished_inventory SET quantity = quantity + $2, box_count = box_count + $3, updated_at = now() WHERE id = $1`,
+        [target, row.quantity, row.box_count]
+      );
+      await client.query(`UPDATE finished_inventory_movements SET inventory_id = $2 WHERE inventory_id = $1`, [row.id, target]);
+      await client.query(`UPDATE scanned_tickets SET inventory_id = $2 WHERE inventory_id = $1`, [row.id, target]);
+      await client.query(`DELETE FROM finished_inventory WHERE id = $1`, [row.id]);
+      merged += 1;
+    } else {
+      await client.query(
+        `UPDATE finished_inventory SET style = $2, sku_key = $3, updated_at = now() WHERE id = $1`,
+        [row.id, style, key]
+      );
+      updated += 1;
+    }
+  }
+
+  await client.query("COMMIT");
+  if (tickets || updated || merged) {
+    console.log(`✅ finished-warehouse: estilo rellenado en ${tickets} ticket(s) y ${updated + merged} SKU(s) de inventario (${merged} fusionado(s))`);
+  }
+}
+
 // Ingresa un ticket (ya bloqueado con FOR UPDATE y aún pendiente) al inventario:
 // suma sus piezas a finished_inventory, registra el movimiento y lo marca.
 // Lo usan el check-in individual y el masivo; la transacción la abre quien llama.
 async function checkInTicket(client, t, userId) {
   const qty = Number(t.pieces) || 0;
+  if (!t.style) t = { ...t, style: styleFromWorkOrder(t.work_order_no) };
 
   // SKU del ticket, consistente con el que arma el pre-empaque.
   //   po = No. de orden (work_order_no)   ·   mo = PO del cliente (customer_po)
@@ -1016,7 +1070,7 @@ function registerFinishedWarehouse(app, deps) {
     }
 
     // ── Cliente: se resuelve desde la orden de trabajo (wo = work_order_no). ──
-    // El estilo también sale de la orden cuando el QR no lo trae.
+    // El estilo sale del No. de orden (último tramo) cuando el QR no lo trae.
     let customer = { id: null, code: null, name: null };
     if (parsed.work_order_no) {
       const cRes = await client.query(
@@ -1030,12 +1084,14 @@ function registerFinishedWarehouse(app, deps) {
       );
       if (cRes.rows.length) {
         customer = { id: cRes.rows[0].customer_id, code: cRes.rows[0].customer_code, name: cRes.rows[0].customer_name };
-        if (!parsed.style && cRes.rows[0].style) parsed.style = cRes.rows[0].style;
+        if (!parsed.style) parsed.style = styleFromWorkOrder(parsed.work_order_no) || cRes.rows[0].style || null;
       }
     }
 
     // ── Folio consecutivo (SKM0001, SKM0002…). El prefijo sale de las letras
     //    iniciales del No. de orden (SKM0001-… → "SKM"); si no hay, usamos "TKT".
+    if (!parsed.style) parsed.style = styleFromWorkOrder(parsed.work_order_no);
+
     const folioPrefix = (String(parsed.work_order_no ?? "").match(/^[A-Za-z]+/)?.[0] || "TKT").toUpperCase();
     const folio = await nextFolio(client, folioPrefix);
 
@@ -1192,7 +1248,7 @@ function registerFinishedWarehouse(app, deps) {
       const sku_key = skuKeyOf({
         customer_code: t.customer_code || null,
         po: t.work_order_no || null,
-        style: t.style || null,
+        style: t.style || styleFromWorkOrder(t.work_order_no),
         color_code: colorCodeOf(t.color, t.size_code),
         size_code: t.size_code || null,
         sex: null,
