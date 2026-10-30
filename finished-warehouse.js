@@ -733,6 +733,7 @@ async function initSchema({ pool, setSchema }) {
 // En inventario el estilo forma parte del sku_key, así que también se recalcula
 // la llave; si ya existe un renglón con la llave nueva, se fusionan (cantidad,
 // cajas, movimientos y tickets apuntan al que queda). Idempotente.
+let stylesBackfilled = false;   // se pone en true cuando el relleno ya corrió bien una vez
 async function backfillStyles(client) {
   await client.query("BEGIN");
 
@@ -776,6 +777,7 @@ async function backfillStyles(client) {
   }
 
   await client.query("COMMIT");
+  stylesBackfilled = true;
   if (tickets || updated || merged) {
     console.log(`✅ finished-warehouse: estilo rellenado en ${tickets} ticket(s) y ${updated + merged} SKU(s) de inventario (${merged} fusionado(s))`);
   }
@@ -1122,6 +1124,10 @@ function registerFinishedWarehouse(app, deps) {
   // Lista de tickets escaneados (más reciente primero) + totales. Filtros
   // opcionales: q (texto), workOrder (No. de orden), po, date (YYYY-MM-DD).
   app.get("/api/finished-warehouse/scanned-tickets", authenticateToken, withClient(async (req, res, client) => {
+    if (!stylesBackfilled) {
+      try { await backfillStyles(client); }
+      catch (e) { try { await client.query("ROLLBACK"); } catch {} console.warn("⚠️ finished-warehouse: relleno de estilo:", e.message); }
+    }
     const { q, workOrder, po, date } = req.query;
     const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit, 10) || 300));
     const params = [];
@@ -1844,6 +1850,10 @@ function registerFinishedWarehouse(app, deps) {
   //  INVENTORY  +  DASHBOARD
   // ======================================================================
   app.get("/api/finished-inventory", authenticateToken, withClient(async (req, res, client) => {
+    if (!stylesBackfilled) {
+      try { await backfillStyles(client); }
+      catch (e) { try { await client.query("ROLLBACK"); } catch {} console.warn("⚠️ finished-warehouse: relleno de estilo:", e.message); }
+    }
     const { customerId, q } = req.query;
     const params = [];
     let where = "WHERE quantity <> 0";
