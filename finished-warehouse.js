@@ -698,6 +698,21 @@ async function initSchema({ pool, setSchema }) {
     // Traza del movimiento hacia el ticket que lo originó (además de list_id/box_id).
     await client.query("ALTER TABLE finished_inventory_movements ADD COLUMN IF NOT EXISTS ticket_id BIGINT;");
 
+    // Estilo: el QR compacto (FGW2) no lo trae, así que se toma de la orden de
+    // trabajo (igual que el pre-empaque: estilo, o style_code si falta). Rellenamos
+    // los tickets ya escaneados que quedaron sin estilo.
+    try {
+      await client.query(`
+        UPDATE scanned_tickets st
+           SET style = COALESCE(wo.estilo, wo.style_code)
+          FROM work_orders wo
+         WHERE (st.style IS NULL OR st.style = '')
+           AND wo.work_order_no = st.work_order_no
+           AND COALESCE(wo.estilo, wo.style_code) IS NOT NULL`);
+    } catch (e) {
+      console.warn("⚠️ finished-warehouse: no se pudo rellenar el estilo de los tickets:", e.message);
+    }
+
     // Contador de folios por prefijo (p. ej. 'SKM'), incremento atómico para que
     // dos escaneos simultáneos nunca tomen el mismo número.
     await client.query(`
@@ -711,6 +726,60 @@ async function initSchema({ pool, setSchema }) {
   } finally {
     client.release();
   }
+}
+
+// Ingresa un ticket (ya bloqueado con FOR UPDATE y aún pendiente) al inventario:
+// suma sus piezas a finished_inventory, registra el movimiento y lo marca.
+// Lo usan el check-in individual y el masivo; la transacción la abre quien llama.
+async function checkInTicket(client, t, userId) {
+  const qty = Number(t.pieces) || 0;
+
+  // SKU del ticket, consistente con el que arma el pre-empaque.
+  //   po = No. de orden (work_order_no)   ·   mo = PO del cliente (customer_po)
+  const box = {
+    customer_code: t.customer_code || null,
+    po: t.work_order_no || null,
+    style: t.style || null,
+    color_code: colorCodeOf(t.color, t.size_code),
+    size_code: t.size_code || null,
+    sex: null,
+    fabric_code: null,
+  };
+  const sku_key = skuKeyOf(box);
+
+  // Los tickets ingresan piezas sueltas (aún sin encajar): box_count no cambia.
+  const invRes = await client.query(
+    `INSERT INTO finished_inventory
+       (sku_key, customer_id, customer_code, customer_name, po, mo, style, fabric_code,
+        sex, size_code, color_name, color_code, quantity, box_count)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0)
+     ON CONFLICT (sku_key) DO UPDATE SET
+       quantity   = finished_inventory.quantity + EXCLUDED.quantity,
+       updated_at = now()
+     RETURNING id`,
+    [
+      sku_key, t.customer_id, t.customer_code, t.customer_name,
+      t.work_order_no, t.customer_po, t.style, null,
+      null, t.size_code, t.color, colorCodeOf(t.color, t.size_code), qty,
+    ]
+  );
+  const inventoryId = invRes.rows[0].id;
+
+  await client.query(
+    `INSERT INTO finished_inventory_movements (inventory_id, list_id, box_id, ticket_id, direction, quantity, created_by)
+     VALUES ($1, NULL, NULL, $2, 'in', $3, $4)`,
+    [inventoryId, t.id, qty, userId]
+  );
+
+  const upd = await client.query(
+    `UPDATE scanned_tickets
+        SET checked_in_at = now(), checked_in_by = $2, inventory_id = $3
+      WHERE id = $1
+      RETURNING *`,
+    [t.id, userId, inventoryId]
+  );
+
+  return { ticket: upd.rows[0], inventoryId, qty };
 }
 
 function registerFinishedWarehouse(app, deps) {
@@ -947,10 +1016,12 @@ function registerFinishedWarehouse(app, deps) {
     }
 
     // ── Cliente: se resuelve desde la orden de trabajo (wo = work_order_no). ──
+    // El estilo también sale de la orden cuando el QR no lo trae.
     let customer = { id: null, code: null, name: null };
     if (parsed.work_order_no) {
       const cRes = await client.query(
-        `SELECT wo.customer_id, wo.customer_name, c.code AS customer_code
+        `SELECT wo.customer_id, wo.customer_name, c.code AS customer_code,
+                COALESCE(wo.estilo, wo.style_code) AS style
            FROM work_orders wo
            LEFT JOIN customers c ON c.id = wo.customer_id
           WHERE wo.work_order_no = $1
@@ -959,6 +1030,7 @@ function registerFinishedWarehouse(app, deps) {
       );
       if (cRes.rows.length) {
         customer = { id: cRes.rows[0].customer_id, code: cRes.rows[0].customer_code, name: cRes.rows[0].customer_name };
+        if (!parsed.style && cRes.rows[0].style) parsed.style = cRes.rows[0].style;
       }
     }
 
@@ -1001,17 +1073,7 @@ function registerFinishedWarehouse(app, deps) {
     if (workOrder) { params.push(workOrder); where += ` AND work_order_no = $${params.length}`; }
     if (po)        { params.push(po);        where += ` AND customer_po = $${params.length}`; }
     if (date && /^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
-      // Optional ?tz= (browser time zone) so "today" matches the user's day, not the server's.
-      const tz = String(req.query.tz || "").trim();
-      let tzOk = /^[A-Za-z0-9_+\-\/]{1,64}$/.test(tz);
-      if (tzOk) { try { await client.query("SELECT now() AT TIME ZONE $1", [tz]); } catch { tzOk = false; } }
-      params.push(date);
-      if (tzOk) {
-        params.push(tz);
-        where += ` AND (scanned_at AT TIME ZONE $${params.length})::date = $${params.length - 1}::date`;
-      } else {
-        where += ` AND scanned_at::date = $${params.length}::date`;
-      }
+      params.push(date); where += ` AND scanned_at::date = $${params.length}::date`;
     }
     if (q) {
       params.push(`%${q}%`);
@@ -1044,6 +1106,32 @@ function registerFinishedWarehouse(app, deps) {
     res.json({ success: true });
   }));
 
+  // ── Check-in masivo: ingresar varios tickets pendientes de una vez. ───────
+  // Body: { ids: [1, 2, 3…] } (los tickets visibles con los filtros del front).
+  // Todo en una transacción: o entran todos o ninguno. Los que ya estaban
+  // ingresados se saltan sin volver a sumar.
+  app.post("/api/finished-warehouse/scanned-tickets/check-in-bulk", authenticateToken, withClient(async (req, res, client) => {
+    const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : [])
+      .map((x) => parseInt(x, 10)).filter(Number.isInteger))];
+    if (ids.length === 0) return res.status(400).json({ success: false, error: "No hay tickets para ingresar" });
+    if (ids.length > 2000) return res.status(400).json({ success: false, error: "Demasiados tickets en una sola operación (máx. 2000)" });
+
+    await client.query("BEGIN");
+    const tRes = await client.query(
+      `SELECT * FROM scanned_tickets WHERE id = ANY($1) AND checked_in_at IS NULL ORDER BY id FOR UPDATE`, [ids]
+    );
+    const userId = req.user?.id ?? null;
+    const tickets = [];
+    let pieces = 0;
+    for (const t of tRes.rows) {
+      const r = await checkInTicket(client, t, userId);
+      tickets.push(r.ticket);
+      pieces += r.qty;
+    }
+    await client.query("COMMIT");
+    res.json({ success: true, checkedIn: tickets.length, skipped: ids.length - tickets.length, piecesAdded: pieces, tickets });
+  }));
+
   // ── Check-in: mover un ticket escaneado al inventario. ───────────────────
   // Suma las piezas del ticket a finished_inventory (por SKU), registra el
   // movimiento y marca el ticket como ingresado. Idempotente: si el ticket ya
@@ -1067,55 +1155,10 @@ function registerFinishedWarehouse(app, deps) {
       return res.json({ success: true, alreadyCheckedIn: true, ticket: t });
     }
 
-    const qty = Number(t.pieces) || 0;
-
-    // SKU del ticket, consistente con el que arma el pre-empaque.
-    //   po = No. de orden (work_order_no)   ·   mo = PO del cliente (customer_po)
-    const box = {
-      customer_code: t.customer_code || null,
-      po: t.work_order_no || null,
-      style: t.style || null,
-      color_code: colorCodeOf(t.color, t.size_code),
-      size_code: t.size_code || null,
-      sex: null,
-      fabric_code: null,
-    };
-    const sku_key = skuKeyOf(box);
-
-    // Los tickets ingresan piezas sueltas (aún sin encajar): box_count no cambia.
-    const invRes = await client.query(
-      `INSERT INTO finished_inventory
-         (sku_key, customer_id, customer_code, customer_name, po, mo, style, fabric_code,
-          sex, size_code, color_name, color_code, quantity, box_count)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0)
-       ON CONFLICT (sku_key) DO UPDATE SET
-         quantity   = finished_inventory.quantity + EXCLUDED.quantity,
-         updated_at = now()
-       RETURNING id`,
-      [
-        sku_key, t.customer_id, t.customer_code, t.customer_name,
-        t.work_order_no, t.customer_po, t.style, null,
-        null, t.size_code, t.color, colorCodeOf(t.color, t.size_code), qty,
-      ]
-    );
-    const inventoryId = invRes.rows[0].id;
-
-    await client.query(
-      `INSERT INTO finished_inventory_movements (inventory_id, list_id, box_id, ticket_id, direction, quantity, created_by)
-       VALUES ($1, NULL, NULL, $2, 'in', $3, $4)`,
-      [inventoryId, t.id, qty, req.user?.id ?? null]
-    );
-
-    const upd = await client.query(
-      `UPDATE scanned_tickets
-          SET checked_in_at = now(), checked_in_by = $2, inventory_id = $3
-        WHERE id = $1
-        RETURNING *`,
-      [t.id, req.user?.id ?? null, inventoryId]
-    );
+    const { ticket, inventoryId, qty } = await checkInTicket(client, t, req.user?.id ?? null);
 
     await client.query("COMMIT");
-    res.json({ success: true, ticket: upd.rows[0], inventoryId, piecesAdded: qty });
+    res.json({ success: true, ticket, inventoryId, piecesAdded: qty });
   }));
 
   // ── Deshacer check-in: regresar un ticket a "pendiente". ─────────────────
