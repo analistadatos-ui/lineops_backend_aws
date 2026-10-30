@@ -1001,7 +1001,17 @@ function registerFinishedWarehouse(app, deps) {
     if (workOrder) { params.push(workOrder); where += ` AND work_order_no = $${params.length}`; }
     if (po)        { params.push(po);        where += ` AND customer_po = $${params.length}`; }
     if (date && /^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
-      params.push(date); where += ` AND scanned_at::date = $${params.length}::date`;
+      // Optional ?tz= (browser time zone) so "today" matches the user's day, not the server's.
+      const tz = String(req.query.tz || "").trim();
+      let tzOk = /^[A-Za-z0-9_+\-\/]{1,64}$/.test(tz);
+      if (tzOk) { try { await client.query("SELECT now() AT TIME ZONE $1", [tz]); } catch { tzOk = false; } }
+      params.push(date);
+      if (tzOk) {
+        params.push(tz);
+        where += ` AND (scanned_at AT TIME ZONE $${params.length})::date = $${params.length - 1}::date`;
+      } else {
+        where += ` AND scanned_at::date = $${params.length}::date`;
+      }
     }
     if (q) {
       params.push(`%${q}%`);
