@@ -1,0 +1,647 @@
+// ==========================================================================
+// verificador-report.js
+//
+// Pestaña "Reportes semanas bloqueadas" del Verificador.
+//
+//   GET /api/verificador/locked-weeks
+//       Semanas bloqueadas por el CEO (plan-week-locks), con corridas, líneas
+//       y piezas terminadas de cada una.
+//
+//   GET /api/verificador/production-report?week=YYYY-MM-DD[&customer=..][&style=..][&format=json|xlsx]
+//       Producción de UNA semana bloqueada, opcionalmente filtrada por cliente
+//       y/o estilo interno (line_runs.style).
+//         format=json -> vista previa + listas de clientes/estilos para los filtros
+//         format=xlsx -> Excel con 3 hojas, mismo formato que el reporte NIKE:
+//                        Summary (por estilo) · Daily · Production detail
+//       Si la semana NO está bloqueada responde 409.
+//
+// "Output" = piezas de las operaciones de empaque/terminado, con las MISMAS
+// palabras clave que PACKING_KEYWORDS en work-orders.js.
+//
+// Corridas SIN orden ligada (line_runs.work_order_id NULL): el cliente, estilo
+// cliente y temporada se toman de la orden más reciente con el mismo
+// style_code, para que el filtro por cliente no las pierda. En el Excel salen
+// marcadas en rojo (igual que en el reporte NIKE) para que se liguen.
+//
+// "Internal order no." = work_orders.tech_pack_no (el número NKB-… de Nike).
+//
+// --------------------------------------------------------------------------
+// SETUP
+// --------------------------------------------------------------------------
+//   npm install exceljs
+//
+// En server.js, DESPUÉS de POST /api/verificador/update-sewed:
+//     const registerVerificadorReport = require("./verificador-report");
+//     registerVerificadorReport(app, { authenticateToken, pool, setSchema, requireVerificador });
+// ==========================================================================
+
+const ExcelJS = require("exceljs");
+const planWeekLocks = require("./plan-week-locks");
+
+const PACKING_KEYWORDS = ["pack", "emp", "termin", "finish"];
+const PACKING_SQL = PACKING_KEYWORDS
+  .map((k) => `lower(oo.operation_name) LIKE '%${k}%'`)
+  .join(" OR ");
+
+const DOW_ES = ["", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
+const DOW_EN = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// ---------------------------------------------------------------- helpers --
+const pad = (n) => String(n).padStart(2, "0");
+
+function ymd(v) {
+  if (v == null) return null;
+  if (v instanceof Date) {
+    return isNaN(v) ? null : `${v.getFullYear()}-${pad(v.getMonth() + 1)}-${pad(v.getDate())}`;
+  }
+  if (typeof v === "object") return ymd(v.week_start ?? v.weekStart ?? v.date ?? null);
+  const str = String(v).trim();
+  const m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return `${m[1]}-${pad(m[2])}-${pad(m[3])}`;
+  // dd/mm/yyyy (formato local de México)
+  const dmy = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (dmy) return `${dmy[3]}-${pad(dmy[2])}-${pad(dmy[1])}`;
+  // Cualquier otra cosa que Date entienda ("Mon Oct 26 2026 ...", timestamp).
+  const d = new Date(/^\d+$/.test(str) ? Number(str) : str);
+  return isNaN(d) ? null : `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function addDays(s, n) {
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+}
+const utcDate = (s) => {
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d));
+};
+function isoWeek(s) {
+  const dt = utcDate(s);
+  const day = dt.getUTCDay() || 7;
+  dt.setUTCDate(dt.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(dt.getUTCFullYear(), 0, 1));
+  return { year: dt.getUTCFullYear(), week: Math.ceil(((dt - yearStart) / 86400000 + 1) / 7) };
+}
+const num = (v) => {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : 0;
+};
+const round = (v, d = 2) => Math.round(num(v) * 10 ** d) / 10 ** d;
+const lineSort = (a, b) => {
+  const na = Number(a), nb = Number(b);
+  if (Number.isFinite(na) && Number.isFinite(nb)) return nb - na; // L15, L9, L5, L3 como el reporte NIKE
+  return String(a).localeCompare(String(b));
+};
+
+async function listLockedWeeks(client) {
+  const set = await planWeekLocks.lockedWeekSet(client);
+  let raw = [];
+  if (set instanceof Set || Array.isArray(set)) raw = [...set];
+  else if (set instanceof Map) raw = [...set.keys()];
+  else if (set && typeof set === "object") raw = Object.keys(set);
+  const weeks = new Set();
+  for (const v of raw) {
+    const d = ymd(v);
+    if (!d) continue;
+    const ws = ymd(planWeekLocks.weekStartOf(d));
+    if (ws && planWeekLocks.isLockedDay(set, ws)) weeks.add(ws);
+  }
+  return { set, weeks: [...weeks].sort().reverse() };
+}
+
+function weekInfo(weekStart) {
+  const { year, week } = isoWeek(weekStart);
+  return { week_start: weekStart, week_end: addDays(weekStart, 6), iso_year: year, iso_week: week };
+}
+
+function rangeLabel(info) {
+  const [y1, m1, d1] = info.week_start.split("-").map(Number);
+  const [y2, m2, d2] = info.week_end.split("-").map(Number);
+  const a = `${MONTHS_EN[m1 - 1]} ${d1}`;
+  const b = m1 === m2 ? `${d2}` : `${MONTHS_EN[m2 - 1]} ${d2}`;
+  return `Week ${info.iso_week}, ${a}–${b}, ${y2 !== y1 ? `${y1}/${y2}` : y2}`;
+}
+
+// --------------------------------------------------------------- queries ---
+// Una fila por corrida (día + línea + estilo).
+async function fetchRuns(client, from, to) {
+  const { rows } = await client.query(
+    `SELECT lr.id AS run_id,
+            to_char(lr.run_date, 'YYYY-MM-DD') AS run_date,
+            EXTRACT(ISODOW FROM lr.run_date)::int AS dow,
+            lr.line_no, lr.style,
+            lr.operators_count, lr.working_hours, lr.sam_minutes, lr.target_pcs,
+            (wo.id IS NOT NULL) AS linked,
+            wo.work_order_no, wo.customer_po, wo.tech_pack_no,
+            COALESCE(wo.customer_name, fb.customer_name) AS customer_name,
+            COALESCE(wo.estilo, fb.estilo)               AS client_style,
+            COALESCE(wo.season, fb.season)               AS season,
+            COALESCE(p.produced, 0) AS produced,
+            EXISTS (SELECT 1 FROM operator_operations oo
+                     WHERE oo.run_id = lr.id AND (${PACKING_SQL})) AS has_packing_op
+       FROM line_runs lr
+       LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
+       LEFT JOIN LATERAL (
+         SELECT w2.customer_name, w2.estilo, w2.season
+           FROM work_orders w2
+          WHERE lr.work_order_id IS NULL AND w2.style_code = lr.style
+          ORDER BY w2.created_at DESC
+          LIMIT 1
+       ) fb ON true
+       LEFT JOIN LATERAL (
+         SELECT SUM(se.sewed_qty) FILTER (WHERE (${PACKING_SQL})) AS produced
+           FROM operation_sewed_entries se
+           JOIN operator_operations oo ON oo.id = se.operation_id
+          WHERE se.run_id = lr.id
+       ) p ON true
+      WHERE lr.run_date BETWEEN $1::date AND $2::date
+      ORDER BY lr.run_date, lr.line_no, lr.style`,
+    [from, to]
+  );
+
+  return rows.map((r) => {
+    const operators = num(r.operators_count);
+    const hours = round(r.working_hours);
+    const sam = round(r.sam_minutes, 3);
+    const target = round(r.target_pcs, 0);
+    const produced = round(r.produced, 0);
+    const samMin = Math.round(produced * sam);
+    const minutes = Math.round(operators * hours * 60);
+    return {
+      run_id: Number(r.run_id),
+      run_date: r.run_date,
+      day: DOW_ES[r.dow] || "",
+      line_no: r.line_no,
+      style: r.style,
+      customer_name: r.customer_name || null,
+      client_style: r.client_style || null,
+      linked: !!r.linked,
+      work_order_no: r.work_order_no || null,
+      customer_po: r.customer_po || null,
+      tech_pack_no: r.tech_pack_no || null,
+      season: r.season || null,
+      operators,
+      hours,
+      sam,
+      target,
+      produced,
+      difference: produced - target,
+      fulfillment_pct: target > 0 ? round((produced * 100) / target, 1) : null,
+      sam_min: samMin,
+      minutes,
+      efficiency_pct: minutes > 0 ? round((samMin * 100) / minutes, 1) : null,
+      has_packing_op: !!r.has_packing_op,
+    };
+  });
+}
+
+function totalsOf(rows) {
+  const t = rows.reduce(
+    (a, r) => {
+      a.runs += 1;
+      a.target += r.target;
+      a.produced += r.produced;
+      a.sam_min += r.sam_min;
+      a.minutes += r.minutes;
+      a.lines.add(String(r.line_no));
+      if (!r.has_packing_op) a.noPack += 1;
+      if (!r.linked) a.unlinked += 1;
+      return a;
+    },
+    { runs: 0, target: 0, produced: 0, sam_min: 0, minutes: 0, lines: new Set(), noPack: 0, unlinked: 0 }
+  );
+  return {
+    runs: t.runs,
+    lines: t.lines.size,
+    target: t.target,
+    produced: t.produced,
+    difference: t.produced - t.target,
+    fulfillment_pct: t.target > 0 ? round((t.produced * 100) / t.target, 1) : null,
+    efficiency_pct: t.minutes > 0 ? round((t.sam_min * 100) / t.minutes, 1) : null,
+    runs_without_packing_op: t.noPack,
+    runs_without_order: t.unlinked,
+  };
+}
+
+// Opciones para los filtros (de la semana completa, sin filtrar).
+function filterOptions(rows) {
+  const customers = [...new Set(rows.map((r) => r.customer_name).filter(Boolean))].sort();
+  const styleMap = new Map();
+  for (const r of rows) {
+    if (!styleMap.has(r.style)) styleMap.set(r.style, { style: r.style, client_style: r.client_style, customer_name: r.customer_name });
+  }
+  const styles = [...styleMap.values()].sort((a, b) => a.style.localeCompare(b.style));
+  return { customers, styles };
+}
+
+function applyFilters(rows, { customer, style }) {
+  return rows.filter(
+    (r) =>
+      (!customer || (r.customer_name || "") === customer) &&
+      (!style || r.style === style)
+  );
+}
+
+// ------------------------------------------------------------------ XLSX ---
+const FONT = "Arial";
+const NAVY = "FF1F3864";
+const F_HEAD = { name: FONT, size: 10, bold: true, color: { argb: "FFFFFFFF" } };
+const F_BODY = { name: FONT, size: 10, color: { argb: "FF000000" } };
+const F_BOLD = { name: FONT, size: 10, bold: true, color: { argb: "FF000000" } };
+const F_TITLE = { name: FONT, size: 14, bold: true };
+const F_NOTE = { name: FONT, size: 9, color: { argb: "FF595959" } };
+const fill = (argb) => ({ type: "pattern", pattern: "solid", fgColor: { argb } });
+const FILL_HEAD = fill(NAVY);
+const FILL_TOTAL = fill("FFD9E1F2");
+const FILL_GREY = fill("FFF2F2F2");
+const FILL_RED = fill("FFFCE4D6");
+const FILL_YELLOW = fill("FFFFF2CC");
+const FMT_INT = "#,##0;\\-#,##0;\\-";
+const FMT_PCT = "0.0%";
+const FMT_DATE = "yyyy\\-mm\\-dd";
+
+function header(ws, rowNo, labels) {
+  const row = ws.getRow(rowNo);
+  labels.forEach((l, i) => {
+    const c = row.getCell(i + 1);
+    c.value = l;
+    c.font = F_HEAD;
+    c.fill = FILL_HEAD;
+    c.alignment = { vertical: "middle", wrapText: true };
+  });
+  row.height = 28;
+}
+function title(ws, text, note) {
+  ws.getCell("A1").value = text;
+  ws.getCell("A1").font = F_TITLE;
+  ws.getCell("A2").value = note;
+  ws.getCell("A2").font = F_NOTE;
+}
+function styleRow(row, n, { font = F_BODY, fillAll = null } = {}) {
+  for (let i = 1; i <= n; i++) {
+    const c = row.getCell(i);
+    c.font = font;
+    if (fillAll) c.fill = fillAll;
+  }
+}
+const F = (formula, result) => ({ formula, result });
+const safeDiv = (a, b) => (b ? a / b : "");
+
+async function buildWorkbook(rows, info, { customer, style }) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "SKM production system";
+  wb.created = new Date();
+
+  const who = customer ? customer.toUpperCase() : "All clients";
+  const tag = customer || "Client";
+  const range = rangeLabel(info);
+  const today = new Date().toISOString().slice(0, 10);
+  const filterNote = `Filters: client = ${customer || "all"}; style = ${style || "all"}.`;
+
+  // ------------------------------------------------ Production detail ----
+  const det = wb.addWorksheet("Production detail", { views: [{ state: "frozen", ySplit: 4, showGridLines: false }] });
+  title(
+    det,
+    `${who} Production Detail – ${range}`,
+    `One row per day + line + style. Fill the ${tag} internal order no. (yellow column). Rows in red have no work order linked in the system. ${filterNote}`
+  );
+  const detCols = [
+    "Date", "Line", "Style", "Client", `${tag} style`, "Work order", "Customer PO",
+    `${tag} internal order no.`, "Season", "Operators", "Hours", "SAM",
+    "Target (pcs)", "Output (pcs)", "Achievement %", "SAM min produced", "Minutes available", "Efficiency %",
+  ];
+  header(det, 4, detCols);
+  [11, 6, 11, 14, 11, 26, 18, 20, 9, 10, 8, 7, 11, 11, 12, 13, 13, 11].forEach((w, i) => (det.getColumn(i + 1).width = w));
+
+  const first = 5;
+  const last = first + rows.length - 1;
+  rows.forEach((r, i) => {
+    const n = first + i;
+    const lineNum = Number(r.line_no);
+    const row = det.getRow(n);
+    row.values = [
+      utcDate(r.run_date),
+      Number.isFinite(lineNum) ? lineNum : r.line_no,
+      r.style,
+      r.customer_name || "",
+      r.client_style || "",
+      r.work_order_no || "",
+      r.customer_po || "",
+      r.tech_pack_no || "",
+      r.season || "",
+      r.operators,
+      r.hours,
+      r.sam,
+      r.target,
+      r.produced,
+      F(`IF(M${n}=0,"",N${n}/M${n})`, safeDiv(r.produced, r.target)),
+      F(`ROUND(N${n}*L${n},0)`, r.sam_min),
+      F(`J${n}*K${n}*60`, r.minutes),
+      F(`IF(Q${n}=0,"",P${n}/Q${n})`, safeDiv(r.sam_min, r.minutes)),
+    ];
+    styleRow(row, detCols.length);
+    row.getCell(1).numFmt = FMT_DATE;
+    row.getCell(2).numFmt = "0";
+    row.getCell(7).numFmt = "@";
+    row.getCell(10).numFmt = "0";
+    row.getCell(11).numFmt = "0.00";
+    row.getCell(12).numFmt = "0.00";
+    [13, 14, 16, 17].forEach((c) => (row.getCell(c).numFmt = FMT_INT));
+    [15, 18].forEach((c) => (row.getCell(c).numFmt = FMT_PCT));
+    row.getCell(8).fill = FILL_YELLOW;
+    if (!r.linked) {
+      row.getCell(6).fill = FILL_RED;
+      row.getCell(7).fill = FILL_RED;
+    }
+  });
+
+  const tot = totalsOf(rows);
+  const avgOps = rows.length ? Math.round(rows.reduce((s, r) => s + r.operators, 0) / rows.length) : 0;
+  const dT = last + 1;
+  const dRow = det.getRow(dT);
+  dRow.getCell(1).value = "TOTAL";
+  dRow.getCell(10).value = F(`ROUND(AVERAGE(J${first}:J${last}),0)`, avgOps);
+  dRow.getCell(13).value = F(`SUM(M${first}:M${last})`, tot.target);
+  dRow.getCell(14).value = F(`SUM(N${first}:N${last})`, tot.produced);
+  dRow.getCell(15).value = F(`IF(M${dT}=0,"",N${dT}/M${dT})`, safeDiv(tot.produced, tot.target));
+  const samSum = rows.reduce((s, r) => s + r.sam_min, 0);
+  const minSum = rows.reduce((s, r) => s + r.minutes, 0);
+  dRow.getCell(16).value = F(`SUM(P${first}:P${last})`, samSum);
+  dRow.getCell(17).value = F(`SUM(Q${first}:Q${last})`, minSum);
+  dRow.getCell(18).value = F(`IF(Q${dT}=0,"",P${dT}/Q${dT})`, safeDiv(samSum, minSum));
+  styleRow(dRow, detCols.length, { font: F_BOLD, fillAll: FILL_TOTAL });
+  dRow.getCell(10).numFmt = "0";
+  [13, 14, 16, 17].forEach((c) => (dRow.getCell(c).numFmt = FMT_INT));
+  [15, 18].forEach((c) => (dRow.getCell(c).numFmt = FMT_PCT));
+  det.autoFilter = { from: { row: 4, column: 1 }, to: { row: last, column: detCols.length } };
+
+  const D = (col) => `'Production detail'!$${col}$${first}:$${col}$${last}`;
+
+  // ------------------------------------------------------------ Summary ----
+  const sum = wb.addWorksheet("Summary", { views: [{ showGridLines: false }] });
+  title(
+    sum,
+    `${who} Production Summary – ${range}`,
+    `Internal and ${tag} style are the same garment and are combined. Figures are calculated from the 'Production detail' sheet. ${filterNote}`
+  );
+  const sumCols = [
+    "Style", "Client", `${tag} style`, "Line-days", "Avg operators", "Target (pcs)", "Output (pcs)",
+    "Achievement %", "SAM", "SAM min produced", "Minutes available", "Efficiency %",
+  ];
+  header(sum, 4, sumCols);
+  [12, 14, 11, 10, 12, 13, 13, 13, 8, 15, 15, 12].forEach((w, i) => (sum.getColumn(i + 1).width = w));
+
+  const byStyle = new Map();
+  for (const r of rows) {
+    const g = byStyle.get(r.style) || { style: r.style, clients: new Set(), cstyles: new Set(), rows: [] };
+    if (r.customer_name) g.clients.add(r.customer_name);
+    if (r.client_style) g.cstyles.add(r.client_style);
+    g.rows.push(r);
+    byStyle.set(r.style, g);
+  }
+  const groups = [...byStyle.values()].sort((a, b) => a.style.localeCompare(b.style));
+  groups.forEach((g, i) => {
+    const n = 5 + i;
+    const s = (k) => g.rows.reduce((a, r) => a + r[k], 0);
+    const cnt = g.rows.length, ops = s("operators"), tg = s("target"), out = s("produced"), sm = s("sam_min"), mn = s("minutes");
+    const row = sum.getRow(n);
+    row.values = [
+      g.style,
+      [...g.clients].join(", "),
+      [...g.cstyles].join(", "),
+      F(`COUNTIF(${D("C")},A${n})`, cnt),
+      F(`IF(D${n}=0,"",ROUND(SUMIF(${D("C")},A${n},${D("J")})/D${n},0))`, cnt ? Math.round(ops / cnt) : ""),
+      F(`SUMIF(${D("C")},A${n},${D("M")})`, tg),
+      F(`SUMIF(${D("C")},A${n},${D("N")})`, out),
+      F(`IF(F${n}=0,"",G${n}/F${n})`, safeDiv(out, tg)),
+      F(`IF(G${n}=0,"",J${n}/G${n})`, safeDiv(sm, out)),
+      F(`SUMIF(${D("C")},A${n},${D("P")})`, sm),
+      F(`SUMIF(${D("C")},A${n},${D("Q")})`, mn),
+      F(`IF(K${n}=0,"",J${n}/K${n})`, safeDiv(sm, mn)),
+    ];
+    styleRow(row, sumCols.length);
+    row.getCell(4).numFmt = "0";
+    row.getCell(5).numFmt = "0";
+    [6, 7, 10, 11].forEach((c) => (row.getCell(c).numFmt = FMT_INT));
+    [8, 12].forEach((c) => (row.getCell(c).numFmt = FMT_PCT));
+    row.getCell(9).numFmt = "0.00";
+  });
+  const sF = 5, sL = 4 + groups.length, sT = sL + 1;
+  const sRow = sum.getRow(sT);
+  sRow.values = [
+    "TOTAL", "", "",
+    F(`SUM(D${sF}:D${sL})`, rows.length),
+    F(`ROUND(AVERAGE(${D("J")}),0)`, avgOps),
+    F(`SUM(F${sF}:F${sL})`, tot.target),
+    F(`SUM(G${sF}:G${sL})`, tot.produced),
+    F(`IF(F${sT}=0,"",G${sT}/F${sT})`, safeDiv(tot.produced, tot.target)),
+    F(`IF(G${sT}=0,"",J${sT}/G${sT})`, safeDiv(samSum, tot.produced)),
+    F(`SUM(J${sF}:J${sL})`, samSum),
+    F(`SUM(K${sF}:K${sL})`, minSum),
+    F(`IF(K${sT}=0,"",J${sT}/K${sT})`, safeDiv(samSum, minSum)),
+  ];
+  styleRow(sRow, sumCols.length, { font: F_BOLD, fillAll: FILL_TOTAL });
+  sRow.getCell(4).numFmt = "0";
+  sRow.getCell(5).numFmt = "0";
+  [6, 7, 10, 11].forEach((c) => (sRow.getCell(c).numFmt = FMT_INT));
+  [8, 12].forEach((c) => (sRow.getCell(c).numFmt = FMT_PCT));
+  sRow.getCell(9).numFmt = "0.00";
+  [
+    "Efficiency = SAM minutes produced ÷ minutes available (operators × hours × 60).",
+    "Achievement = output ÷ target. SAM = SAM minutes produced ÷ output. Output = pieces captured on packing/finishing operations.",
+    `Source: SKM production system (line runs), locked week, exported ${today}.`,
+  ].forEach((t, i) => {
+    const c = sum.getCell(`A${sT + 2 + i}`);
+    c.value = t;
+    c.font = F_NOTE;
+  });
+
+  // -------------------------------------------------------------- Daily ----
+  const day = wb.addWorksheet("Daily", { views: [{ state: "frozen", ySplit: 4, showGridLines: false }] });
+  title(day, `${who} Production by Day – ${range}`, `Calculated from the 'Production detail' sheet. Grey = no production. ${filterNote}`);
+  const dayCols = [
+    "Date", "Day", "Lines & styles", "Line-days", "Target (pcs)", "Output (pcs)",
+    "Achievement %", "SAM min produced", "Minutes available", "Efficiency %",
+  ];
+  header(day, 4, dayCols);
+  [11, 6, 56, 10, 13, 13, 13, 15, 15, 12].forEach((w, i) => (day.getColumn(i + 1).width = w));
+
+  for (let i = 0; i < 7; i++) {
+    const ds = addDays(info.week_start, i);
+    const n = 5 + i;
+    const dr = rows.filter((r) => r.run_date === ds);
+    const byLine = new Map();
+    for (const r of dr) {
+      const k = String(r.line_no);
+      if (!byLine.has(k)) byLine.set(k, []);
+      if (!byLine.get(k).includes(r.style)) byLine.get(k).push(r.style);
+    }
+    const lines = [...byLine.keys()].sort(lineSort).map((k) => `L${k}: ${byLine.get(k).join(" → ")}`).join(" | ");
+    const s = (k) => dr.reduce((a, r) => a + r[k], 0);
+    const tg = s("target"), out = s("produced"), sm = s("sam_min"), mn = s("minutes");
+    const row = day.getRow(n);
+    row.values = [
+      utcDate(ds),
+      DOW_EN[utcDate(ds).getUTCDay()],
+      lines,
+      F(`COUNTIF(${D("A")},A${n})`, dr.length),
+      F(`SUMIF(${D("A")},A${n},${D("M")})`, tg),
+      F(`SUMIF(${D("A")},A${n},${D("N")})`, out),
+      F(`IF(E${n}=0,"",F${n}/E${n})`, safeDiv(out, tg)),
+      F(`SUMIF(${D("A")},A${n},${D("P")})`, sm),
+      F(`SUMIF(${D("A")},A${n},${D("Q")})`, mn),
+      F(`IF(I${n}=0,"",H${n}/I${n})`, safeDiv(sm, mn)),
+    ];
+    if (dr.length) styleRow(row, dayCols.length);
+    else styleRow(row, dayCols.length, { font: { ...F_BODY, color: { argb: "FF808080" } }, fillAll: FILL_GREY });
+    row.getCell(1).numFmt = FMT_DATE;
+    row.getCell(4).numFmt = "0";
+    [5, 6, 8, 9].forEach((c) => (row.getCell(c).numFmt = FMT_INT));
+    [7, 10].forEach((c) => (row.getCell(c).numFmt = FMT_PCT));
+  }
+  const yT = 12;
+  const daysWith = new Set(rows.map((r) => r.run_date)).size;
+  const yRow = day.getRow(yT);
+  yRow.values = [
+    "TOTAL", "",
+    F(`COUNTIF(D5:D11,">0")&" days with production"`, `${daysWith} days with production`),
+    F("SUM(D5:D11)", rows.length),
+    F("SUM(E5:E11)", tot.target),
+    F("SUM(F5:F11)", tot.produced),
+    F(`IF(E${yT}=0,"",F${yT}/E${yT})`, safeDiv(tot.produced, tot.target)),
+    F("SUM(H5:H11)", samSum),
+    F("SUM(I5:I11)", minSum),
+    F(`IF(I${yT}=0,"",H${yT}/I${yT})`, safeDiv(samSum, minSum)),
+  ];
+  styleRow(yRow, dayCols.length, { font: F_BOLD, fillAll: FILL_TOTAL });
+  yRow.getCell(4).numFmt = "0";
+  [5, 6, 8, 9].forEach((c) => (yRow.getCell(c).numFmt = FMT_INT));
+  [7, 10].forEach((c) => (yRow.getCell(c).numFmt = FMT_PCT));
+
+  // Mismo orden de hojas que el reporte NIKE: Summary, Daily, Production detail.
+  sum.orderNo = 0;
+  day.orderNo = 1;
+  det.orderNo = 2;
+  wb.worksheets.sort((a, b) => a.orderNo - b.orderNo);
+
+  return wb;
+}
+
+// ---------------------------------------------------------------- routes ---
+function registerVerificadorReport(app, { authenticateToken, pool, setSchema, requireVerificador }) {
+  if (typeof requireVerificador !== "function") {
+    throw new Error("verificador-report: falta requireVerificador (regístralo después de su definición en server.js)");
+  }
+
+  app.get("/api/verificador/locked-weeks", authenticateToken, requireVerificador, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { weeks } = await listLockedWeeks(client);
+      if (weeks.length === 0) return res.json({ success: true, weeks: [] });
+
+      const from = weeks[weeks.length - 1];
+      const to = addDays(weeks[0], 6);
+      const { rows } = await client.query(
+        `SELECT to_char(lr.run_date, 'YYYY-MM-DD') AS run_date,
+                lr.line_no,
+                COUNT(DISTINCT lr.id)::int AS runs,
+                COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_SQL})), 0) AS produced
+           FROM line_runs lr
+           LEFT JOIN operation_sewed_entries se ON se.run_id = lr.id
+           LEFT JOIN operator_operations oo     ON oo.id = se.operation_id
+          WHERE lr.run_date BETWEEN $1::date AND $2::date
+          GROUP BY lr.run_date, lr.line_no`,
+        [from, to]
+      );
+
+      const byWeek = new Map(weeks.map((w) => [w, { runs: 0, produced: 0, lines: new Set() }]));
+      for (const r of rows) {
+        const agg = byWeek.get(ymd(planWeekLocks.weekStartOf(r.run_date)));
+        if (!agg) continue;
+        agg.runs += r.runs;
+        agg.produced += num(r.produced);
+        agg.lines.add(String(r.line_no));
+      }
+      res.json({
+        success: true,
+        weeks: weeks.map((w) => {
+          const a = byWeek.get(w);
+          return { ...weekInfo(w), runs: a.runs, lines: a.lines.size, produced: round(a.produced, 0) };
+        }),
+      });
+    } catch (err) {
+      console.error("❌ /api/verificador/locked-weeks error:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get("/api/verificador/production-report", authenticateToken, requireVerificador, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+
+      // Acepta ?week= o ?weekStart= / ?week_start= por si el frontend manda otro nombre.
+      const rawWeek = req.query.week ?? req.query.weekStart ?? req.query.week_start;
+      const asked = ymd(Array.isArray(rawWeek) ? rawWeek[0] : rawWeek);
+      if (!asked) {
+        console.warn("⚠️  production-report sin semana válida. query =", JSON.stringify(req.query));
+        return res.status(400).json({
+          success: false,
+          error: `Parámetro week requerido (YYYY-MM-DD). Se recibió: ${rawWeek === undefined ? "nada" : JSON.stringify(rawWeek)}.`,
+        });
+      }
+      const format = req.query.format === "xlsx" ? "xlsx" : "json";
+      const filters = {
+        customer: String(req.query.customer || "").trim() || null,
+        style: String(req.query.style || "").trim() || null,
+      };
+
+      const weekStart = ymd(planWeekLocks.weekStartOf(asked));
+      const set = await planWeekLocks.lockedWeekSet(client);
+      if (!weekStart || !planWeekLocks.isLockedDay(set, weekStart)) {
+        return res.status(409).json({
+          success: false,
+          notLocked: true,
+          error: "La semana no está bloqueada. El reporte solo se genera para semanas bloqueadas.",
+        });
+      }
+
+      const info = weekInfo(weekStart);
+      const all = await fetchRuns(client, info.week_start, info.week_end);
+      const rows = applyFilters(all, filters);
+
+      if (format === "json") {
+        return res.json({
+          success: true,
+          week: info,
+          filters,
+          options: filterOptions(all),
+          rows,
+          totals: totalsOf(rows),
+        });
+      }
+
+      if (rows.length === 0) {
+        return res.status(404).json({ success: false, error: "No hay producción para esa semana con esos filtros." });
+      }
+      const wb = await buildWorkbook(rows, info, filters);
+      const buf = await wb.xlsx.writeBuffer();
+      const tag = `${info.iso_year}-W${pad(info.iso_week)}`;
+      const who = (filters.customer || "All").replace(/[^A-Za-z0-9_-]+/g, "_");
+      const st = filters.style ? `_${filters.style.replace(/[^A-Za-z0-9_-]+/g, "_")}` : "";
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="${who}_Production_Report_${tag}${st}.xlsx"`);
+      return res.send(Buffer.from(buf));
+    } catch (err) {
+      console.error("❌ /api/verificador/production-report error:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+}
+
+module.exports = registerVerificadorReport;
+module.exports._buildWorkbook = buildWorkbook; // para pruebas
