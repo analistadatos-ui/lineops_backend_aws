@@ -2076,6 +2076,9 @@ app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerif
 });
 
 
+ const registerVerificadorReport = require("./verificador-report");
+   registerVerificadorReport(app, { authenticateToken, pool, setSchema, requireVerificador });
+
 // ✅ Confirm & save a batch of printed tickets.
 // Called from the line-leader ticket builder when the leader presses
 // "Confirmar y guardar" on the generated tickets. Persists what was printed so
