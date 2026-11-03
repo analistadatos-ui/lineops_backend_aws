@@ -1252,6 +1252,9 @@ registerSupermarketPlan(app, {
 const registerEfficiencyPermissions = require("./efficiency-permissions");
 registerEfficiencyPermissions(app, { authenticateToken, pool, setSchema });
 
+const verificadorActivity = require("./verificador-activity");
+verificadorActivity(app, { authenticateToken, pool, setSchema });
+
 // 🔒 Bloqueo de semanas del Plan Board. lockerRoles = roles que pueden bloquear.
 planWeekLocks(app, { authenticateToken, pool, setSchema, lockerRoles: ["ceo", "skyrina", "master"] });
 
@@ -1997,6 +2000,7 @@ app.get("/api/verificador/run/:runId/sewed", authenticateToken, requireVerificad
  * POST /api/verificador/update-sewed/:runId
  * body: { entries: [{ operatorNo, operationName, slotLabel, sewedQty }] }
  * Sobrescribe las cantidades cosidas capturadas por el líder de línea.
+ * Las celdas que cambian quedan en la bitácora y le llegan como aviso al CEO.
  */
 app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerificador, async (req, res) => {
   const client = await pool.connect();
@@ -2013,6 +2017,7 @@ app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerif
     }
 
     let updatedCount = 0;
+    const changes = []; // { operatorNo, operationName, slotLabel, from, to } — para el aviso al CEO
 
     for (const entry of entries) {
       const { operatorNo, operationName, slotLabel, sewedQty } = entry;
@@ -2036,17 +2041,31 @@ app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerif
       if (slotResult.rows.length === 0) continue;
       const slotId = slotResult.rows[0].id;
 
+      // Valor ANTES del cambio (sin fila = 0).
+      const prev = await client.query(
+        `SELECT sewed_qty FROM operation_sewed_entries WHERE operation_id = $1 AND slot_id = $2`,
+        [operationId, slotId]
+      );
+      const before = Number(prev.rows[0]?.sewed_qty || 0);
+      const after = Number(sewedQty || 0);
+
       await client.query(
         `INSERT INTO operation_sewed_entries (run_id, operation_id, slot_id, sewed_qty, created_at, updated_at)
          VALUES ($1, $2, $3, $4, now(), now())
          ON CONFLICT (operation_id, slot_id)
          DO UPDATE SET sewed_qty = EXCLUDED.sewed_qty, updated_at = now()`,
-        [runId, operationId, slotId, Number(sewedQty || 0)]
+        [runId, operationId, slotId, after]
       );
       updatedCount++;
+      if (before !== after) {
+        changes.push({ operatorNo, operationName, slotLabel, from: before, to: after });
+      }
     }
 
     await client.query("COMMIT");
+
+    // Aviso al CEO (solo si algo cambió). Nunca lanza.
+    await verificadorActivity.logCorrection(client, { runId, user: req.user, changes });
 
     // Recalcula el estado de la ORDEN según lo producido (mismo criterio que el
     // líder de línea). Va fuera de la transacción ya commiteada, para que lea las
@@ -2065,7 +2084,7 @@ app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerif
       console.warn("⚠️  recálculo de estado de la orden falló (el guardado sí se realizó):", e.message);
     }
 
-    res.json({ success: true, updatedCount, statusChange });
+    res.json({ success: true, updatedCount, changedCount: changes.length, statusChange });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ /api/verificador/update-sewed error:", err.message);
