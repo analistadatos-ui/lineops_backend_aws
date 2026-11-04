@@ -11,8 +11,13 @@
 //       Producción de UNA semana bloqueada, opcionalmente filtrada por cliente
 //       y/o estilo interno (line_runs.style).
 //         format=json -> vista previa + listas de clientes/estilos para los filtros
-//         format=xlsx -> Excel con 3 hojas, mismo formato que el reporte NIKE:
-//                        Summary (por estilo) · Daily · Production detail
+//         format=xlsx -> Excel con 5 hojas, mismo formato que el reporte NIKE:
+//                        Summary (por estilo) · Daily · Production detail ·
+//                        Forward schedule · Plan by week
+//       Forward schedule / Plan by week = lo PLANEADO desde hoy hasta el viernes
+//       de la semana actual + 4 (line_assignments del Plan Board), con los
+//       mismos filtros de cliente/estilo. Cada asignación se reparte en partes
+//       iguales entre sus días hábiles (lun–vie) de planned_start a planned_end.
 //       Si la semana NO está bloqueada responde 409.
 //
 // "Output" = piezas de las operaciones de empaque/terminado, con las MISMAS
@@ -37,6 +42,8 @@
 
 const ExcelJS = require("exceljs");
 const planWeekLocks = require("./plan-week-locks");
+// Avisa al panel del CEO cada vez que se descarga el Excel.
+const verificadorActivity = require("./verificador-activity");
 
 const PACKING_KEYWORDS = ["pack", "emp", "termin", "finish"];
 const PACKING_SQL = PACKING_KEYWORDS
@@ -241,6 +248,101 @@ function applyFilters(rows, { customer, style }) {
   );
 }
 
+// ------------------------------------------------------- forward plan ----
+const FORWARD_WEEKS = 4; // semana actual + 4
+
+function todayYmd() {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+const dowUtc = (s) => utcDate(s).getUTCDay(); // 0 = domingo
+const mondayOf = (s) => addDays(s, -((dowUtc(s) + 6) % 7));
+const isWorkday = (s) => {
+  const d = dowUtc(s);
+  return d >= 1 && d <= 5;
+};
+function workdaysBetween(from, to) {
+  const out = [];
+  for (let d = from; d <= to; d = addDays(d, 1)) if (isWorkday(d)) out.push(d);
+  return out;
+}
+
+function forwardWindow() {
+  const from = todayYmd();
+  const to = addDays(mondayOf(from), FORWARD_WEEKS * 7 + 4); // viernes de la semana +4
+  return { from, to };
+}
+
+// Una fila por día hábil + asignación (línea + orden).
+async function fetchForward(client, { from, to }) {
+  const { rows } = await client.query(
+    `SELECT la.id, la.line_no,
+            to_char(COALESCE(la.planned_start_date, la.assigned_date), 'YYYY-MM-DD') AS ps,
+            to_char(COALESCE(la.planned_end_date, la.planned_start_date, la.assigned_date), 'YYYY-MM-DD') AS pe,
+            la.assigned_quantity,
+            COALESCE(NULLIF(TRIM(la.color), ''), wo.color) AS color,
+            wo.work_order_no, wo.customer_name, wo.style_code, wo.estilo,
+            wo.customer_po, wo.tech_pack_no, wo.season
+       FROM line_assignments la
+       JOIN work_orders wo ON wo.id = la.work_order_id
+      WHERE la.status NOT IN ('cancelled', 'completed')
+        AND wo.status <> 'completed'
+        AND COALESCE(la.planned_end_date, la.planned_start_date, la.assigned_date) >= $1::date
+        AND COALESCE(la.planned_start_date, la.assigned_date) <= $2::date`,
+    [from, to]
+  );
+
+  const out = [];
+  for (const r of rows) {
+    const ps = r.ps;
+    const pe = r.pe < ps ? ps : r.pe;
+    let days = workdaysBetween(ps, pe);
+    if (!days.length) days = [ps]; // asignación solo en fin de semana: se deja en su día
+    const total = Math.round(num(r.assigned_quantity));
+    const base = Math.floor(total / days.length);
+    let rest = total - base * days.length;
+    days.forEach((d) => {
+      const qty = base + (rest > 0 ? 1 : 0);
+      if (rest > 0) rest -= 1;
+      if (d < from || d > to || qty <= 0) return;
+      const lineNum = Number(r.line_no);
+      out.push({
+        date: d,
+        week_of: mondayOf(d),
+        line_no: Number.isFinite(lineNum) ? lineNum : r.line_no,
+        style: r.style_code || "",
+        customer_name: r.customer_name || null,
+        client_style: r.estilo || null,
+        work_order_no: r.work_order_no,
+        customer_po: r.customer_po || null,
+        tech_pack_no: r.tech_pack_no || null,
+        season: r.season || null,
+        color: r.color || null,
+        qty,
+        planned_start: ps,
+        planned_end: pe,
+      });
+    });
+  }
+  out.sort(
+    (a, b) =>
+      a.date.localeCompare(b.date) ||
+      String(a.line_no).localeCompare(String(b.line_no), undefined, { numeric: true }) ||
+      String(a.work_order_no).localeCompare(String(b.work_order_no))
+  );
+  return out;
+}
+
+function forwardSummary(rows, win) {
+  return {
+    from: win.from,
+    to: win.to,
+    rows: rows.length,
+    planned: rows.reduce((s, r) => s + r.qty, 0),
+    lines: new Set(rows.map((r) => String(r.line_no))).size,
+  };
+}
+
 // ------------------------------------------------------------------ XLSX ---
 const FONT = "Arial";
 const NAVY = "FF1F3864";
@@ -286,7 +388,7 @@ function styleRow(row, n, { font = F_BODY, fillAll = null } = {}) {
 const F = (formula, result) => ({ formula, result });
 const safeDiv = (a, b) => (b ? a / b : "");
 
-async function buildWorkbook(rows, info, { customer, style }) {
+async function buildWorkbook(rows, info, { customer, style }, forward = { rows: [], win: forwardWindow() }) {
   const wb = new ExcelJS.Workbook();
   wb.creator = "SKM production system";
   wb.created = new Date();
@@ -517,10 +619,143 @@ async function buildWorkbook(rows, info, { customer, style }) {
   [5, 6, 8, 9].forEach((c) => (yRow.getCell(c).numFmt = FMT_INT));
   [7, 10].forEach((c) => (yRow.getCell(c).numFmt = FMT_PCT));
 
-  // Mismo orden de hojas que el reporte NIKE: Summary, Daily, Production detail.
+  // ---------------------------------------------------- Forward schedule ----
+  const fw = forward.rows || [];
+  const win = forward.win;
+  const fws = wb.addWorksheet("Forward schedule", { views: [{ state: "frozen", ySplit: 4, showGridLines: false }] });
+  const fmtShort = (s) => {
+    const [y, m, d] = s.split("-").map(Number);
+    return { md: `${MONTHS_EN[m - 1]} ${d}`, y };
+  };
+  const wf = fmtShort(win.from), wt = fmtShort(win.to);
+  title(
+    fws,
+    `${who} Forward Production Schedule – ${wf.md} to ${wt.md}, ${wt.y} (current week + ${FORWARD_WEEKS} weeks)`,
+    `Planned qty per working day (Mon–Fri) = assigned quantity of each Plan Board assignment spread evenly from its planned start to its planned end. ` +
+      `Fill the ${tag} internal order no. (yellow column) where missing. ${filterNote}`
+  );
+  const fwCols = [
+    "Date", "Day", "Week of", "Line", "Style", "Client", `${tag} style`, "Work order", "Customer PO",
+    `${tag} internal order no.`, "Season", "Color", "Planned qty (pcs)", "Planned start", "Planned end",
+  ];
+  header(fws, 4, fwCols);
+  [11, 6, 11, 6, 11, 14, 11, 26, 18, 20, 9, 8, 13, 12, 12].forEach((w, i) => (fws.getColumn(i + 1).width = w));
+  const fF = 5, fL = fF + fw.length - 1;
+  fw.forEach((r, i) => {
+    const row = fws.getRow(fF + i);
+    row.values = [
+      utcDate(r.date), DOW_EN[dowUtc(r.date)], utcDate(r.week_of), r.line_no, r.style,
+      r.customer_name || "", r.client_style || "", r.work_order_no || "", r.customer_po || "",
+      r.tech_pack_no || "", r.season || "", r.color || "", r.qty,
+      utcDate(r.planned_start), utcDate(r.planned_end),
+    ];
+    styleRow(row, fwCols.length);
+    [1, 3, 14, 15].forEach((c) => (row.getCell(c).numFmt = FMT_DATE));
+    row.getCell(4).numFmt = "0";
+    row.getCell(9).numFmt = "@";
+    row.getCell(13).numFmt = FMT_INT;
+    row.getCell(10).fill = FILL_YELLOW;
+  });
+  const plannedTotal = fw.reduce((s, r) => s + r.qty, 0);
+  const fT = fw.length ? fL + 1 : fF;
+  const fTot = fws.getRow(fT);
+  fTot.getCell(1).value = "TOTAL";
+  fTot.getCell(13).value = fw.length ? F(`SUM(M${fF}:M${fL})`, plannedTotal) : 0;
+  styleRow(fTot, fwCols.length, { font: F_BOLD, fillAll: FILL_TOTAL });
+  fTot.getCell(13).numFmt = FMT_INT;
+  if (fw.length) fws.autoFilter = { from: { row: 4, column: 1 }, to: { row: fL, column: fwCols.length } };
+  else {
+    const c = fws.getCell(`A${fT + 2}`);
+    c.value = "No planned production in this window for the selected filters.";
+    c.font = F_NOTE;
+  }
+
+  // -------------------------------------------------------- Plan by week ----
+  const pbw = wb.addWorksheet("Plan by week", { views: [{ state: "frozen", xSplit: 3, ySplit: 4, showGridLines: false }] });
+  title(
+    pbw,
+    `${who} Planned Quantity by Line and Week`,
+    `Calculated from the 'Forward schedule' sheet. Week = Monday of each week. ${filterNote}`
+  );
+  const weeks = [];
+  for (let w = mondayOf(win.from); w <= win.to; w = addDays(w, 7)) weeks.push(w);
+  const weekLabelEn = (w) => {
+    const [, m, d] = w.split("-").map(Number);
+    return `Week of ${MONTHS_EN[m - 1]} ${pad(d)}`;
+  };
+  const pbCols = ["Line", "Style", `${tag} style`, ...weeks.map(weekLabelEn), "Total"];
+  header(pbw, 4, pbCols);
+  // Fila 3: lunes de cada semana (criterio de los SUMIFS), en gris claro.
+  weeks.forEach((w, i) => {
+    const c = pbw.getRow(3).getCell(4 + i);
+    c.value = utcDate(w);
+    c.numFmt = FMT_DATE;
+    c.font = F_NOTE;
+  });
+  pbw.getColumn(1).width = 7;
+  pbw.getColumn(2).width = 11;
+  pbw.getColumn(3).width = 11;
+  weeks.forEach((_, i) => (pbw.getColumn(4 + i).width = 14));
+  pbw.getColumn(4 + weeks.length).width = 11;
+
+  const pairs = new Map();
+  for (const r of fw) {
+    const k = `${r.line_no}|${r.style}`;
+    if (!pairs.has(k)) pairs.set(k, { line_no: r.line_no, style: r.style, cstyles: new Set(), byWeek: new Map() });
+    const p = pairs.get(k);
+    if (r.client_style) p.cstyles.add(r.client_style);
+    p.byWeek.set(r.week_of, (p.byWeek.get(r.week_of) || 0) + r.qty);
+  }
+  const plist = [...pairs.values()].sort(
+    (a, b) =>
+      String(a.line_no).localeCompare(String(b.line_no), undefined, { numeric: true }) ||
+      a.style.localeCompare(b.style)
+  );
+  const colL = (i) => String.fromCharCode(65 + i); // A.. (máx. ~10 columnas)
+  const FW = (c) => `'Forward schedule'!$${c}$${fF}:$${c}$${fL}`;
+  const lastWeekCol = colL(3 + weeks.length - 1);
+  const totCol = colL(3 + weeks.length);
+  plist.forEach((p, i) => {
+    const n = 5 + i;
+    const row = pbw.getRow(n);
+    row.getCell(1).value = p.line_no;
+    row.getCell(2).value = p.style;
+    row.getCell(3).value = [...p.cstyles].join(", ");
+    let rowSum = 0;
+    weeks.forEach((w, j) => {
+      const v = p.byWeek.get(w) || 0;
+      rowSum += v;
+      const col = colL(3 + j);
+      row.getCell(4 + j).value = F(
+        `SUMIFS(${FW("M")},${FW("D")},$A${n},${FW("E")},$B${n},${FW("C")},${col}$3)`,
+        v
+      );
+    });
+    row.getCell(4 + weeks.length).value = F(`SUM(D${n}:${lastWeekCol}${n})`, rowSum);
+    styleRow(row, pbCols.length);
+    row.getCell(1).numFmt = "0";
+    for (let c = 4; c <= 4 + weeks.length; c++) row.getCell(c).numFmt = FMT_INT;
+  });
+  const pT = 5 + plist.length;
+  const pTot = pbw.getRow(pT);
+  pTot.getCell(1).value = "TOTAL";
+  for (let j = 0; j <= weeks.length; j++) {
+    const col = colL(3 + j);
+    const val = j < weeks.length
+      ? plist.reduce((s, p) => s + (p.byWeek.get(weeks[j]) || 0), 0)
+      : plannedTotal;
+    pTot.getCell(4 + j).value = plist.length ? F(`SUM(${col}5:${col}${pT - 1})`, val) : 0;
+  }
+  styleRow(pTot, pbCols.length, { font: F_BOLD, fillAll: FILL_TOTAL });
+  for (let c = 4; c <= 4 + weeks.length; c++) pTot.getCell(c).numFmt = FMT_INT;
+  void totCol;
+
+  // Mismo orden de hojas que el reporte NIKE.
   sum.orderNo = 0;
   day.orderNo = 1;
   det.orderNo = 2;
+  fws.orderNo = 3;
+  pbw.orderNo = 4;
   wb.worksheets.sort((a, b) => a.orderNo - b.orderNo);
 
   return wb;
@@ -612,6 +847,10 @@ function registerVerificadorReport(app, { authenticateToken, pool, setSchema, re
       const all = await fetchRuns(client, info.week_start, info.week_end);
       const rows = applyFilters(all, filters);
 
+      // Plan hacia adelante (hoy -> semana actual + 4), mismos filtros.
+      const win = forwardWindow();
+      const forwardRows = applyFilters(await fetchForward(client, win), filters);
+
       if (format === "json") {
         return res.json({
           success: true,
@@ -620,14 +859,23 @@ function registerVerificadorReport(app, { authenticateToken, pool, setSchema, re
           options: filterOptions(all),
           rows,
           totals: totalsOf(rows),
+          forward: forwardSummary(forwardRows, win),
         });
       }
 
       if (rows.length === 0) {
         return res.status(404).json({ success: false, error: "No hay producción para esa semana con esos filtros." });
       }
-      const wb = await buildWorkbook(rows, info, filters);
+      const wb = await buildWorkbook(rows, info, filters, { rows: forwardRows, win });
       const buf = await wb.xlsx.writeBuffer();
+      // Nunca lanza: si la bitácora falla, la descarga sigue.
+      await verificadorActivity.logReportDownload(client, {
+        user: req.user,
+        week: info,
+        filters,
+        rows: rows.length,
+        totals: totalsOf(rows),
+      });
       const tag = `${info.iso_year}-W${pad(info.iso_week)}`;
       const who = (filters.customer || "All").replace(/[^A-Za-z0-9_-]+/g, "_");
       const st = filters.style ? `_${filters.style.replace(/[^A-Za-z0-9_-]+/g, "_")}` : "";
