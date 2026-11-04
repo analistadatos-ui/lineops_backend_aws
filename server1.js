@@ -13,6 +13,7 @@ const winston = require("winston");
 const fs = require("fs");
 const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl, generatePresignedPutUrl } = require("./s3-raw");
 const planWeekLocks = require("./plan-week-locks"); // 🔒 bloqueo de semanas del Plan Board (CEO)
+const planUrgentChanges = require("./plan-urgent-changes"); // ⚡ cambio urgente en semanas bloqueadas
 const itControlPanel = require("./it-control-panel"); // 🖥️ Panel de TI: bitácora + usuarios
 // ----------------------------------------------------------------------
 // 1. LOGGER (Winston)
@@ -705,6 +706,7 @@ await registerOrderSets.initSchema({ pool, setSchema });   // ← must come firs
 await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
 await registerOrderClose.initSchema({ pool, setSchema });   // ✅ cierre manual (después de work_orders)
 await planWeekLocks.initSchema({ pool, setSchema });   // 🔒 después de line_assignments
+await planUrgentChanges.initSchema({ pool, setSchema }); // ⚡ bitácora de cambios urgentes
 await registerPlanRebalance.initSchema({ pool, setSchema }); // ⚖️ plan_board_snapshots
 
     // Create index for faster queries
@@ -1258,6 +1260,16 @@ verificadorActivity(app, { authenticateToken, pool, setSchema });
 // 🔒 Bloqueo de semanas del Plan Board. lockerRoles = roles que pueden bloquear.
 planWeekLocks(app, { authenticateToken, pool, setSchema, lockerRoles: ["ceo", "skyrina", "master"] });
 
+// ⚡ Cambio urgente de color/estilo en semanas bloqueadas (sin desbloquearlas).
+// Requiere que el trigger de semanas respete plan.urgent_override (ver
+// plan-urgent-changes.js). urgentRoles = quien puede hacerlo.
+planUrgentChanges(app, {
+  authenticateToken, pool, setSchema,
+  planWeekLocks, plannerStyleParams,
+  workOrders: registerWorkOrders,
+  mergeOrInsertAssignment, ensureDraftRunForAssignment, cleanupOrphanDraftRuns,
+  urgentRoles: ["planner", "master", "ceo"],
+});
 
 // 🖥️ Panel de TI. itRoles = quién puede abrirlo.
 itControlPanel(app, {
