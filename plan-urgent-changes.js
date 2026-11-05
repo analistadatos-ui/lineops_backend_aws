@@ -18,7 +18,11 @@
 //     resto se queda con la orden/color original.
 //   • Cambio de estilo: se revalida la capacidad de la linea con el estandar
 //     del estilo nuevo (planner_style_params). Mismo estilo = misma capacidad.
-//   • La orden destino debe tener piezas sin asignar (la bolsa).
+//   • La orden destino debe tener piezas sin asignar (la bolsa), o se toman de
+//     SALDOS DE DIAS PASADOS de esa orden (casillas que cerraron por debajo de
+//     lo asignado). Esas casillas se liquidan igual que settle-day: se bajan a
+//     lo que SI se cosio y quedan 'completed'; el saldo vuelve a la bolsa y de
+//     ahi sale para la casilla urgente. Lo que sobre se queda en la bolsa.
 //   • MOTIVO obligatorio. Todo queda en plan_urgent_changes (quien, cuando,
 //     de que a que y por que), y el tablero marca la casilla con ⚡.
 //   • El candado de TODO el tablero (plan_board_lock) SI se respeta: la ruta
@@ -118,6 +122,8 @@ async function initSchema({ pool, setSchema }) {
     // Aviso al CEO (campana): visto / quien lo vio. NULL = sin ver.
     await client.query("ALTER TABLE plan_urgent_changes ADD COLUMN IF NOT EXISTS ceo_seen_at TIMESTAMPTZ;");
     await client.query("ALTER TABLE plan_urgent_changes ADD COLUMN IF NOT EXISTS ceo_seen_by BIGINT;");
+    // Saldos de dias pasados que se liquidaron para tomar sus piezas.
+    await client.query("ALTER TABLE plan_urgent_changes ADD COLUMN IF NOT EXISTS settled_balances JSONB NOT NULL DEFAULT '[]';");
     await client.query("CREATE INDEX IF NOT EXISTS idx_plan_urgent_changes_unseen ON plan_urgent_changes(created_at DESC) WHERE ceo_seen_at IS NULL;");
     await client.query("CREATE INDEX IF NOT EXISTS idx_plan_urgent_changes_day ON plan_urgent_changes(assigned_date);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_plan_urgent_changes_target ON plan_urgent_changes(target_assignment_id);");
@@ -166,6 +172,44 @@ async function assignedActive(client, workOrderId, color) {
     params
   );
   return Number(r.rows[0].q) || 0;
+}
+
+// Liquida UNA casilla pasada (orden + linea + dia) por lo que realmente se
+// cosio. Misma regla que settle-day (work-orders.js): reparto proporcional
+// entre colores, residuo a la fila mas grande, filas en 0 se borran.
+// Devuelve el saldo liberado (0 si el dia ya cumplio).
+async function settlePastCell(client, { workOrderId, lineNo, date, produced }) {
+  const cell = await client.query(
+    `SELECT id, color, assigned_quantity
+       FROM line_assignments
+      WHERE work_order_id = $1 AND line_no = $2 AND assigned_date = $3::date
+        AND assigned_date < CURRENT_DATE
+        AND status NOT IN ('cancelled', 'rejected')
+      ORDER BY id
+      FOR UPDATE`,
+    [workOrderId, String(lineNo), date]
+  );
+  if (!cell.rows.length) return { balance: 0, assigned: 0 };
+  const parts = cell.rows.map((r) => ({ id: r.id, color: r.color, assigned: Number(r.assigned_quantity) || 0 }));
+  const assigned = parts.reduce((t, r) => t + r.assigned, 0);
+  const balance = Math.max(assigned - produced, 0);
+  if (balance <= 0) {
+    await client.query("UPDATE line_assignments SET status = 'completed', updated_at = now() WHERE id = ANY($1)", [parts.map((r) => r.id)]);
+    return { balance: 0, assigned };
+  }
+  let given = 0;
+  parts.forEach((r) => { r.keep = assigned > 0 ? Math.floor((r.assigned / assigned) * produced) : 0; given += r.keep; });
+  const rest = produced - given;
+  if (rest > 0) parts.slice().sort((x, y) => y.assigned - x.assigned)[0].keep += rest;
+  for (const r of parts.filter((x) => x.keep > 0)) {
+    await client.query(
+      "UPDATE line_assignments SET assigned_quantity = $2, status = 'completed', updated_at = now() WHERE id = $1",
+      [r.id, r.keep]
+    );
+  }
+  const del = parts.filter((x) => x.keep <= 0).map((x) => x.id);
+  if (del.length) await client.query("DELETE FROM line_assignments WHERE id = ANY($1)", [del]);
+  return { balance, assigned, colors: parts.map((r) => r.color).filter(Boolean) };
 }
 
 /**
@@ -256,6 +300,7 @@ function registerPlanUrgentChanges(app, deps) {
         sourceLeft: Number(r.source_qty_after) || 0,
         reason: r.reason,
         warnings: r.warnings || [],
+        settledBalances: r.settled_balances || [],
       },
     };
   };
@@ -271,7 +316,7 @@ function registerPlanUrgentChanges(app, deps) {
                 to_char(week_start, 'YYYY-MM-DD') AS week_start,
                 source_work_order_no, source_style, source_color, source_qty_after, moved_qty,
                 target_work_order_no, target_style, target_color, reason, warnings,
-                changed_by_name, created_at, ceo_seen_at
+                settled_balances, changed_by_name, created_at, ceo_seen_at
            FROM plan_urgent_changes
           ORDER BY created_at DESC
           LIMIT $1`,
@@ -325,6 +370,77 @@ function registerPlanUrgentChanges(app, deps) {
     }
   });
 
+  // ---- GET /api/line-assignments/urgent-options?assignmentId=N ------------
+  // Lo que el modal de cambio urgente necesita, calculado aqui y no con las
+  // listas del tablero (que pueden no traer ordenes ya asignadas):
+  //   sameStyleOrders  ordenes activas del MISMO estilo y cliente que la
+  //                    casilla (incluida la suya), con lo libre por color.
+  // Los saldos de dias pasados los pide el modal a /day-balances.
+  app.get("/api/line-assignments/urgent-options", authenticateToken, async (req, res) => {
+    const assignmentId = parseInt(req.query.assignmentId, 10);
+    if (!Number.isInteger(assignmentId)) return res.status(400).json({ success: false, error: "assignmentId requerido" });
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const STYLE = "UPPER(TRIM(COALESCE(NULLIF(TRIM(w.style_code), ''), w.estilo, '')))";
+      const CUST = "COALESCE(w.customer_id::text, UPPER(TRIM(COALESCE(w.customer_name, ''))))";
+      const src = (await client.query(
+        `SELECT w.id, ${STYLE} AS style_key, ${CUST} AS cust_key
+           FROM line_assignments la JOIN work_orders w ON w.id = la.work_order_id
+          WHERE la.id = $1`,
+        [assignmentId]
+      )).rows[0];
+      if (!src) return res.status(404).json({ success: false, error: "La casilla ya no existe." });
+
+      const { rows: orders } = await client.query(
+        `SELECT w.id, w.work_order_no, w.customer_po, w.customer_name, w.status, w.color,
+                w.style_code, w.estilo, w.style_description,
+                COALESCE(NULLIF(w.total_to_produce, 0), w.quantity, 0) AS target
+           FROM work_orders w
+          WHERE (w.id = $1
+                 OR (${STYLE} = $2 AND $2 <> '' AND ${CUST} = $3
+                     AND COALESCE(w.status, '') NOT IN ('completed', 'cancelled', 'canceled', 'closed')))
+          ORDER BY (w.id = $1) DESC, w.work_order_no
+          LIMIT 60`,
+        [src.id, src.style_key, src.cust_key]
+      );
+      const out = [];
+      for (const o of orders) {
+        const colors = await colorQuantities(client, o.id, o);
+        const assigned = await assignedActive(client, o.id);
+        const byColor = (await client.query(
+          `SELECT UPPER(TRIM(COALESCE(color, ''))) AS c, SUM(assigned_quantity) AS q
+             FROM line_assignments WHERE work_order_id = $1 AND status NOT IN ('cancelled', 'rejected')
+            GROUP BY 1`, [o.id]
+        )).rows.reduce((m, r) => ((m[r.c] = Number(r.q) || 0), m), {});
+        out.push({
+          id: Number(o.id),
+          work_order_no: o.work_order_no,
+          customer_po: o.customer_po,
+          customer_name: o.customer_name,
+          style: o.style_code || o.estilo || null,
+          status: o.status,
+          own: Number(o.id) === Number(src.id),
+          target: Number(o.target) || 0,
+          assigned,
+          free: Math.max((Number(o.target) || 0) - assigned, 0),
+          colors: Object.entries(colors).map(([color, qty]) => ({
+            color,
+            qty,
+            assigned: byColor[color] || 0,
+            free: qty == null ? null : Math.max(qty - (byColor[color] || 0), 0),
+          })),
+        });
+      }
+      res.json({ success: true, styleKey: src.style_key, sameStyleOrders: out });
+    } catch (err) {
+      console.error("\u274c Error en urgent-options:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
   // ---- POST /api/line-assignments/urgent-change ---------------------------
   // Body:
   //   assignmentId   casilla (line_assignments.id) en una semana bloqueada
@@ -334,6 +450,8 @@ function registerPlanUrgentChanges(app, deps) {
   //   newWorkOrderId orden destino (solo 'style')
   //   quantity       piezas a cambiar (default: todo lo no cosido)
   //   reason         motivo (obligatorio)
+  //   balanceCells   [{ lineNo, date }] casillas PASADAS de la orden destino
+  //                  con saldo: se liquidan y su saldo se usa para el cambio.
   //   sendToLines    true/false: crear el borrador para el lider de linea.
   //                  Default: true si la casilla original ya se habia enviado.
   app.post("/api/line-assignments/urgent-change", authenticateToken, async (req, res) => {
@@ -397,11 +515,14 @@ function registerPlanUrgentChanges(app, deps) {
       }
 
       // ---- destino ------------------------------------------------------------
-      const targetWoId = mode === "style" ? parseInt(body.newWorkOrderId, 10) : Number(src.work_order_id);
+      // 'color': por defecto la misma orden; tambien puede ser otra orden del
+      // MISMO estilo y cliente (otro PO con el color disponible).
+      const pickedWo = body.newWorkOrderId == null || body.newWorkOrderId === "" ? null : parseInt(body.newWorkOrderId, 10);
+      const targetWoId = mode === "style" ? pickedWo : pickedWo ?? Number(src.work_order_id);
       if (!Number.isInteger(targetWoId)) throw new HttpError(400, "Elija la orden del nuevo estilo.");
 
       const tgt = (await client.query(
-        `SELECT id, work_order_no, status, color, total_to_produce, quantity
+        `SELECT id, work_order_no, status, color, total_to_produce, quantity, customer_id, customer_name
            FROM work_orders WHERE id = $1 FOR UPDATE`,
         [targetWoId]
       )).rows[0];
@@ -419,8 +540,47 @@ function registerPlanUrgentChanges(app, deps) {
       if (targetWoId === Number(src.work_order_id) && newColor === srcColor) {
         throw new HttpError(400, "El destino es igual a la casilla actual: elija otro color u otra orden.");
       }
-      const tgtStyle = mode === "style" ? await plannerStyleParams.styleOfWorkOrder(client, targetWoId) : srcStyle;
+      const tgtStyle = targetWoId === Number(src.work_order_id) ? srcStyle : await plannerStyleParams.styleOfWorkOrder(client, targetWoId);
+      if (mode === "color" && targetWoId !== Number(src.work_order_id)) {
+        const normS = (v) => String(v || "").trim().toUpperCase();
+        if (normS(tgtStyle) !== normS(srcStyle)) {
+          throw new HttpError(400, `La orden ${tgt.work_order_no} es de otro estilo (${tgtStyle || "—"}): use "Cambiar estilo".`);
+        }
+        const custOf = async (id) => (await client.query(
+          "SELECT COALESCE(customer_id::text, UPPER(TRIM(customer_name))) AS c FROM work_orders WHERE id = $1", [id]
+        )).rows[0]?.c || null;
+        const [cs, ct] = [await custOf(src.work_order_id), await custOf(targetWoId)];
+        if (cs && ct && cs !== ct) {
+          throw new HttpError(400, `La orden ${tgt.work_order_no} es de otro cliente: use "Cambiar estilo".`);
+        }
+      }
       const changeType = mode === "style" && String(tgtStyle || "") !== String(srcStyle || "") ? "style" : mode;
+
+      // ---- saldos de dias pasados de la orden destino -------------------------
+      const settled = [];
+      const wanted = Array.isArray(body.balanceCells) ? body.balanceCells.slice(0, 60) : [];
+      if (wanted.length) {
+        const dates = wanted.map((c) => String(c?.date || "").slice(0, 10)).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d));
+        if (dates.length !== wanted.length) throw new HttpError(400, "Fecha de saldo inválida.");
+        const minD = dates.reduce((m, d) => (d < m ? d : m)), maxD = dates.reduce((m, d) => (d > m ? d : m));
+        const prodRows = typeof workOrders?.producedByLineDayForMany === "function"
+          ? await workOrders.producedByLineDayForMany(client, { workOrderIds: [targetWoId], from: minD, to: maxD })
+          : [];
+        const seen = new Set();
+        for (const c of wanted) {
+          const lineNo = String(c.lineNo), date = String(c.date).slice(0, 10);
+          const k = `${lineNo}|${date}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          if (lineNo === String(src.line_no) && date === src.day) continue; // la casilla urgente no
+          const produced = prodRows
+            .filter((r) => String(r.line_no) === lineNo && r.day === date)
+            .reduce((t, r) => t + (Number(r.produced) || 0), 0);
+          const r = await settlePastCell(client, { workOrderId: targetWoId, lineNo, date, produced });
+          if (r.assigned === 0) throw new HttpError(409, `La casilla Línea ${lineNo} ${date} de ${tgt.work_order_no} ya no tiene saldo (o no es de un día pasado). Recargue el tablero.`);
+          settled.push({ lineNo, date, assigned: r.assigned, produced, balance: r.balance });
+        }
+      }
 
       // ---- la orden destino debe tener piezas en la bolsa --------------------
       const sameOrder = targetWoId === Number(src.work_order_id);
@@ -428,7 +588,10 @@ function registerPlanUrgentChanges(app, deps) {
       const assignedAll = await assignedActive(client, targetWoId);
       const orderFree = n2(target - (sameOrder ? assignedAll - qty : assignedAll));
       if (target > 0 && qty > orderFree) {
-        throw new HttpError(400, `La orden ${tgt.work_order_no} solo tiene ${Math.max(Math.floor(orderFree), 0)} pzas sin asignar.`, { maxQuantity: Math.max(Math.floor(orderFree), 0) });
+        throw new HttpError(400,
+          `La orden ${tgt.work_order_no} solo tiene ${Math.max(Math.floor(orderFree), 0)} pzas disponibles` +
+          (settled.length ? " (incluyendo los saldos elegidos)." : ". Elija saldos de días pasados para tomar más."),
+          { maxQuantity: Math.max(Math.floor(orderFree), 0) });
       }
       const warnings = [];
       const colorTarget = newColor ? tgtColors[newColor] : null;
@@ -538,13 +701,13 @@ function registerPlanUrgentChanges(app, deps) {
            (change_type, line_no, assigned_date, week_start, source_assignment_id, source_work_order_id,
             source_work_order_no, source_style, source_color, source_qty_before, source_qty_after, moved_qty,
             target_assignment_id, target_work_order_id, target_work_order_no, target_style, target_color,
-            reason, warnings, changed_by, changed_by_name)
-         VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21)
+            reason, warnings, changed_by, changed_by_name, settled_balances)
+         VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22::jsonb)
          RETURNING id, created_at`,
         [changeType, String(src.line_no), src.day, weekStart, src.id, src.work_order_id,
          src.work_order_no, srcStyle || null, srcColor || null, srcQty, srcLeft, qty,
          newRow?.id || null, targetWoId, tgt.work_order_no, tgtStyle || null, newColor || null,
-         reason, JSON.stringify(warnings), req.user?.id ?? null, who]
+         reason, JSON.stringify(warnings), req.user?.id ?? null, who, JSON.stringify(settled)]
       )).rows[0];
 
       await client.query("COMMIT");
@@ -558,11 +721,13 @@ function registerPlanUrgentChanges(app, deps) {
         sourceLeft: srcLeft,
         assignment: newRow,
         sentToLines: !!runId,
+        settledBalances: settled,
         warnings,
         message:
           `⚡ ${changeType === "style" ? "Estilo" : "Color"} cambiado en Línea ${src.line_no} (${src.day}): ` +
           `${src.work_order_no}${srcColor ? ` ${srcColor}` : ""} → ${tgt.work_order_no}${newColor ? ` ${newColor}` : ""}, ${Math.round(qty)} pzas.` +
-          (srcLeft > 0 ? ` Quedan ${Math.round(srcLeft)} pzas de la orden original.` : ""),
+          (srcLeft > 0 ? ` Quedan ${Math.round(srcLeft)} pzas de la orden original.` : "") +
+          (settled.length ? ` Se liquidaron ${settled.length} día(s) pasados (${Math.round(settled.reduce((t, x) => t + x.balance, 0))} pzas de saldo).` : ""),
       });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
