@@ -92,11 +92,130 @@ async function initSchema({ pool, setSchema }) {
         END IF;
       END $$;
     `);
+    // ── AGRUPACIÓN DE CORTES ─────────────────────────────────────────────
+    // Varias CORTES compatibles (mismo estilo + misma tela, o mismo item code
+    // de Nike) se planean juntas: el planner arma UNA serie de marcadas sobre
+    // la suma de tallas y al guardar se reparten los paneles entre las órdenes.
+    // cut_groups.markers guarda el plan del grupo; cada cut_orders.markers
+    // recibe su parte, así verificación, tickets y dashboard siguen igual.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cut_groups(
+        id BIGSERIAL PRIMARY KEY,
+        group_by VARCHAR(20) NOT NULL DEFAULT 'style_fabric',
+        group_key TEXT,
+        markers JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_by VARCHAR(100),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT chk_cut_group_by CHECK (group_by IN ('style_fabric','item_code'))
+      );
+    `);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS cut_group_id BIGINT REFERENCES cut_groups(id) ON DELETE SET NULL;`);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_cut_orders_group ON cut_orders(cut_group_id);");
     console.log("✅ cut_orders table ready in prod_db_schema");
   } finally {
     client.release();
   }
 }
+
+// SELECT base de una CORTE con los datos de su orden de trabajo. Lo usan el
+// listado y la agrupación (para validar compatibilidad con los mismos datos
+// que ve el planner).
+const CUT_ORDER_SELECT = `
+        SELECT co.id,
+               co.work_order_id,
+               co.fabric,
+               co.fabric_code,
+               co.fabrics,
+               to_char(co.cut_date, 'YYYY-MM-DD') AS cut_date,
+               co.quantity,
+               co.yield_per_piece,
+               co.total_length,
+               co.panels,
+               co.amount_cut,
+               co.remaining_to_cut,
+               co.sizes,
+               co.size_progress,
+               co.markers,
+               co.notes,
+               co.status,
+               co.verified_at,
+               co.verified_by,
+               co.verification_notes,
+               co.cut_group_id,
+               COALESCE(co.priority, 'normal') AS priority,
+               co.created_at,
+               wo.work_order_no,
+               wo.customer_name,
+               wo.customer_po,
+               wo.style_description,
+               wo.style_code,
+               wo.estilo,
+               mc.code AS master_code,
+               -- "tipo modelo correlativo": e.g. DAM+CHA+01 -> DAMCHA01
+               NULLIF(CONCAT(mc.type, mc.modelo, mc.correlativo), '') AS modelo_code,
+               COALESCE(co.color, wo.color) AS color,
+               COALESCE(co.style_no, wo.style_code) AS style_no,
+               COALESCE(co.season, wo.season) AS season,
+               -- Distinct telas (name+code+yield) across the work order's lines.
+               -- The scalar co.fabric_code is just ONE of these; the cutter picks
+               -- the código they are actually cutting inside CuttingEntry.
+               COALESCE((
+                 SELECT jsonb_agg(fab ORDER BY (fab->>'name'), (fab->>'code'))
+                   FROM (
+                     SELECT DISTINCT ON (upper(f->>'name'), upper(COALESCE(f->>'code','')))
+                            f AS fab
+                       FROM work_order_lines wl
+                       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(wl.fabrics, '[]'::jsonb)) AS f
+                      WHERE wl.work_order_id = wo.id
+                        AND COALESCE(f->>'name','') <> ''
+                      ORDER BY upper(f->>'name'), upper(COALESCE(f->>'code','')), (f->>'yield')
+                   ) d
+               ), '[]'::jsonb) AS wo_fabrics,
+               -- Item codes (Nike) de las líneas de la orden para el color del corte.
+               COALESCE((
+                 SELECT jsonb_agg(DISTINCT UPPER(TRIM(wl.item_code)))
+                   FROM work_order_lines wl
+                  WHERE wl.work_order_id = wo.id
+                    AND COALESCE(TRIM(wl.item_code), '') <> ''
+                    AND (COALESCE(TRIM(co.color), '') = ''
+                         OR UPPER(TRIM(wl.color)) = UPPER(TRIM(co.color)))
+               ), '[]'::jsonb) AS item_codes
+          FROM cut_orders co
+          JOIN work_orders wo ON wo.id = co.work_order_id
+          LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
+`;
+
+// ── Agrupación: reglas de compatibilidad ───────────────────────────────────
+// (Las mismas reglas viven en CutPlanning.jsx para habilitar las casillas.)
+//   style_fabric → mismo estilo y MISMO juego de telas (códigos).
+//   item_code    → mismo item code (Nike). La CORTE debe tener un solo item code.
+const up = (v) => String(v ?? "").trim().toUpperCase();
+const asArr = (v) => (Array.isArray(v) ? v : []);
+const cutStyleKey = (r) => up(r.modelo_code || r.style_no || r.style_code || r.estilo);
+const cutFabricKey = (r) => {
+  const raw = asArr(r.fabrics).length ? asArr(r.fabrics) : asArr(r.wo_fabrics);
+  let codes = raw.map((f) => up(f?.code) || up(f?.name)).filter(Boolean);
+  if (!codes.length) codes = [up(r.fabric_code) || up(r.fabric)].filter(Boolean);
+  return [...new Set(codes)].sort().join("+");
+};
+const cutItemCode = (r) => {
+  const ics = [...new Set(asArr(r.item_codes).map(up).filter(Boolean))];
+  return ics.length === 1 ? ics[0] : "";
+};
+const cutGroupKey = (r, by) => {
+  if (by === "item_code") {
+    const ic = cutItemCode(r);
+    return ic ? `IC:${ic}` : null;
+  }
+  const st = cutStyleKey(r);
+  const fb = cutFabricKey(r);
+  return st && fb ? `${st}|${fb}` : null;
+};
+const hasDoneMarker = (markers, onlyIds = null) =>
+  asArr(markers).some((m) => m && m.done && (!onlyIds || onlyIds.has(m.id)));
+const sumMarkerPanels = (markers) =>
+  asArr(markers).reduce((s, m) => s + (parseInt(m?.panels) || 0), 0);
 
 // Quién puede firmar la verificación del corte. Ajusta a los roles reales de
 // tu tabla de usuarios si el nombre difiere.
@@ -127,59 +246,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const result = await client.query(`
-        SELECT co.id,
-               co.work_order_id,
-               co.fabric,
-               co.fabric_code,
-               co.fabrics,
-               to_char(co.cut_date, 'YYYY-MM-DD') AS cut_date,
-               co.quantity,
-               co.yield_per_piece,
-               co.total_length,
-               co.panels,
-               co.amount_cut,
-               co.remaining_to_cut,
-               co.sizes,
-               co.size_progress,
-               co.markers,
-               co.notes,
-               co.status,
-               co.verified_at,
-               co.verified_by,
-               co.verification_notes,
-               COALESCE(co.priority, 'normal') AS priority,
-               co.created_at,
-               wo.work_order_no,
-               wo.customer_name,
-               wo.customer_po,
-               wo.style_description,
-               wo.style_code,
-               wo.estilo,
-               mc.code AS master_code,
-               -- "tipo modelo correlativo": e.g. DAM+CHA+01 -> DAMCHA01
-               NULLIF(CONCAT(mc.type, mc.modelo, mc.correlativo), '') AS modelo_code,
-               COALESCE(co.color, wo.color) AS color,
-               COALESCE(co.style_no, wo.style_code) AS style_no,
-               COALESCE(co.season, wo.season) AS season,
-               -- Distinct telas (name+code+yield) across the work order's lines.
-               -- The scalar co.fabric_code is just ONE of these; the cutter picks
-               -- the código they are actually cutting inside CuttingEntry.
-               COALESCE((
-                 SELECT jsonb_agg(fab ORDER BY (fab->>'name'), (fab->>'code'))
-                   FROM (
-                     SELECT DISTINCT ON (upper(f->>'name'), upper(COALESCE(f->>'code','')))
-                            f AS fab
-                       FROM work_order_lines wl
-                       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(wl.fabrics, '[]'::jsonb)) AS f
-                      WHERE wl.work_order_id = wo.id
-                        AND COALESCE(f->>'name','') <> ''
-                      ORDER BY upper(f->>'name'), upper(COALESCE(f->>'code','')), (f->>'yield')
-                   ) d
-               ), '[]'::jsonb) AS wo_fabrics
-          FROM cut_orders co
-          JOIN work_orders wo ON wo.id = co.work_order_id
-          LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
+      const result = await client.query(`${CUT_ORDER_SELECT}
          ORDER BY co.created_at DESC
       `);
       res.json({ success: true, cutOrders: result.rows });
@@ -552,7 +619,219 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       client.release();
     }
   });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // AGRUPACIÓN DE CORTES
+  // ───────────────────────────────────────────────────────────────────────
+
+  // Grupos con al menos una CORTE, con los ids de sus órdenes.
+  app.get("/api/cut-groups", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const result = await client.query(`
+        SELECT g.id, g.group_by, g.group_key, g.markers, g.created_by, g.created_at, g.updated_at,
+               array_agg(co.id ORDER BY co.id) AS member_ids
+          FROM cut_groups g
+          JOIN cut_orders co ON co.cut_group_id = g.id
+         GROUP BY g.id
+         ORDER BY g.created_at DESC
+      `);
+      res.json({ success: true, cutGroups: result.rows });
+    } catch (err) {
+      console.error("❌ Error fetching cut groups:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Crear grupo: { cutOrderIds: [..], groupBy: 'style_fabric' | 'item_code' }
+  // Las marcadas individuales SIN verificar de las órdenes se descartan: a
+  // partir de aquí se planean desde el grupo.
+  app.post("/api/cut-groups", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const groupBy = req.body.groupBy === "item_code" ? "item_code" : "style_fabric";
+      const ids = [...new Set(asArr(req.body.cutOrderIds).map((v) => parseInt(v)).filter((v) => v > 0))];
+      if (ids.length < 2) {
+        return res.status(400).json({ success: false, error: "Elija al menos dos órdenes de corte para agrupar" });
+      }
+
+      await client.query("BEGIN");
+      await client.query("SELECT id FROM cut_orders WHERE id = ANY($1::bigint[]) FOR UPDATE", [ids]);
+      const { rows } = await client.query(`${CUT_ORDER_SELECT} WHERE co.id = ANY($1::bigint[])`, [ids]);
+      const cutNo = (id) => `CORTE-${String(id).padStart(4, "0")}`;
+
+      const fail = async (status, error) => {
+        await client.query("ROLLBACK");
+        return res.status(status).json({ success: false, error });
+      };
+      if (rows.length !== ids.length) return fail(404, "Alguna de las órdenes de corte ya no existe");
+
+      for (const r of rows) {
+        if (r.status === "completed" || r.status === "cancelled") {
+          return fail(400, `${cutNo(r.id)} está ${r.status === "completed" ? "cortada" : "cancelada"} y no se puede agrupar`);
+        }
+        if (r.cut_group_id) return fail(409, `${cutNo(r.id)} ya pertenece a otro grupo`);
+        if (hasDoneMarker(r.markers)) {
+          return fail(409, `${cutNo(r.id)} tiene marcadas verificadas; el supervisor debe reabrirlas antes de agrupar`);
+        }
+      }
+
+      const key = cutGroupKey(rows[0], groupBy);
+      if (!key) {
+        return fail(400, groupBy === "item_code"
+          ? `${cutNo(rows[0].id)} no tiene un item code único`
+          : `${cutNo(rows[0].id)} no tiene estilo o tela para agrupar`);
+      }
+      const odd = rows.find((r) => cutGroupKey(r, groupBy) !== key);
+      if (odd) {
+        return fail(400, groupBy === "item_code"
+          ? `${cutNo(odd.id)} tiene otro item code; sólo se agrupan órdenes con el mismo item code`
+          : `${cutNo(odd.id)} tiene otro estilo o tela; sólo se agrupan órdenes con el mismo estilo y la misma tela`);
+      }
+
+      const g = await client.query(
+        `INSERT INTO cut_groups (group_by, group_key, created_by) VALUES ($1, $2, $3) RETURNING *`,
+        [groupBy, key, verifierName(req.user)]
+      );
+      const cleared = rows.filter((r) => asArr(r.markers).length > 0).length;
+      await client.query(
+        `UPDATE cut_orders
+            SET cut_group_id = $1,
+                markers = CASE WHEN jsonb_typeof(markers) = 'array' AND jsonb_array_length(markers) > 0 THEN '[]'::jsonb ELSE markers END,
+                panels = NULL,
+                updated_at = now()
+          WHERE id = ANY($2::bigint[])`,
+        [g.rows[0].id, ids]
+      );
+      await client.query("COMMIT");
+      res.json({ success: true, cutGroup: { ...g.rows[0], member_ids: ids.sort((a, b) => a - b) }, clearedPlans: cleared });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("❌ Error creating cut group:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Guardar el plan del grupo.
+  //   { markers: [marcadas del grupo, tallas sumadas],
+  //     allocations: [{ cutOrderId, markers: [la parte de esa orden] }] }
+  // Las marcadas ya verificadas en una orden NO se tocan (se conserva la copia
+  // que tiene la orden), igual que en la planeación individual.
+  app.patch("/api/cut-groups/:id/plan", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const groupId = parseInt(req.params.id);
+      const groupMarkers = asArr(req.body.markers).map((m) => ({ ...m, done: false, completedAt: null }));
+      const allocations = asArr(req.body.allocations);
+
+      await client.query("BEGIN");
+      const g = await client.query("SELECT * FROM cut_groups WHERE id = $1 FOR UPDATE", [groupId]);
+      if (!g.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, error: "Grupo no encontrado" });
+      }
+      const members = await client.query(
+        "SELECT id, markers FROM cut_orders WHERE cut_group_id = $1 ORDER BY id FOR UPDATE",
+        [groupId]
+      );
+      const memberIds = new Set(members.rows.map((r) => Number(r.id)));
+      const bad = allocations.find((a) => !memberIds.has(Number(a?.cutOrderId)));
+      if (bad) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, error: `La orden ${bad?.cutOrderId} no pertenece a este grupo` });
+      }
+      const allocById = new Map(allocations.map((a) => [Number(a.cutOrderId), asArr(a.markers)]));
+      const order = groupMarkers.map((m) => m.id);
+
+      for (const r of members.rows) {
+        const existing = asArr(r.markers);
+        const doneById = new Map(existing.filter((m) => m && m.done).map((m) => [m.id, m]));
+        const incoming = new Map((allocById.get(Number(r.id)) || []).map((m) => [m.id, m]));
+        const final = [];
+        order.forEach((id) => {
+          if (doneById.has(id)) { final.push(doneById.get(id)); doneById.delete(id); }
+          else if (incoming.has(id)) final.push({ ...incoming.get(id), done: false, completedAt: null });
+        });
+        doneById.forEach((m) => final.push(m)); // verificadas que ya no están en el plan: se conservan
+        await client.query(
+          `UPDATE cut_orders SET markers = $1::jsonb, panels = $2, updated_at = now() WHERE id = $3`,
+          [JSON.stringify(final), sumMarkerPanels(final), r.id]
+        );
+      }
+      await client.query(
+        "UPDATE cut_groups SET markers = $1::jsonb, updated_at = now() WHERE id = $2",
+        [JSON.stringify(groupMarkers), groupId]
+      );
+      await client.query("COMMIT");
+
+      const updated = await client.query(`${CUT_ORDER_SELECT} WHERE co.cut_group_id = $1 ORDER BY co.id`, [groupId]);
+      res.json({
+        success: true,
+        cutGroup: { ...g.rows[0], markers: groupMarkers, member_ids: updated.rows.map((r) => Number(r.id)) },
+        cutOrders: updated.rows,
+      });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("❌ Error saving cut group plan:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Desagrupar: quita de cada orden las marcadas que venían del grupo. No se
+  // permite si alguna ya está verificada (el supervisor debe reabrirla).
+  app.delete("/api/cut-groups/:id", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const groupId = parseInt(req.params.id);
+      await client.query("BEGIN");
+      const g = await client.query("SELECT * FROM cut_groups WHERE id = $1 FOR UPDATE", [groupId]);
+      if (!g.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, error: "Grupo no encontrado" });
+      }
+      const groupIds = new Set(asArr(g.rows[0].markers).map((m) => m?.id).filter(Boolean));
+      const members = await client.query(
+        "SELECT id, markers FROM cut_orders WHERE cut_group_id = $1 FOR UPDATE",
+        [groupId]
+      );
+      const locked = members.rows.find((r) => hasDoneMarker(r.markers, groupIds));
+      if (locked) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          success: false,
+          error: `CORTE-${String(locked.id).padStart(4, "0")} tiene marcadas del grupo ya verificadas; el supervisor debe reabrirlas antes de desagrupar`,
+        });
+      }
+      for (const r of members.rows) {
+        const rest = asArr(r.markers).filter((m) => !groupIds.has(m?.id));
+        await client.query(
+          `UPDATE cut_orders SET cut_group_id = NULL, markers = $1::jsonb, panels = $2, updated_at = now() WHERE id = $3`,
+          [JSON.stringify(rest), rest.length ? sumMarkerPanels(rest) : null, r.id]
+        );
+      }
+      await client.query("DELETE FROM cut_groups WHERE id = $1", [groupId]);
+      await client.query("COMMIT");
+      res.json({ success: true, id: groupId, released: members.rows.map((r) => Number(r.id)) });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("❌ Error ungrouping cut orders:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
 }
 
 registerCutOrders.initSchema = initSchema;
+registerCutOrders.cutGroupKey = cutGroupKey;
 module.exports = registerCutOrders;
