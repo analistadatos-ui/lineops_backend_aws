@@ -122,6 +122,8 @@ async function initSchema({ pool, setSchema }) {
     // Aviso al CEO (campana): visto / quien lo vio. NULL = sin ver.
     await client.query("ALTER TABLE plan_urgent_changes ADD COLUMN IF NOT EXISTS ceo_seen_at TIMESTAMPTZ;");
     await client.query("ALTER TABLE plan_urgent_changes ADD COLUMN IF NOT EXISTS ceo_seen_by BIGINT;");
+    // Piezas puestas del destino (en cambio de estilo puede ser < moved_qty).
+    await client.query("ALTER TABLE plan_urgent_changes ADD COLUMN IF NOT EXISTS target_qty NUMERIC(12,2);");
     // Saldos de dias pasados que se liquidaron para tomar sus piezas.
     await client.query("ALTER TABLE plan_urgent_changes ADD COLUMN IF NOT EXISTS settled_balances JSONB NOT NULL DEFAULT '[]';");
     await client.query("CREATE INDEX IF NOT EXISTS idx_plan_urgent_changes_unseen ON plan_urgent_changes(created_at DESC) WHERE ceo_seen_at IS NULL;");
@@ -297,6 +299,7 @@ function registerPlanUrgentChanges(app, deps) {
         from: { workOrderNo: r.source_work_order_no, style: r.source_style, color: r.source_color },
         to: { workOrderNo: r.target_work_order_no, style: r.target_style, color: r.target_color },
         movedQty: Number(r.moved_qty) || 0,
+        placedQty: r.target_qty == null ? Number(r.moved_qty) || 0 : Number(r.target_qty) || 0,
         sourceLeft: Number(r.source_qty_after) || 0,
         reason: r.reason,
         warnings: r.warnings || [],
@@ -314,7 +317,7 @@ function registerPlanUrgentChanges(app, deps) {
       const { rows } = await client.query(
         `SELECT id, change_type, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date,
                 to_char(week_start, 'YYYY-MM-DD') AS week_start,
-                source_work_order_no, source_style, source_color, source_qty_after, moved_qty,
+                source_work_order_no, source_style, source_color, source_qty_after, moved_qty, target_qty,
                 target_work_order_no, target_style, target_color, reason, warnings,
                 settled_balances, changed_by_name, created_at, ceo_seen_at
            FROM plan_urgent_changes
@@ -620,10 +623,23 @@ function registerPlanUrgentChanges(app, deps) {
         await client.query("ROLLBACK");
         return plannerStyleParams.styleParamsRequired(res, tgtStyle);
       }
+      // Cambio de estilo: `qty` son las piezas del estilo VIEJO que se quitan.
+      // En el tiempo liberado se ponen las del estilo nuevo que quepan. Si el
+      // estilo nuevo es más lento caben menos; no es error, se avisa. (Antes
+      // se rechazaba y el máximo bajaba en cada intento: 10, 9, 8…, porque
+      // quitar menos piezas libera menos tiempo.)
+      let placeQty = qty;
       if (changeType === "style" && qty > cap.available + 0.0001) {
-        throw new HttpError(400,
-          `La Línea ${src.line_no} solo tiene capacidad para ${Math.max(Math.floor(cap.available), 0)} pzas del estilo ${tgtStyle || "nuevo"} el ${src.day}.`,
-          { maxQuantity: Math.max(Math.floor(cap.available), 0) });
+        placeQty = Math.floor(Math.max(cap.available, 0));
+        if (placeQty <= 0) {
+          throw new HttpError(400,
+            `La Línea ${src.line_no} no tiene tiempo para ninguna pieza del estilo ${tgtStyle || "nuevo"} el ${src.day}, ` +
+            `ni quitando ${Math.round(qty)} pzas de ${srcStyle || "la orden actual"}.`);
+        }
+        warnings.push(
+          `El estilo ${tgtStyle || "nuevo"} tarda más: en el tiempo de ${Math.round(qty)} pzas de ${srcStyle || "la orden actual"} ` +
+          `caben ${placeQty} pzas.`
+        );
       }
 
       // ---- 3. poner las piezas del destino -----------------------------------
@@ -632,7 +648,7 @@ function registerPlanUrgentChanges(app, deps) {
         lineRunId: null,
         lineNo: String(src.line_no),
         assignedDate: src.day,
-        quantity: qty,
+        quantity: placeQty,
         availableMinutes: cap.availableMinutes,
         requiredRate: cap.target,
         startDate: src.day,
@@ -701,13 +717,13 @@ function registerPlanUrgentChanges(app, deps) {
            (change_type, line_no, assigned_date, week_start, source_assignment_id, source_work_order_id,
             source_work_order_no, source_style, source_color, source_qty_before, source_qty_after, moved_qty,
             target_assignment_id, target_work_order_id, target_work_order_no, target_style, target_color,
-            reason, warnings, changed_by, changed_by_name, settled_balances)
-         VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22::jsonb)
+            reason, warnings, changed_by, changed_by_name, settled_balances, target_qty)
+         VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22::jsonb,$23)
          RETURNING id, created_at`,
         [changeType, String(src.line_no), src.day, weekStart, src.id, src.work_order_id,
          src.work_order_no, srcStyle || null, srcColor || null, srcQty, srcLeft, qty,
          newRow?.id || null, targetWoId, tgt.work_order_no, tgtStyle || null, newColor || null,
-         reason, JSON.stringify(warnings), req.user?.id ?? null, who, JSON.stringify(settled)]
+         reason, JSON.stringify(warnings), req.user?.id ?? null, who, JSON.stringify(settled), placeQty]
       )).rows[0];
 
       await client.query("COMMIT");
@@ -718,6 +734,7 @@ function registerPlanUrgentChanges(app, deps) {
         changeId: Number(log.id),
         changeType,
         movedQty: qty,
+        placedQty: placeQty,
         sourceLeft: srcLeft,
         assignment: newRow,
         sentToLines: !!runId,
@@ -725,7 +742,8 @@ function registerPlanUrgentChanges(app, deps) {
         warnings,
         message:
           `⚡ ${changeType === "style" ? "Estilo" : "Color"} cambiado en Línea ${src.line_no} (${src.day}): ` +
-          `${src.work_order_no}${srcColor ? ` ${srcColor}` : ""} → ${tgt.work_order_no}${newColor ? ` ${newColor}` : ""}, ${Math.round(qty)} pzas.` +
+          `${src.work_order_no}${srcColor ? ` ${srcColor}` : ""} → ${tgt.work_order_no}${newColor ? ` ${newColor}` : ""}, ` +
+          (placeQty !== qty ? `${Math.round(qty)} pzas quitadas → ${Math.round(placeQty)} pzas puestas.` : `${Math.round(qty)} pzas.`) +
           (srcLeft > 0 ? ` Quedan ${Math.round(srcLeft)} pzas de la orden original.` : "") +
           (settled.length ? ` Se liquidaron ${settled.length} día(s) pasados (${Math.round(settled.reduce((t, x) => t + x.balance, 0))} pzas de saldo).` : ""),
       });
