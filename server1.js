@@ -696,6 +696,7 @@ await registerPreOrders.initSchema({ pool, setSchema });
 await registerMerchantAnalytics.initSchema({ pool, setSchema });
 await registerMerchantPlan.initSchema({ pool, setSchema });
 await registerPreOrderHolds.initSchema({ pool, setSchema });   // ← add
+await registerForecastOrders.initSchema({ pool, setSchema });  // 📈 Tablero de pronóstico (después de customers)
 await registerCutOrders.initSchema({ pool, setSchema });
 await registerCutOrderRequests.initSchema({ pool, setSchema });   // solicitudes de corte (después de cut_orders)
 await registerBom.initSchema({ pool, setSchema });
@@ -1193,6 +1194,10 @@ registerFinishedWarehouseAnalytics(app, { authenticateToken, pool, setSchema });
 
 const registerPreOrderHolds = require("./pre-order-holds");
 registerPreOrderHolds(app, { authenticateToken, pool, setSchema });
+
+// 📈 Tablero de pronóstico del cliente: pronósticos FC#### + sus reservas de línea/día.
+const registerForecastOrders = require("./forecast-orders");
+registerForecastOrders(app, { authenticateToken, pool, setSchema });
 
 const registerCutOrderAnalytics = require("./cut-order-analytics");
 registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema });
