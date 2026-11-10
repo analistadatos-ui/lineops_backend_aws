@@ -39,6 +39,18 @@
 //   POST   /api/pre-orders/:id/cancel
 //   DELETE /api/pre-orders/:id
 //
+//   GET    /api/pre-orders/inbox           -> avisos para el merchant: pre-órdenes
+//                                             que el planner mandó desde un
+//                                             pronóstico y aún no se han visto
+//   POST   /api/pre-orders/inbox/seen      -> { ids? } marca vistas (sin ids: todas)
+//
+// PRE-ÓRDENES QUE VIENEN DEL PRONÓSTICO
+//   forecast-orders.js (POST /api/forecast-orders/:id/to-pre-order) crea la
+//   PRE#### con source_forecast_id / source_forecast_no y merchant_seen_at NULL
+//   (= aviso sin leer). Se completa igual que cualquier otra. Además:
+//     • convert → las SKM se anotan también en el pronóstico de origen.
+//     • cancel / delete → las piezas sin convertir regresan al pronóstico.
+//
 // Body de POST / PUT (camelCase, como lo manda PreOrdenWizard):
 //   { tipo, modelo, correlativo, estilo?, styleDescription?,
 //     customerId, clienteCode, customerPo?, pieces, samMinutes?, targetDate?, notes? }
@@ -106,6 +118,14 @@ async function initSchema({ pool, setSchema }) {
     await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS converted_pieces NUMERIC(12,2) NOT NULL DEFAULT 0;");
     await client.query("ALTER TABLE pre_orders DROP CONSTRAINT IF EXISTS chk_pre_order_status;");
     await client.query("ALTER TABLE pre_orders ADD CONSTRAINT chk_pre_order_status CHECK (status IN ('pending','partially_converted','converted','cancelled'));");
+    // Origen pronóstico (forecast-orders.js → /to-pre-order) + aviso al merchant.
+    await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS source_forecast_id BIGINT;");
+    await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS source_forecast_no VARCHAR(30);");
+    await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS source_style_name VARCHAR(120);");
+    await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS source_season VARCHAR(60);");
+    await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS sent_by BIGINT;");
+    await client.query("ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS merchant_seen_at TIMESTAMPTZ;");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_pre_orders_source_fc ON pre_orders(source_forecast_id);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_pre_orders_status ON pre_orders(status);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_pre_orders_customer ON pre_orders(customer_id);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_pre_orders_created_at ON pre_orders(created_at);");
@@ -143,8 +163,28 @@ const SELECT_COLS = `
   to_char(target_date, 'YYYY-MM-DD') AS target_date,
   to_char(planned_week, 'YYYY-MM-DD') AS planned_week, notes, status,
   work_order_ids, work_order_nos,
+  source_forecast_id, source_forecast_no, source_style_name, source_season,
+  sent_by, merchant_seen_at,
   converted_at, converted_by, created_by, updated_by, created_at, updated_at
 `;
+
+// Las piezas de una PRE que nunca se convirtieron regresan a su pronóstico
+// (cancelada o borrada). Si el pronóstico fue cancelado no se toca.
+async function returnPiecesToForecast(client, pre) {
+  if (!pre?.source_forecast_id) return 0;
+  const back = Math.max(0, (Number(pre.pieces) || 0) - (Number(pre.converted_pieces) || 0));
+  if (!(back > 0)) return 0;
+  await client.query(
+    `UPDATE forecast_orders SET
+        converted_pieces = GREATEST(converted_pieces - $2, 0),
+        status = CASE WHEN GREATEST(converted_pieces - $2, 0) > 0 THEN 'partially_converted' ELSE 'active' END,
+        converted_at = NULL, converted_by = NULL,
+        updated_at = NOW()
+      WHERE id = $1 AND status <> 'cancelled'`,
+    [pre.source_forecast_id, back]
+  );
+  return back;
+}
 
 // Lee y valida el cuerpo compartido por POST y PUT.
 function parseBody(body) {
@@ -354,6 +394,56 @@ function registerPreOrders(app, deps) {
     }
   });
 
+  // ---- AVISOS: pre-órdenes que llegaron del pronóstico --------------------
+  // Antes de /:id (first-match-wins). Lo consulta la campana del MerchantNavbar.
+  app.get("/api/pre-orders/inbox", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { rows } = await client.query(
+        `SELECT ${SELECT_COLS}
+           FROM pre_orders
+          WHERE source_forecast_id IS NOT NULL
+            AND merchant_seen_at IS NULL
+            AND status IN ('pending','partially_converted')
+          ORDER BY created_at DESC
+          LIMIT 30`
+      );
+      const { rows: c } = await client.query(
+        `SELECT COUNT(*)::int AS n FROM pre_orders
+          WHERE source_forecast_id IS NOT NULL AND merchant_seen_at IS NULL
+            AND status IN ('pending','partially_converted')`
+      );
+      res.json({ success: true, unread: c[0]?.n || 0, items: rows });
+    } catch (err) {
+      console.error("\u274c GET /api/pre-orders/inbox:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Body: { ids?: [..] } — sin ids marca todas como vistas.
+  app.post("/api/pre-orders/inbox/seen", authenticateToken, async (req, res) => {
+    const ids = (Array.isArray(req.body?.ids) ? req.body.ids : [])
+      .map((v) => parseInt(v, 10)).filter((v) => !isNaN(v));
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const r = ids.length
+        ? await client.query(
+            "UPDATE pre_orders SET merchant_seen_at = NOW() WHERE id = ANY($1::bigint[]) AND merchant_seen_at IS NULL", [ids])
+        : await client.query(
+            "UPDATE pre_orders SET merchant_seen_at = NOW() WHERE source_forecast_id IS NOT NULL AND merchant_seen_at IS NULL");
+      res.json({ success: true, marked: r.rowCount });
+    } catch (err) {
+      console.error("\u274c POST /api/pre-orders/inbox/seen:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
   // ---- GET: lista --------------------------------------------------------
   // ?status=pending (default) | converted | cancelled | all
   // ?customerId=  ?search=  (busca en PRE####, estilo, cliente, descripción)
@@ -378,7 +468,8 @@ function registerPreOrders(app, deps) {
         const p = `$${params.length}`;
         where.push(`(pre_order_no ILIKE ${p} OR style_code ILIKE ${p} OR estilo ILIKE ${p}
                      OR customer_name ILIKE ${p} OR style_description ILIKE ${p}
-                     OR customer_po ILIKE ${p})`);
+                     OR customer_po ILIKE ${p} OR source_forecast_no ILIKE ${p}
+                     OR source_style_name ILIKE ${p})`);
       }
       const { rows } = await client.query(
         `SELECT ${SELECT_COLS}
@@ -551,7 +642,7 @@ function registerPreOrders(app, deps) {
       // en una NO aborta la transacción ni salta las demás.
       await client.query("BEGIN");
       const cur = await client.query(
-        `SELECT work_order_ids, work_order_nos, pieces, converted_pieces,
+        `SELECT work_order_ids, work_order_nos, pieces, converted_pieces, source_forecast_id,
                 to_char(planned_week,'YYYY-MM-DD') AS planned_week
            FROM pre_orders WHERE id = $1 FOR UPDATE`, [id]);
       if (cur.rows.length === 0) {
@@ -629,6 +720,23 @@ function registerPreOrders(app, deps) {
           { finalize: false, convertedPieces });
       })) || 0;
 
+      // 3) Si nació de un pronóstico, las SKM nuevas se anotan también ahí (rastro
+      //    FC → PRE → SKM). Las piezas ya se descontaron al mandar la PRE.
+      if (cur.rows[0].source_forecast_id) {
+        await step("sync_forecast", async () => {
+          const { rows: fc } = await client.query(
+            "SELECT work_order_ids, work_order_nos FROM forecast_orders WHERE id = $1 FOR UPDATE",
+            [cur.rows[0].source_forecast_id]);
+          if (!fc.length) return;
+          const fIds = [...new Set([...(fc[0].work_order_ids || []).map(Number), ...ids])];
+          const fNos = [...new Set([
+            ...String(fc[0].work_order_nos || "").split(",").map((x) => x.trim()).filter(Boolean), ...nos])];
+          await client.query(
+            "UPDATE forecast_orders SET work_order_ids = $2, work_order_nos = $3, updated_at = NOW() WHERE id = $1",
+            [cur.rows[0].source_forecast_id, fIds, fNos.join(", ") || null]);
+        });
+      }
+
       // Holds que quedaron por estar en semana bloqueada (para avisar al wizard).
       const kept = await client.query(
         "SELECT COUNT(*)::int AS n FROM pre_order_day_holds WHERE pre_order_id = $1", [id]);
@@ -690,13 +798,16 @@ function registerPreOrders(app, deps) {
       const { rows } = await client.query(
         `UPDATE pre_orders
             SET status = 'cancelled', updated_by = $2, updated_at = NOW()
-          WHERE id = $1 AND status <> 'converted'
+          WHERE id = $1 AND status IN ('pending','partially_converted')
           RETURNING ${SELECT_COLS}`,
         [id, req.user?.id ?? null]
       );
       if (rows.length === 0) {
-        return res.status(400).json({ success: false, error: "No existe o ya se convirtió en PO" });
+        return res.status(400).json({ success: false, error: "No existe, ya se convirtió en PO o ya estaba cancelada" });
       }
+      // Si venía de un pronóstico, lo que no se convirtió regresa a ese pronóstico.
+      await returnPiecesToForecast(client, rows[0])
+        .catch((e) => console.warn("no se pudieron regresar piezas al pronóstico:", e.message));
       // Cancelada = fuera del tablero de planeación (semana del merchant + holds del planner).
       await client.query("DELETE FROM merchant_week_plan WHERE pre_order_id = $1", [id])
         .catch((e) => console.warn("no se pudo limpiar el tablero:", e.message));
@@ -726,14 +837,18 @@ function registerPreOrders(app, deps) {
       // una semana bloqueada por el CEO, el trigger lo impide y no se borra nada.
       await client.query("BEGIN");
       await planWeekLocks.enforce(client);
-      const { rowCount } = await client.query(
-        "DELETE FROM pre_orders WHERE id = $1 AND status <> 'converted'",
+      const { rows: gone, rowCount } = await client.query(
+        `DELETE FROM pre_orders WHERE id = $1 AND status <> 'converted'
+         RETURNING pieces, converted_pieces, source_forecast_id, status`,
         [id]
       );
       if (rowCount === 0) {
         await client.query("ROLLBACK");
         return res.status(400).json({ success: false, error: "No existe o ya se convirtió en PO" });
       }
+      // Venía de un pronóstico: sus piezas regresan ahí (misma transacción).
+      // (Una cancelada ya las regresó al cancelarse.)
+      if (gone[0].status !== "cancelled") await returnPiecesToForecast(client, gone[0]);
       await client.query("COMMIT");
       await client.query("DELETE FROM merchant_week_plan WHERE pre_order_id = $1", [id])
         .catch((e) => console.warn("no se pudo limpiar el tablero:", e.message));

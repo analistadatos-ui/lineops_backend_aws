@@ -51,6 +51,14 @@
 //   GET    /api/forecast-orders/:id
 //   POST   /api/forecast-orders                       -> create (auto FC####)
 //   PUT    /api/forecast-orders/:id                   -> edit (active only)
+//   POST   /api/forecast-orders/:id/to-pre-order      -> SEND to the merchant as a
+//          PRE#### (total or partial). No details are asked: the pre-order is
+//          built from the forecast (style, client, pieces, SAM, handover date)
+//          and lands in the merchant's «Pre-órdenes» table + notification bell,
+//          AND on the merchant plan board (merchant_week_plan) in the week the
+//          forecast sat on the board (else its handover week, else this week),
+//          ready to be dragged to another week.
+//          The merchant completes it to SKM with the usual wizard.
 //   POST   /api/forecast-orders/:id/convert           -> link the SKM orders made
 //          from it (total or partial), release / shrink its board cells and put
 //          the new SKMs on the merchant week plan so they show in the Plan Board
@@ -84,6 +92,9 @@
 //     season?, handoverDate?, operators, samMinutes, workingHours,
 //     efficiency? (0.85 or 85; default 100%), notes? }
 // ==========================================================================
+
+// Tablero del merchant: la PRE que se manda desde aquí nace ya en su semana.
+const { placePreOrder } = require("./merchant-plan");
 
 async function initSchema({ pool, setSchema }) {
   const client = await pool.connect();
@@ -124,6 +135,10 @@ async function initSchema({ pool, setSchema }) {
     await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS work_order_nos TEXT;");
     await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS converted_at TIMESTAMPTZ;");
     await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS converted_by BIGINT;");
+    // Hand-off to the merchant as PRE#### (see /to-pre-order). converted_pieces
+    // counts what left the forecast either way (sent as PRE or made as SKM).
+    await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS pre_order_ids BIGINT[] NOT NULL DEFAULT '{}';");
+    await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS pre_order_nos TEXT;");
     await client.query("ALTER TABLE forecast_orders DROP CONSTRAINT IF EXISTS chk_fc_status;");
     await client.query("ALTER TABLE forecast_orders ADD CONSTRAINT chk_fc_status CHECK (status IN ('active','partially_converted','converted','cancelled'));");
     await client.query("CREATE INDEX IF NOT EXISTS idx_forecast_orders_status ON forecast_orders(status);");
@@ -223,6 +238,7 @@ const SELECT_COLS = `
   GREATEST(f.quantity - f.converted_pieces, 0)     AS open_quantity,       -- still forecast
   GREATEST(f.quantity - f.converted_pieces - COALESCE(h.held, 0), 0) AS remaining_quantity,
   f.work_order_ids, f.work_order_nos, f.converted_at, f.converted_by,
+  f.pre_order_ids, f.pre_order_nos,
   to_char(h.first_day, 'YYYY-MM-DD')               AS first_day,
   to_char(h.last_day,  'YYYY-MM-DD')               AS last_day,
   COALESCE(h.lines, '{}')                          AS lines,
@@ -324,6 +340,15 @@ async function nextForecastNo(client) {
        FROM forecast_orders WHERE forecast_no LIKE 'FC%'`
   );
   return `FC${String((rows[0]?.maxseq || 0) + 1).padStart(4, "0")}`;
+}
+
+// Same numbering rule as pre-orders.js (PRE####).
+async function nextPreOrderNo(client) {
+  const { rows } = await client.query(
+    `SELECT COALESCE(MAX((substring(pre_order_no from '^PRE([0-9]+)'))::int), 0) AS maxseq
+       FROM pre_orders WHERE pre_order_no LIKE 'PRE%'`
+  );
+  return `PRE${String((rows[0]?.maxseq || 0) + 1).padStart(4, "0")}`;
 }
 
 async function getOrderById(client, id) {
@@ -590,7 +615,7 @@ function registerForecastOrders(app, deps) {
         params.push(`%${search}%`);
         const p = `$${params.length}`;
         where.push(`(f.forecast_no ILIKE ${p} OR f.style_name ILIKE ${p} OR f.customer_name ILIKE ${p}
-                     OR f.style_description ILIKE ${p} OR f.season ILIKE ${p})`);
+                     OR f.style_description ILIKE ${p} OR f.season ILIKE ${p} OR f.pre_order_nos ILIKE ${p})`);
       }
       const { rows } = await client.query(
         `SELECT ${SELECT_COLS} ${FROM_JOIN}
@@ -786,6 +811,159 @@ function registerForecastOrders(app, deps) {
       }
       await client.query("COMMIT");
       res.json({ success: true, recalculated, forecastOrder: await getOrderById(client, id) });
+    }));
+
+  // ---- POST /:id/to-pre-order: send the forecast to the merchant ---------
+  // The planner does NOT fill the SKM details here. A PRE#### is created from
+  // what the forecast already knows and shows up in the merchant's
+  // «Pre-órdenes» table (pending, with a "from forecast FC####" badge and an
+  // unread notification). The merchant then completes it to SKM with the same
+  // wizard as any other pre-order.
+  // Body: { pieces?, customerPo?, notes?, fromDate? }
+  //   pieces ≥ open pieces (or omitted) → forecast 'converted', all cells released
+  //   pieces <  open pieces             → 'partially_converted', cells released
+  //                                        earliest first; the rest stays forecast
+  // The PRE gets planned_week = week of the forecast's next planned day (else
+  // its first cell, its handover week, or this week) and a row on the merchant
+  // plan board in that same week, so the merchant sees it in the week grid and
+  // can move it. The SKM made from it later inherits that week.
+  app.post("/api/forecast-orders/:id/to-pre-order", authenticateToken,
+    withClient("POST /api/forecast-orders/:id/to-pre-order", async (client, req, res) => {
+      const id = parseInt(req.params.id, 10);
+      const b = req.body || {};
+      const fromDate = isYmd(b.fromDate) ? b.fromDate : ymdLocal(new Date());
+      const uid = req.user?.id ?? null;
+
+      await client.query("BEGIN");
+      const { rows: cur } = await client.query(
+        `SELECT id, forecast_no, status, style_name, style_description, customer_id, customer_name,
+                season, quantity, converted_pieces, sam_minutes, notes, pre_order_ids, pre_order_nos,
+                to_char(handover_date,'YYYY-MM-DD') AS handover_date
+           FROM forecast_orders WHERE id = $1 FOR UPDATE`, [id]);
+      const f = cur[0];
+      if (!f) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, error: "Forecast order not found" }); }
+      if (!OPEN_STATUSES.includes(f.status)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, error: `This forecast order is ${f.status}` });
+      }
+      const open = Math.max(0, (Number(f.quantity) || 0) - (Number(f.converted_pieces) || 0));
+      if (!(open > 0)) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "Nothing left to send for this forecast" }); }
+      const asked = numOr(b.pieces, 0);
+      const pieces = Math.round(Math.min(asked > 0 ? asked : open, open) * 100) / 100;
+
+      // Client: catalog id if we have it (or an exact name match) → code for the PRE.
+      const cust = await resolveCustomer(client, { customerId: f.customer_id, customerName: f.customer_name });
+      let clienteCode = null;
+      if (cust.customerId) {
+        const { rows: c } = await client.query("SELECT code FROM customers WHERE id = $1", [cust.customerId]);
+        clienteCode = String(c[0]?.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 3) || null;
+      }
+
+      // Week where the forecast sits on the board (next planned day, else first cell / handover).
+      const { rows: wk } = await client.query(
+        `SELECT to_char(MIN(assigned_date) FILTER (WHERE assigned_date >= $2),'YYYY-MM-DD') AS next_day,
+                to_char(MIN(assigned_date),'YYYY-MM-DD') AS first_day
+           FROM forecast_day_holds WHERE forecast_order_id = $1`, [id, fromDate]);
+      // Siempre hay semana: sin casillas ni fecha de entrega, la semana actual.
+      const anchor = wk[0]?.next_day || wk[0]?.first_day || f.handover_date || fromDate;
+      const plannedWeek = mondayOf(anchor);
+
+      const noteParts = [
+        `Desde pronóstico ${f.forecast_no}`,
+        `Estilo: ${f.style_name}`,
+        f.season ? `Temporada: ${f.season}` : null,
+        txt(b.notes, 1500),
+        f.notes ? `Notas del pronóstico: ${f.notes}` : null,
+      ].filter(Boolean);
+
+      // Insert the PRE. Number clash (two people at once) → retry inside a SAVEPOINT
+      // so the transaction survives the failed attempt.
+      let pre = null;
+      for (let attempt = 0; attempt < 5 && !pre; attempt++) {
+        const no = await nextPreOrderNo(client);
+        await client.query("SAVEPOINT pre_no");
+        try {
+          const { rows } = await client.query(
+            `INSERT INTO pre_orders
+               (pre_order_no, tipo, modelo, correlativo, style_code, estilo, style_description,
+                customer_id, customer_name, cliente_code, customer_po, pieces, sam_minutes,
+                target_date, planned_week, notes, status,
+                source_forecast_id, source_forecast_no, source_style_name, source_season,
+                sent_by, merchant_seen_at,
+                created_by, updated_by, created_at, updated_at)
+             VALUES ($1,NULL,NULL,NULL,NULL,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',
+                     $12,$13,$14,$15,$16,NULL,$16,$16,NOW(),NOW())
+             RETURNING id, pre_order_no`,
+            [no, f.style_description || f.style_name, cust.customerId, cust.customerName || f.customer_name,
+             clienteCode, txt(b.customerPo, 60), pieces, Number(f.sam_minutes) || 0,
+             f.handover_date, plannedWeek, noteParts.join(" · ").slice(0, 2000),
+             f.id, f.forecast_no, txt(f.style_name, 120), txt(f.season, 60), uid]
+          );
+          await client.query("RELEASE SAVEPOINT pre_no");
+          pre = rows[0];
+        } catch (e) {
+          await client.query("ROLLBACK TO SAVEPOINT pre_no");
+          if (e.code !== "23505") throw e;
+        }
+      }
+      if (!pre) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, error: "Could not assign a pre-order number, try again" }); }
+
+      // Merchant plan board: the PRE row in plannedWeek. Best effort (own
+      // SAVEPOINT): if it fails the PRE still exists, keeps planned_week, and
+      // the merchant can drop it on the board by hand.
+      let boardRowId = null, boardError = null;
+      await client.query("SAVEPOINT merchant_board");
+      try {
+        boardRowId = await placePreOrder(client, {
+          id: pre.id,
+          pre_order_no: pre.pre_order_no,
+          customer_name: cust.customerName || f.customer_name,
+          customer_po: txt(b.customerPo, 60),
+          style_code: null,
+          estilo: null,
+          display_style: f.style_name,
+          style_description: f.style_description || f.style_name,
+          pieces,
+          sam_minutes: Number(f.sam_minutes) || 0,
+        }, plannedWeek, uid);
+        await client.query("RELEASE SAVEPOINT merchant_board");
+      } catch (e) {
+        await client.query("ROLLBACK TO SAVEPOINT merchant_board");
+        boardError = e.message;
+        console.warn(`\u26a0\ufe0f  forecast ${id} → ${pre.pre_order_no}: merchant board row not created:`, e.message);
+      }
+
+      // Forecast: pieces leave it (like an SKM conversion) and it remembers the PRE.
+      const newConverted = (Number(f.converted_pieces) || 0) + pieces;
+      const isFinal = newConverted + 1e-6 >= (Number(f.quantity) || 0);
+      const preIds = [...new Set([...(f.pre_order_ids || []).map(Number), Number(pre.id)])];
+      const preNos = [...new Set([...String(f.pre_order_nos || "").split(",").map((x) => x.trim()).filter(Boolean), pre.pre_order_no])];
+      await client.query(
+        `UPDATE forecast_orders SET
+            status = $2, converted_pieces = $3, pre_order_ids = $4, pre_order_nos = $5,
+            converted_at = CASE WHEN $6 THEN NOW() ELSE converted_at END,
+            converted_by = CASE WHEN $6 THEN $7 ELSE converted_by END,
+            updated_by = $7, updated_at = NOW()
+          WHERE id = $1`,
+        [id, isFinal ? "converted" : "partially_converted", newConverted, preIds, preNos.join(", "), isFinal, uid]
+      );
+
+      // Board cells: all released on a full hand-off; else shrink earliest first.
+      let releasedPieces = 0;
+      if (isFinal) {
+        const r = await client.query("DELETE FROM forecast_day_holds WHERE forecast_order_id = $1 RETURNING quantity", [id]);
+        releasedPieces = r.rows.reduce((t, x) => t + (Number(x.quantity) || 0), 0);
+      } else {
+        releasedPieces = await shrinkForecastHolds(client, id, pieces);
+      }
+
+      await client.query("COMMIT");
+      res.json({
+        success: true, partial: !isFinal, pieces, releasedPieces, plannedWeek,
+        onMerchantBoard: boardRowId != null, boardError,
+        preOrder: { id: pre.id, pre_order_no: pre.pre_order_no },
+        forecastOrder: await getOrderById(client, id),
+      });
     }));
 
   // ---- POST /:id/convert: the SKM orders made from this forecast ----------

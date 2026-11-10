@@ -48,6 +48,14 @@
 //   con is_pre_order = true, así el merchant no tiene que marcarlas a mano.
 //   Al convertir la pre-orden, pre-orders.js mueve la semana a las POs nuevas
 //   y borra la fila de pre-orden.
+//
+// PRE-ÓRDENES QUE MANDA PLANEACIÓN DESDE EL PRONÓSTICO
+//   forecast-orders.js (POST /api/forecast-orders/:id/to-pre-order) llama a
+//   registerMerchantPlan.placePreOrder() dentro de su transacción: la PRE nace
+//   ya en el tablero del merchant, en la semana donde estaba el pronóstico
+//   (o la semana actual si no estaba cargado). El merchant la arrastra a otra
+//   semana como cualquier otra ficha. GET devuelve además source_forecast_no
+//   para que el tablero pueda etiquetarla.
 // ==========================================================================
 
 async function initSchema({ pool, setSchema }) {
@@ -192,6 +200,44 @@ function upsertParams(item, userId) {
   ];
 }
 
+// Pone UNA pre-orden en el tablero del merchant (una fila, color '') en
+// `weekStart`. Usa el mismo UPSERT que el tablero, así si la fila ya existe
+// sólo se actualiza. La equivalencia es la última con la que se armó el plan.
+// `pre` = fila de pre_orders (id, pre_order_no, customer_name, customer_po,
+// style_code, estilo, style_description, pieces, sam_minutes) + opcional
+// display_style (texto a mostrar cuando aún no hay estilo cliente).
+async function placePreOrder(client, pre, weekStart, userId = null) {
+  if (!pre?.id || !isYmd(weekStart)) return null;
+  const { rows: eqRows } = await client.query(
+    "SELECT equivalence FROM merchant_week_plan WHERE equivalence > 0 ORDER BY updated_at DESC NULLS LAST LIMIT 1"
+  );
+  const eq = Number(eqRows[0]?.equivalence) > 0 ? Number(eqRows[0].equivalence) : 10;
+  const sam = Number(pre.sam_minutes) || 0;
+  const qty = Number(pre.pieces) || 0;
+  const eqPerPiece = sam / eq;
+  const params = upsertParams({
+    preOrderId: pre.id,
+    color: "",
+    weekStart,
+    workOrderNo: pre.pre_order_no,
+    customerName: pre.customer_name,
+    customerPo: pre.customer_po,
+    styleCode: pre.style_code,
+    estilo: pre.estilo || pre.display_style || null,
+    styleDescription: pre.style_description,
+    cantidad: qty,
+    samMinutes: sam,
+    equivalence: eq,
+    eqPerPiece,
+    eqPieces: qty * eqPerPiece,
+    sizes: [],
+    isPreOrder: true,
+  }, userId);
+  if (!params) return null;
+  const { rows } = await client.query(UPSERT_SQL, params);
+  return rows[0]?.id ?? null;
+}
+
 function registerMerchantPlan(app, deps) {
   const { authenticateToken, pool, setSchema } = deps;
 
@@ -201,14 +247,16 @@ function registerMerchantPlan(app, deps) {
     try {
       await setSchema(client);
       const { rows } = await client.query(
-        `SELECT id, work_order_id, pre_order_id, color,
-                to_char(week_start, 'YYYY-MM-DD') AS week_start,
-                work_order_no, customer_name, customer_po, style_code, estilo,
-                style_description, cantidad, sam_minutes, equivalence,
-                eq_per_piece, eq_pieces, sizes, is_pre_order,
-                set_id, set_component, updated_at
-           FROM merchant_week_plan
-          ORDER BY week_start, COALESCE(set_id, 0), work_order_no, color`
+        `SELECT m.id, m.work_order_id, m.pre_order_id, m.color,
+                to_char(m.week_start, 'YYYY-MM-DD') AS week_start,
+                m.work_order_no, m.customer_name, m.customer_po, m.style_code, m.estilo,
+                m.style_description, m.cantidad, m.sam_minutes, m.equivalence,
+                m.eq_per_piece, m.eq_pieces, m.sizes, m.is_pre_order,
+                m.set_id, m.set_component, m.updated_at,
+                p.source_forecast_id, p.source_forecast_no           -- PRE mandada desde el pronóstico
+           FROM merchant_week_plan m
+           LEFT JOIN pre_orders p ON p.id = m.pre_order_id
+          ORDER BY m.week_start, COALESCE(m.set_id, 0), m.work_order_no, m.color`
       );
       // The factor is global; surface the most-recently-touched value so the
       // board can restore the same equivalencia the plan was built with.
@@ -301,4 +349,5 @@ function registerMerchantPlan(app, deps) {
 }
 
 registerMerchantPlan.initSchema = initSchema;
+registerMerchantPlan.placePreOrder = placePreOrder;
 module.exports = registerMerchantPlan;
