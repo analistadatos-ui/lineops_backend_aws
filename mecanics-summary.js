@@ -1,47 +1,67 @@
 // ==========================================================================
 // mechanics-summary.js
 //
-// A single VMware-side proxy endpoint that fans out to the AWS API
-// (skyrina-backend, behind API Gateway in mx-central-1), merges the two
-// relevant responses, and returns one clean payload for the frontend.
+// Proxy endpoint that fans out to skyrina-backend (the Mechanics FastAPI
+// Lambda in mx-central-1), merges the relevant responses, and returns one
+// clean payload for the frontend.
 //
 // It calls, in parallel:
 //   1. GET /rh/bonos/semana/{semana}      -> per-mechanic bonus + closed/assigned + location
 //   2. GET /supervisor/dashboard/stats    -> global created/closed totals
 //
-// The AWS key/secret lives ONLY here on the server, never in the browser.
+// --------------------------------------------------------------------------
+// HOW IT REACHES SKYRINA (changed)
+// --------------------------------------------------------------------------
+// Previously this called the PUBLIC API Gateway URL over HTTPS, which from
+// inside the VPC had to go out through the NAT gateway.
+//
+// Now it invokes the skyrina-backend Lambda DIRECTLY with the AWS SDK. The
+// call goes through the Lambda VPC endpoint (vpce-01b56ab670f2e013f), so it
+// never leaves the VPC and the NAT gateway is no longer needed for it.
+// The request is wrapped in an API Gateway (REST / v1) event, which Mangum
+// in the FastAPI app already understands, so skyrina-backend needs NO changes.
+//
+// Access is controlled by IAM: the LineOps Lambda role has the
+// InvokeMechanicsLambda inline policy (lambda:InvokeFunction on skyrina-backend).
 //
 // --------------------------------------------------------------------------
 // SETUP
 // --------------------------------------------------------------------------
-// 1. Requires Node 18+ (uses the built-in global `fetch`). If you're on an
-//    older Node, install node-fetch and uncomment the require at the bottom
-//    of this comment block, OR switch to axios — see the note near the fetch call.
+// 1. Add the dependency:   npm install @aws-sdk/client-lambda
 //
-// 2. Add these to your .env on the VMware server:
-//      AWS_API_BASE=https://<api-id>.execute-api.mx-central-1.amazonaws.com/<stage>
-//      AWS_API_KEY=<the key/token issued for this integration>
-//    (No trailing slash on AWS_API_BASE. Include the stage, e.g. /prod.)
-//    If your FastAPI app mounts everything under a global /api prefix, append
-//    it here too: .../<stage>/api
+// 2. Environment variables on the LineOps Lambda:
+//      MECHANICS_FUNCTION_NAME=skyrina-backend          (required)
+//      MECHANICS_PATH_PREFIX=/api                       (optional; only if the
+//                                                        FastAPI app mounts its
+//                                                        routes under /api, i.e.
+//                                                        if the old AWS_API_BASE
+//                                                        ended in /api)
+//      AWS_API_KEY=<key>                                (optional; only forwarded
+//                                                        in case FastAPI itself
+//                                                        checks the x-api-key header)
+//    AWS_API_BASE is no longer used and can be removed.
 //
-// 3. Wire it into server.js after `authenticateToken` is defined:
+// 3. Wire it into server.js after `authenticateToken` is defined (unchanged):
 //      const registerMechanicsSummary = require("./mechanics-summary");
 //      registerMechanicsSummary(app, authenticateToken);
 //
-//    (If you prefer, paste the body of `registerMechanicsSummary` directly
-//     into server.js instead — it's written to match your existing style.)
-//
-// const fetch = require("node-fetch"); // <- only if on Node < 18
+// NOTE: this event format is for a REST API (v1) trigger. If skyrina-backend
+// is fronted by an HTTP API, the event must use the version 2.0 format.
 // ==========================================================================
 
-// --- Config -------------------------------------------------------------
-const AWS_API_BASE = process.env.AWS_API_BASE; // e.g. https://abc.execute-api.mx-central-1.amazonaws.com/prod
-const AWS_API_KEY = process.env.AWS_API_KEY;
+const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
 
-// API Gateway hard-kills requests at 29s. Stay comfortably under that so a
-// slow AWS call fails fast instead of hanging your frontend.
+// --- Config -------------------------------------------------------------
+const MECHANICS_FUNCTION_NAME = process.env.MECHANICS_FUNCTION_NAME; // e.g. skyrina-backend
+const MECHANICS_PATH_PREFIX = (process.env.MECHANICS_PATH_PREFIX || "").replace(/\/$/, "");
+const AWS_API_KEY = process.env.AWS_API_KEY; // optional
+
+// Fail fast instead of hanging the frontend if skyrina is slow.
 const AWS_TIMEOUT_MS = 15000;
+
+const lambdaClient = new LambdaClient({
+  region: process.env.AWS_REGION || "mx-central-1",
+});
 
 // --- Helpers ------------------------------------------------------------
 
@@ -68,29 +88,74 @@ function isValidYear(s) {
   return typeof s === "string" && /^\d{4}$/.test(s);
 }
 
-// One fetch with a timeout + auth header + JSON parsing, with useful errors.
+// Build an API Gateway REST (v1) proxy event for a GET request.
+function buildApiGatewayEvent(path) {
+  const url = new URL(`${MECHANICS_PATH_PREFIX}${path}`, "http://internal");
+  const query = url.searchParams.toString()
+    ? Object.fromEntries(url.searchParams.entries())
+    : null;
+
+  const headers = { accept: "application/json" };
+  if (AWS_API_KEY) headers["x-api-key"] = AWS_API_KEY;
+
+  return {
+    resource: "/{proxy+}",
+    path: url.pathname,
+    httpMethod: "GET",
+    headers,
+    multiValueHeaders: Object.fromEntries(Object.entries(headers).map(([k, v]) => [k, [v]])),
+    queryStringParameters: query,
+    multiValueQueryStringParameters: query
+      ? Object.fromEntries(Object.entries(query).map(([k, v]) => [k, [v]]))
+      : null,
+    pathParameters: { proxy: url.pathname.replace(/^\//, "") },
+    stageVariables: null,
+    requestContext: {
+      resourcePath: "/{proxy+}",
+      httpMethod: "GET",
+      path: url.pathname,
+      stage: "internal",
+      requestId: `lineops-${Date.now()}`,
+      identity: { sourceIp: "127.0.0.1", userAgent: "lineops-lambda" },
+    },
+    body: null,
+    isBase64Encoded: false,
+  };
+}
+
+// One direct Lambda invoke with a timeout + JSON parsing, with useful errors.
+// Same signature and return value as the old fetch-based awsGet, so the
+// route code below is unchanged.
 async function awsGet(path) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AWS_TIMEOUT_MS);
 
   try {
-    const res = await fetch(`${AWS_API_BASE}${path}`, {
-      method: "GET",
-      headers: {
-        // NOTE: adjust this header to whatever your API Gateway actually
-        // expects. `x-api-key` is the API-key style. If you use a bearer
-        // token instead, replace with: Authorization: `Bearer ${AWS_API_KEY}`
-        "x-api-key": AWS_API_KEY,
-        Accept: "application/json",
-      },
-      signal: controller.signal,
-    });
+    const result = await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: MECHANICS_FUNCTION_NAME,
+        Payload: Buffer.from(JSON.stringify(buildApiGatewayEvent(path))),
+      }),
+      { abortSignal: controller.signal }
+    );
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`AWS ${path} -> ${res.status} ${res.statusText} ${text}`.trim());
+    const raw = result.Payload ? Buffer.from(result.Payload).toString("utf8") : "";
+
+    // The skyrina function itself crashed (unhandled error, timeout, etc.).
+    if (result.FunctionError) {
+      throw new Error(`AWS ${path} -> Lambda error (${result.FunctionError}) ${raw}`.trim());
     }
-    return await res.json();
+
+    const out = raw ? JSON.parse(raw) : {};
+    const status = out.statusCode || 500;
+    const body = out.isBase64Encoded && out.body
+      ? Buffer.from(out.body, "base64").toString("utf8")
+      : out.body;
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`AWS ${path} -> ${status} ${body || ""}`.trim());
+    }
+    return body ? JSON.parse(body) : {};
   } catch (err) {
     if (err.name === "AbortError") {
       throw new Error(`AWS ${path} timed out after ${AWS_TIMEOUT_MS}ms`);
@@ -114,18 +179,18 @@ function effectiveBonus(m) {
  * @param {import('express').RequestHandler} authenticateToken  reuse your existing middleware
  */
 module.exports = function registerMechanicsSummary(app, authenticateToken) {
-  if (!AWS_API_BASE || !AWS_API_KEY) {
+  if (!MECHANICS_FUNCTION_NAME) {
     console.warn(
-      "⚠️  mechanics-summary: AWS_API_BASE or AWS_API_KEY not set — /api/mechanics-summary will return 500 until configured."
+      "⚠️  mechanics-summary: MECHANICS_FUNCTION_NAME not set — /api/mechanics-summary will return 500 until configured."
     );
   }
 
   app.get("/api/mechanics-summary", authenticateToken, async (req, res) => {
     try {
-      if (!AWS_API_BASE || !AWS_API_KEY) {
+      if (!MECHANICS_FUNCTION_NAME) {
         return res.status(500).json({
           success: false,
-          error: "AWS integration not configured (missing AWS_API_BASE / AWS_API_KEY).",
+          error: "AWS integration not configured (missing MECHANICS_FUNCTION_NAME).",
         });
       }
 
