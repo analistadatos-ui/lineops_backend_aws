@@ -790,6 +790,48 @@ function registerWorkOrders(app, deps) {
     }
   });
 
+  // ---- GET /api/customer-production?customer=NAME&from=&to= -------------
+  //
+  // Piezas terminadas por (ORDEN, LINEA, DIA) de TODAS las ordenes de un
+  // cliente. Lo usa el panel de detalle de «Resumen por cliente» para pintar
+  // en que lineas se ha cosido, el historico semanal y el ritmo real con el
+  // que se proyecta la fecha de entrega. Mismo enlace line_runs->orden y las
+  // mismas operaciones de empaque que produced_quantity
+  // (producedByLineDayForMany), asi que los totales cuadran con la lista.
+  //
+  // Incluye ordenes completadas/canceladas: el cliente puede tener produccion
+  // historica aunque hoy tenga 0 ordenes activas.
+  app.get("/api/customer-production", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const customer = String(req.query.customer || "").trim();
+      if (!customer) {
+        return res.status(400).json({ success: false, error: "Falta el parametro customer" });
+      }
+      const { rows: wos } = await client.query(
+        `SELECT id FROM work_orders WHERE UPPER(TRIM(customer_name)) = UPPER($1)`,
+        [customer]
+      );
+      const ids = wos.map((r) => Number(r.id));
+      // Sin ordenes no se llama al helper: con una lista vacia regresaria la
+      // produccion de TODOS los clientes.
+      if (ids.length === 0) return res.json({ success: true, resolved: true, rows: [] });
+
+      const rows = await producedByLineDayForMany(client, {
+        workOrderIds: ids,
+        from: req.query.from || null,
+        to: req.query.to || null,
+      });
+      res.json({ success: true, resolved: !!RESOLVED_RUN_LINK, rows });
+    } catch (err) {
+      console.error("\u274c Error en customer-production:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
   // ---- POST /api/line-assignments/settle-day ----------------------------
   //
   // Cierra una celda por lo que REALMENTE se cosio y devuelve el saldo.
