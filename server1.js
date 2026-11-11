@@ -903,6 +903,17 @@ const allowRoles = (...roles) => (req, res, next) => {
   next();
 };
 
+// 👑 PRIVILEGED ACCOUNTS
+// Only a master (the CEO, or factory_director through the role alias) may create,
+// edit or deactivate master / factory_director accounts, or give anyone those roles.
+const PRIVILEGED_ROLES = ["master", "factory_director","admin"];
+const USER_ROLES = ["engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "master", "factory_director", "admin"];
+const canManagePrivileged = (req) => Boolean(req.user && ["master", "admin"].includes(req.user.role));
+const denyPrivileged = (req, res, action, extra = {}) => {
+  logger.warn("Blocked: non-master tried to manage a privileged account", { by: req.user?.username, action, ...extra });
+  return res.status(403).json({ success: false, error: "Only a master user can manage master or director accounts." });
+};
+
 // ----------------------------------------------------------------------
 // 8. VALIDATION HELPERS
 // ----------------------------------------------------------------------
@@ -915,8 +926,13 @@ const validate = (validations) => {
       return next();
     }
 
-    const extractedErrors = errors.array().map((err) => ({ [err.param]: err.msg }));
-    logger.warn("Validation error", { errors: extractedErrors, body: req.body });
+        const extractedErrors = errors.array().map((err) => ({ [err.param]: err.msg }));
+    // Never write passwords, tokens or keys to the logs.
+    const SENSITIVE_FIELD = /pass(word)?|secret|token|api[-_]?key/i;
+    const safeBody = req.body && typeof req.body === "object"
+      ? Object.fromEntries(Object.entries(req.body).map(([k, v]) => [k, SENSITIVE_FIELD.test(k) ? "[redacted]" : v]))
+      : req.body;
+    logger.warn("Validation error", { errors: extractedErrors, body: safeBody });
     return res.status(400).json({
       success: false,
       error: "Validation failed",
@@ -10920,7 +10936,11 @@ app.post(
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { username, password, role, line_number, full_name } = req.body;
+            const { username, password, role, line_number, full_name } = req.body;
+
+      if (PRIVILEGED_ROLES.includes(role) && !canManagePrivileged(req)) {
+        return denyPrivileged(req, res, "create", { role });
+      }
 
       if (role === "line_leader") {
         const existing = await client.query(
@@ -10957,15 +10977,28 @@ app.post(
   }
 );
 
-app.put("/api/users/:id", authenticateToken, allowRoles("engineer", "supervisor", "master"), async (req, res, next) => {
+app.put("/api/users/:id", authenticateToken, allowRoles("engineer", "supervisor", "master", "admin"), async (req, res, next) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
     const { id } = req.params;
     const { username, password, role, line_number, full_name, is_active } = req.body;
 
-    if (parseInt(id, 10) === req.user.id && is_active === false) {
+        if (parseInt(id, 10) === req.user.id && is_active === false) {
       return res.status(400).json({ success: false, error: "You cannot deactivate your own account" });
+    }
+    if (role !== undefined && !USER_ROLES.includes(role)) {
+      return res.status(400).json({ success: false, error: "Invalid role" });
+    }
+    if (password !== undefined && (typeof password !== "string" || password.length < 8)) {
+      return res.status(400).json({ success: false, error: "Password must be at least 8 characters" });
+    }
+    if (!canManagePrivileged(req)) {
+      const target = await client.query("SELECT role FROM users WHERE id = $1", [id]);
+      const targetRole = target.rows[0]?.role;
+      if (PRIVILEGED_ROLES.includes(targetRole) || PRIVILEGED_ROLES.includes(role)) {
+        return denyPrivileged(req, res, "update", { userId: id, targetRole, newRole: role });
+      }
     }
 
     const updates = [];
@@ -11025,8 +11058,14 @@ app.delete("/api/users/:id", authenticateToken, allowRoles("engineer", "supervis
   try {
     await setSchema(client);
     const { id } = req.params;
-    if (parseInt(id, 10) === req.user.id) {
+        if (parseInt(id, 10) === req.user.id) {
       return res.status(400).json({ success: false, error: "Cannot delete your own account" });
+    }
+    if (!canManagePrivileged(req)) {
+      const target = await client.query("SELECT role FROM users WHERE id = $1", [id]);
+      if (PRIVILEGED_ROLES.includes(target.rows[0]?.role)) {
+        return denyPrivileged(req, res, "deactivate", { userId: id });
+      }
     }
 
     const result = await client.query(
