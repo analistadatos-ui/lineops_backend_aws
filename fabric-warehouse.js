@@ -34,6 +34,21 @@
 //                               custom origin header "X-Origin-Verify". When set,
 //                               calls that skip CloudFront (straight to the
 //                               API Gateway URL) are rejected with 403.
+//   FABRIC_SKYTEX_ALLOWED_IPS   optional: comma-separated IPs Skytex calls from.
+//                               Read from "CloudFront-Viewer-Address", which
+//                               CloudFront sets itself (the caller cannot fake it);
+//                               the distribution must forward that header to the
+//                               origin. Other IPs get 403.
+//   FABRIC_SKYTEX_SIGNING_SECRET  optional: shared secret for signed pushes. Skytex sends
+//                               X-Skytex-Timestamp: <unix seconds>
+//                               X-Skytex-Signature: sha256=<hex HMAC-SHA256(secret,
+//                                                   "<timestamp>.<raw body>")>
+//                               Requests older than 5 minutes are rejected (replay).
+//                               server.js must keep the raw body (req.rawBody).
+//   FABRIC_SKYTEX_REQUIRE_SIGNATURE  "true" = unsigned pushes are rejected and the
+//                               API key alone is no longer accepted. Leave unset
+//                               while Skytex migrates (then a signature, if sent,
+//                               must be valid, otherwise the API key is checked).
 //   FABRIC_AGING_DAYS   optional, days in stock before a roll is flagged (default 30)
 // Until the API is live, the screen also accepts the test JSON pasted or uploaded
 // (POST /api/fabric-warehouse/skytex/preview) and runs it through the same mapper.
@@ -754,7 +769,12 @@ function registerFabricWarehouse(app, deps) {
   //   { "transfer_id": "TR-2026-000123", "event": "transfer", "data": [ {roll}, … ] }
   // (transfer_id may also come inside each roll.)
   //
-  // Auth: header "X-Api-Key: <FABRIC_SKYTEX_WEBHOOK_KEY>" (or Authorization: Bearer).
+  // Auth, in this order (see the header of this file for the env vars):
+  //   1. X-Origin-Verify (only through CloudFront)       -> 403
+  //   2. caller IP in FABRIC_SKYTEX_ALLOWED_IPS, if set  -> 403
+  //   3. HMAC signature (X-Skytex-Signature + X-Skytex-Timestamp) when sent or
+  //      required; otherwise header "X-Api-Key: <FABRIC_SKYTEX_WEBHOOK_KEY>"
+  //      (or Authorization: Bearer)                      -> 401
   //
   // Idempotent — sending the same transfer_id again (retry or correction):
   //   • rolls already registered are UPDATED with the new data (never duplicated)
@@ -783,16 +803,82 @@ function registerFabricWarehouse(app, deps) {
     return null;
   };
 
+  // --- Extra checks for the Skytex push (each one is off until configured) ---
+  const SIGNATURE_TOLERANCE_S = 300; // 5 minutes: older signed requests are treated as replays
+
+  const allowedSkytexIps = () =>
+    String(process.env.FABRIC_SKYTEX_ALLOWED_IPS || "").split(",").map((s) => s.trim()).filter(Boolean);
+
+  // CloudFront-Viewer-Address is "1.2.3.4:5678" (IPv4) or "2001:db8::1:5678" (IPv6).
+  const viewerIp = (req) => {
+    const v = String(req.get("cloudfront-viewer-address") || "").trim();
+    if (!v) return null;
+    const m = v.match(/^\[?([^\]]+?)\]?:\d+$/);
+    return m ? m[1] : v;
+  };
+
+  const signatureRequired = () => String(process.env.FABRIC_SKYTEX_REQUIRE_SIGNATURE || "").trim().toLowerCase() === "true";
+
+  // Returns { sent, ok, reason }. "sent" = the caller included signature headers.
+  const checkSignature = (req) => {
+    const secret = String(process.env.FABRIC_SKYTEX_SIGNING_SECRET || "").trim();
+    const sig = String(req.get("x-skytex-signature") || "").trim().replace(/^sha256=/i, "").toLowerCase();
+    const ts = String(req.get("x-skytex-timestamp") || "").trim();
+    const sent = Boolean(sig || ts);
+    if (!sent) return { sent, ok: false, reason: "missing signature headers" };
+    if (!secret) return { sent, ok: false, reason: "signing secret not configured on Skyrina side" };
+    if (!sig || !ts) return { sent, ok: false, reason: "both X-Skytex-Signature and X-Skytex-Timestamp are required" };
+    if (!/^\d{9,11}$/.test(ts) || Math.abs(Date.now() / 1000 - Number(ts)) > SIGNATURE_TOLERANCE_S) {
+      return { sent, ok: false, reason: "timestamp invalid or older than 5 minutes" };
+    }
+    if (!Buffer.isBuffer(req.rawBody)) return { sent, ok: false, reason: "raw body not available (server.js must set req.rawBody)" };
+    const expected = crypto.createHmac("sha256", secret).update(`${ts}.`).update(req.rawBody).digest("hex");
+    return sameKey(sig, expected) ? { sent, ok: true } : { sent, ok: false, reason: "signature does not match" };
+  };
+
+  // Log rejected calls (without secrets) so attempts show up in CloudWatch.
+  const logRejected = (req, status, reason) =>
+    console.warn(`[skytex-webhook] rejected ${status}: ${reason} (ip=${viewerIp(req) || "unknown"})`);
+
   app.post(`${BASE}/skytex/transfers`, withClient(async (req, res, client) => {
     // Only through CloudFront (which adds X-Origin-Verify), never straight to API Gateway.
     const originSecret = String(process.env.FABRIC_ORIGIN_VERIFY || "").trim();
     if (originSecret && !sameKey(String(req.get("x-origin-verify") || ""), originSecret)) {
+      logRejected(req, 403, "missing or wrong X-Origin-Verify");
       return res.status(403).json({ success: false, code: "forbidden", error: "Use the published URL." });
     }
+
+    // Only Skytex's own IPs, when the list is configured.
+    const ips = allowedSkytexIps();
+    if (ips.length) {
+      const ip = viewerIp(req);
+      if (!ip || !ips.includes(ip)) {
+        logRejected(req, 403, "IP not in FABRIC_SKYTEX_ALLOWED_IPS");
+        return res.status(403).json({ success: false, code: "forbidden", error: "Caller not allowed." });
+      }
+    }
+
     const key = webhookKey();
-    if (!key) return res.status(503).json({ success: false, code: "not_configured", error: "Webhook not configured on Skyrina side (FABRIC_SKYTEX_WEBHOOK_KEY)." });
-    const sent = String(req.get("x-api-key") || "").trim() || String(req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
-    if (!sent || !sameKey(sent, key)) return res.status(401).json({ success: false, code: "unauthorized", error: "Invalid or missing API key." });
+    const signingConfigured = Boolean(String(process.env.FABRIC_SKYTEX_SIGNING_SECRET || "").trim());
+    if (!key && !signingConfigured) {
+      return res.status(503).json({ success: false, code: "not_configured", error: "Webhook not configured on Skyrina side (FABRIC_SKYTEX_WEBHOOK_KEY or FABRIC_SKYTEX_SIGNING_SECRET)." });
+    }
+
+    // Signature first: required, or checked whenever Skytex sends one.
+    const sig = checkSignature(req);
+    if (signatureRequired() || sig.sent) {
+      if (!sig.ok) {
+        logRejected(req, 401, sig.reason);
+        return res.status(401).json({ success: false, code: "unauthorized", error: `Invalid request signature: ${sig.reason}.` });
+      }
+    } else {
+      // Transition period: unsigned calls still authenticate with the API key.
+      const sent = String(req.get("x-api-key") || "").trim() || String(req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+      if (!key || !sent || !sameKey(sent, key)) {
+        logRejected(req, 401, "invalid or missing API key");
+        return res.status(401).json({ success: false, code: "unauthorized", error: "Invalid or missing API key." });
+      }
+    }
 
     const body = req.body;
     if (!body || typeof body !== "object") return res.status(400).json({ success: false, code: "invalid_payload", error: "Body must be JSON." });
