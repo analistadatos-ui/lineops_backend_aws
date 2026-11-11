@@ -11,13 +11,13 @@
 //       Producción de UNA semana bloqueada, opcionalmente filtrada por cliente
 //       y/o estilo interno (line_runs.style).
 //         format=json -> vista previa + listas de clientes/estilos para los filtros
-//         format=xlsx -> Excel con 5 hojas, mismo formato que el reporte NIKE:
+//         format=xlsx -> Excel con 6 hojas, mismo formato que el reporte NIKE:
 //                        Summary (por estilo) · Daily · Production detail ·
-//                        Forward schedule · Plan by week
+//                        Forward schedule · Plan board · Plan by week
 //       Forward schedule / Plan by week = lo PLANEADO desde el lunes de la semana actual hasta el viernes
 //       de la semana actual + 4 (line_assignments del Plan Board), con los
-//       mismos filtros de cliente/estilo. Cada asignación se reparte en partes
-//       iguales entre sus días hábiles (lun–vie) de planned_start a planned_end.
+//       mismos filtros de cliente/estilo. Una fila por celda del Plan Board:
+//       su día (assigned_date) y su cantidad (assigned_quantity).
 //       Si la semana NO está bloqueada responde 409.
 //
 // "Output" = piezas de las operaciones de empaque/terminado, con las MISMAS
@@ -276,55 +276,70 @@ function forwardWindow() {
   return { from, to };
 }
 
-// Una fila por día hábil + asignación (línea + orden).
+// Una fila por celda del Plan Board.
+//
+// En el Plan Board cada asignación es UNA celda: un día (assigned_date) con su
+// cantidad (assigned_quantity). planned_start_date / planned_end_date NO son el
+// rango de esa celda: al fusionar celdas (mergeOrInsertAssignment) se ensanchan
+// con LEAST/GREATEST, así que varias celdas de la misma orden terminan con el
+// mismo rango lun–jue. Antes se repartía cada celda en ese rango y la orden
+// salía repetida (3 filas por día en la línea 9). Ahora cada celda va en su
+// día y con su cantidad completa, igual que se ve en el tablero.
+//
+// "Planned start" / "Planned end" del Excel = primer y último día que esa
+// orden+color tiene en esa línea (todas sus celdas activas, no solo las de la
+// ventana).
 async function fetchForward(client, { from, to }) {
   const { rows } = await client.query(
-    `SELECT la.id, la.line_no,
-            to_char(COALESCE(la.planned_start_date, la.assigned_date), 'YYYY-MM-DD') AS ps,
-            to_char(COALESCE(la.planned_end_date, la.planned_start_date, la.assigned_date), 'YYYY-MM-DD') AS pe,
-            la.assigned_quantity,
-            COALESCE(NULLIF(TRIM(la.color), ''), wo.color) AS color,
+    `WITH cells AS (
+       SELECT la.*,
+              COALESCE(la.assigned_date, la.planned_start_date) AS cell_date
+         FROM line_assignments la
+         JOIN work_orders wo ON wo.id = la.work_order_id
+        WHERE la.status NOT IN ('cancelled', 'completed')
+          AND wo.status <> 'completed'
+     ),
+     ranged AS (
+       SELECT c.*,
+              MIN(c.cell_date) OVER w AS run_start,
+              MAX(c.cell_date) OVER w AS run_end
+         FROM cells c
+       WINDOW w AS (PARTITION BY c.work_order_id, c.line_no, COALESCE(c.color, ''))
+     )
+     SELECT r.id, r.line_no,
+            to_char(r.cell_date, 'YYYY-MM-DD') AS d,
+            to_char(r.run_start, 'YYYY-MM-DD') AS ps,
+            to_char(r.run_end,   'YYYY-MM-DD') AS pe,
+            r.assigned_quantity,
+            COALESCE(NULLIF(TRIM(r.color), ''), wo.color) AS color,
             wo.work_order_no, wo.customer_name, wo.style_code, wo.estilo,
             wo.customer_po, wo.tech_pack_no, wo.season
-       FROM line_assignments la
-       JOIN work_orders wo ON wo.id = la.work_order_id
-      WHERE la.status NOT IN ('cancelled', 'completed')
-        AND wo.status <> 'completed'
-        AND COALESCE(la.planned_end_date, la.planned_start_date, la.assigned_date) >= $1::date
-        AND COALESCE(la.planned_start_date, la.assigned_date) <= $2::date`,
+       FROM ranged r
+       JOIN work_orders wo ON wo.id = r.work_order_id
+      WHERE r.cell_date BETWEEN $1::date AND $2::date`,
     [from, to]
   );
 
   const out = [];
   for (const r of rows) {
-    const ps = r.ps;
-    const pe = r.pe < ps ? ps : r.pe;
-    let days = workdaysBetween(ps, pe);
-    if (!days.length) days = [ps]; // asignación solo en fin de semana: se deja en su día
-    const total = Math.round(num(r.assigned_quantity));
-    const base = Math.floor(total / days.length);
-    let rest = total - base * days.length;
-    days.forEach((d) => {
-      const qty = base + (rest > 0 ? 1 : 0);
-      if (rest > 0) rest -= 1;
-      if (d < from || d > to || qty <= 0) return;
-      const lineNum = Number(r.line_no);
-      out.push({
-        date: d,
-        week_of: mondayOf(d),
-        line_no: Number.isFinite(lineNum) ? lineNum : r.line_no,
-        style: r.style_code || "",
-        customer_name: r.customer_name || null,
-        client_style: r.estilo || null,
-        work_order_no: r.work_order_no,
-        customer_po: r.customer_po || null,
-        tech_pack_no: r.tech_pack_no || null,
-        season: r.season || null,
-        color: r.color || null,
-        qty,
-        planned_start: ps,
-        planned_end: pe,
-      });
+    const qty = Math.round(num(r.assigned_quantity));
+    if (!r.d || qty <= 0) continue;
+    const lineNum = Number(r.line_no);
+    out.push({
+      date: r.d,
+      week_of: mondayOf(r.d),
+      line_no: Number.isFinite(lineNum) ? lineNum : r.line_no,
+      style: r.style_code || "",
+      customer_name: r.customer_name || null,
+      client_style: r.estilo || null,
+      work_order_no: r.work_order_no,
+      customer_po: r.customer_po || null,
+      tech_pack_no: r.tech_pack_no || null,
+      season: r.season || null,
+      color: r.color || null,
+      qty,
+      planned_start: r.ps || r.d,
+      planned_end: r.pe || r.d,
     });
   }
   out.sort(
@@ -634,7 +649,7 @@ async function buildWorkbook(rows, info, { customer, style }, forward = { rows: 
   title(
     fws,
     `${who} Forward Production Schedule – ${wf.md} to ${wt.md}, ${wt.y} (current week + ${FORWARD_WEEKS} weeks)`,
-    `Planned qty per working day (Mon–Fri) = assigned quantity of each Plan Board assignment spread evenly from its planned start to its planned end. ` +
+    `One row per Plan Board cell: planned qty = the quantity assigned to that line on that day. Planned start / end = first and last day of that order on that line. ` +
       `Fill the ${tag} internal order no. (yellow column) where missing. ${filterNote}`
   );
   const fwCols = [
@@ -753,12 +768,120 @@ async function buildWorkbook(rows, info, { customer, style }, forward = { rows: 
   for (let c = 4; c <= 4 + weeks.length; c++) pTot.getCell(c).numFmt = FMT_INT;
   void totCol;
 
+  // ---------------------------------------------------------- Plan board ----
+  // Misma vista que el Plan Board: una fila por línea, una columna por día
+  // hábil. Cada celda lleva lo asignado a esa línea ese día (estilo · color,
+  // orden y piezas); si hay varias órdenes en el mismo día van una debajo de
+  // otra. Cada orden tiene su propio color para seguirla a lo largo de la fila.
+  const pb = wb.addWorksheet("Plan board", { views: [{ state: "frozen", xSplit: 1, ySplit: 4, showGridLines: false }] });
+  title(
+    pb,
+    `${who} Plan Board – ${wf.md} to ${wt.md}, ${wt.y}`,
+    `Same layout as the Plan Board: one row per line, one column per working day. Each cell = what is assigned to that line that day ` +
+      `(style · color, work order, pcs). Same work order = same color. ${filterNote}`
+  );
+  const pbDays = workdaysBetween(mondayOf(win.from), win.to);
+  const lines = [...new Set(fw.map((r) => String(r.line_no)))].sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true })
+  );
+  // Fila 3: semana ISO sobre el lunes de cada semana. Fila 4: día.
+  pb.getRow(4).getCell(1).value = "Line";
+  pbDays.forEach((d, i) => {
+    const col = 2 + i;
+    const [, m, dd] = d.split("-").map(Number);
+    if (dowUtc(d) === 1) {
+      const c3 = pb.getRow(3).getCell(col);
+      c3.value = `S${isoWeek(d).week}`;
+      c3.font = F_BOLD;
+    }
+    pb.getRow(4).getCell(col).value = `${DOW_EN[dowUtc(d)]} ${dd} ${MONTHS_EN[m - 1]}`;
+    pb.getColumn(col).width = 20;
+  });
+  pb.getRow(4).getCell(2 + pbDays.length).value = "Total";
+  header(pb, 4, [pb.getRow(4).getCell(1).value, ...pbDays.map((_, i) => pb.getRow(4).getCell(2 + i).value), "Total"]);
+  pb.getColumn(1).width = 7;
+  pb.getColumn(2 + pbDays.length).width = 10;
+  // Lunes con borde izquierdo grueso para separar semanas, como el tablero.
+  const weekEdge = (cell, d) => {
+    if (dowUtc(d) === 1) cell.border = { ...(cell.border || {}), left: { style: "medium", color: { argb: NAVY } } };
+  };
+
+  const PALETTE = ["FFDDEBF7", "FFFCE4D6", "FFE2EFDA", "FFFFF2CC", "FFEDE1F5", "FFDDF3F3", "FFF8DCE6", "FFE7E6E6"];
+  const woColor = new Map();
+  const colorOf = (wo) => {
+    if (!woColor.has(wo)) woColor.set(wo, PALETTE[woColor.size % PALETTE.length]);
+    return woColor.get(wo);
+  };
+
+  const cellMap = new Map(); // "linea|dia" -> filas
+  for (const r of fw) {
+    const k = `${r.line_no}|${r.date}`;
+    if (!cellMap.has(k)) cellMap.set(k, []);
+    cellMap.get(k).push(r);
+  }
+  const dayTotals = pbDays.map(() => 0);
+  lines.forEach((ln, li) => {
+    const row = pb.getRow(5 + li);
+    const lc = row.getCell(1);
+    lc.value = `L${ln}`;
+    lc.font = F_BOLD;
+    lc.alignment = { vertical: "middle", horizontal: "center" };
+    let lineTotal = 0;
+    let maxLines = 1;
+    pbDays.forEach((d, i) => {
+      const c = row.getCell(2 + i);
+      const items = (cellMap.get(`${ln}|${d}`) || []).sort((a, b) =>
+        String(a.work_order_no).localeCompare(String(b.work_order_no))
+      );
+      c.alignment = { vertical: "top", wrapText: true };
+      c.font = { ...F_BODY, size: 9 };
+      c.border = { top: { style: "thin", color: { argb: "FFD9D9D9" } }, bottom: { style: "thin", color: { argb: "FFD9D9D9" } },
+                   left: { style: "thin", color: { argb: "FFD9D9D9" } }, right: { style: "thin", color: { argb: "FFD9D9D9" } } };
+      if (items.length) {
+        c.value = items
+          .map((r) => `${r.style}${r.color ? ` · ${r.color}` : ""}\n${r.work_order_no || ""}\n${r.qty.toLocaleString("en-US")} pcs`)
+          .join("\n\n");
+        c.fill = fill(colorOf(items[0].work_order_no));
+        const q = items.reduce((s, r) => s + r.qty, 0);
+        lineTotal += q;
+        dayTotals[i] += q;
+        maxLines = Math.max(maxLines, items.length * 4 - 1);
+      } else {
+        c.fill = FILL_GREY;
+      }
+      weekEdge(c, d);
+    });
+    const t = row.getCell(2 + pbDays.length);
+    t.value = lineTotal;
+    t.numFmt = FMT_INT;
+    t.font = F_BOLD;
+    t.alignment = { vertical: "middle" };
+    row.height = Math.max(15, maxLines * 12 + 4);
+  });
+  const pbT = pb.getRow(5 + lines.length);
+  pbT.getCell(1).value = "TOTAL";
+  dayTotals.forEach((v, i) => {
+    const c = pbT.getCell(2 + i);
+    c.value = v;
+    c.numFmt = FMT_INT;
+  });
+  pbT.getCell(2 + pbDays.length).value = plannedTotal;
+  styleRow(pbT, 2 + pbDays.length, { font: F_BOLD, fillAll: FILL_TOTAL });
+  pbT.getCell(2 + pbDays.length).numFmt = FMT_INT;
+  pbDays.forEach((d, i) => weekEdge(pbT.getCell(2 + i), d));
+  if (!lines.length) {
+    const c = pb.getCell(`A${7 + lines.length}`);
+    c.value = "No planned production in this window for the selected filters.";
+    c.font = F_NOTE;
+  }
+
   // Mismo orden de hojas que el reporte NIKE.
   sum.orderNo = 0;
   day.orderNo = 1;
   det.orderNo = 2;
   fws.orderNo = 3;
-  pbw.orderNo = 4;
+  pb.orderNo = 4;
+  pbw.orderNo = 5;
   wb.worksheets.sort((a, b) => a.orderNo - b.orderNo);
 
   return wb;
