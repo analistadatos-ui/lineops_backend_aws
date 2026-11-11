@@ -14,7 +14,7 @@
 //         format=xlsx -> Excel con 5 hojas, mismo formato que el reporte NIKE:
 //                        Summary (por estilo) · Daily · Production detail ·
 //                        Forward schedule · Plan by week
-//       Forward schedule / Plan by week = lo PLANEADO desde hoy hasta el viernes
+//       Forward schedule / Plan by week = lo PLANEADO desde el lunes de la semana actual hasta el viernes
 //       de la semana actual + 4 (line_assignments del Plan Board), con los
 //       mismos filtros de cliente/estilo. Cada asignación se reparte en partes
 //       iguales entre sus días hábiles (lun–vie) de planned_start a planned_end.
@@ -267,9 +267,12 @@ function workdaysBetween(from, to) {
   return out;
 }
 
+// Desde el LUNES de la semana actual (no desde hoy), para que la semana en
+// curso salga completa en 'Forward schedule' y 'Plan by week'.
 function forwardWindow() {
-  const from = todayYmd();
-  const to = addDays(mondayOf(from), FORWARD_WEEKS * 7 + 4); // viernes de la semana +4
+  const today = todayYmd();
+  const from = mondayOf(today); // lunes de la semana actual
+  const to = addDays(from, FORWARD_WEEKS * 7 + 4); // viernes de la semana +4
   return { from, to };
 }
 
