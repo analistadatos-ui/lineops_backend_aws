@@ -167,6 +167,31 @@ const targetOf = (p) => {
   return sam > 0 ? effectiveMinutesOf(p) / sam : 0;
 };
 
+// ---- 📈 learning curves (optional, see learning-curves.js) ---------------
+// learning-curves.js plugs in a provider; without it every factor is 1 and
+// this module behaves exactly as before. A resolver answers, for ONE line,
+// "what fraction of the standard pieces/day does style S make on day D?":
+//   factor(style, ymd, stdEfficiency) → 0 < f ≤ 1
+//   stageOn(style, ymd)               → { curveId, day, eff, index } | null
+//   addDate(style, ymd)                → count a newly placed day (re-plan)
+//   curveOf(style) / datesOf(style)    → the active curve and its assigned days
+let learningCurveProvider = null;
+function setLearningCurveProvider(provider) {
+  learningCurveProvider = provider && typeof provider.forLine === "function" ? provider : null;
+}
+const NO_CURVES = Object.freeze({
+  active: false, factor: () => 1, stageOn: () => null, addDate: () => {}, curveOf: () => null, datesOf: () => [],
+});
+async function curvesForLine(client, opts) {
+  if (!learningCurveProvider) return NO_CURVES;
+  try {
+    return (await learningCurveProvider.forLine(client, opts)) || NO_CURVES;
+  } catch (e) {
+    console.warn("⚠️  learning curves skipped:", e.message);
+    return NO_CURVES; // a curve problem must never block planning
+  }
+}
+
 // Validate + normalise user input. efficiency accepts 0.85 or 85.
 function parseInput(body) {
   const sam = Number(body?.samMinutes);
@@ -353,7 +378,11 @@ async function holdsTableExists(client) {
 // feature) fall back to the rate stored on the assignment. Pre-order holds use
 // their pre-order's style standard. Anything with no known rate is measured
 // with `fallbackTarget` (the pieces/day of the style being placed).
-async function lineLoadRange(client, { lineNo, from, to, fallbackTarget, excludeIds = [] }) {
+// 📈 Assignments of a style with a learning curve on this line are measured
+// against the CURVE's pieces/day for that date (target × factor), so a curve
+// day correctly takes a bigger share of the line. Pass `curves` to reuse a
+// resolver the caller already built.
+async function lineLoadRange(client, { lineNo, from, to, fallbackTarget, excludeIds = [], curves = null }) {
   const rows = await client.query(
     `SELECT to_char(la.assigned_date, 'YYYY-MM-DD') AS d,
             la.assigned_quantity::float AS qty,
@@ -368,6 +397,7 @@ async function lineLoadRange(client, { lineNo, from, to, fallbackTarget, exclude
     [String(lineNo), from, to, excludeIds.map(Number).filter(Number.isFinite)]
   );
   const pmap = await getParamsMap(client, rows.rows.map((r) => r.style), lineNo);
+  const lc = curves || await curvesForLine(client, { lineNo, excludeIds });
   const load = new Map();
   const add = (d, qty, tgt) => {
     if (!(qty > 0)) return;
@@ -376,7 +406,7 @@ async function lineLoadRange(client, { lineNo, from, to, fallbackTarget, exclude
   };
   for (const r of rows.rows) {
     const p = pmap.get(r.style);
-    add(r.d, r.qty, p ? targetOf(p) : (r.rate > 0 ? r.rate : fallbackTarget));
+    add(r.d, r.qty, p ? targetOf(p) * lc.factor(r.style, r.d, p.efficiency) : (r.rate > 0 ? r.rate : fallbackTarget));
   }
   if (await holdsTableExists(client)) {
     // Pre-order holds are measured with THEIR OWN style's standard (the style
@@ -405,14 +435,27 @@ async function lineLoadRange(client, { lineNo, from, to, fallbackTarget, exclude
 // Capacity of ONE line-day for ONE style.
 //   → { params: null } when the style has no planner standard (caller must ask).
 //   → { params, target, load, available, availableMinutes }
+// 📈 On a learning-curve day `target` / `availableMinutes` are the CURVE's
+// (standard × factor); `standardTarget` keeps the standard and `learningCurve`
+// says which day/stage applies. The day being placed counts as
+// (distinct days the style already has on the line before it) + 1.
 async function cellCapacity(client, { lineNo, date, style, excludeIds = [] }) {
   const params = await getParams(client, style, lineNo);
   if (!params) return { params: null, style: normStyle(style), target: 0, load: 0, available: 0 };
-  const target = targetOf(params);
-  const loads = await lineLoadRange(client, { lineNo, from: date, to: date, fallbackTarget: target, excludeIds });
-  const load = loads.get(date) || 0;
+  const day = String(date).slice(0, 10);
+  const standardTarget = targetOf(params);
+  const curves = await curvesForLine(client, { lineNo, excludeIds });
+  const factor = curves.factor(style, day, params.efficiency);
+  const target = standardTarget * factor;
+  const loads = await lineLoadRange(client, { lineNo, from: day, to: day, fallbackTarget: target, excludeIds, curves });
+  const load = loads.get(day) || 0;
   const available = Math.max(0, Math.floor((1 - load) * target + 1e-6));
-  return { params, style: params.style_code, target, load, available, availableMinutes: effectiveMinutesOf(params) };
+  const stage = curves.stageOn(style, day);
+  return {
+    params, style: params.style_code, target, standardTarget, load, available,
+    availableMinutes: effectiveMinutesOf(params) * factor,
+    learningCurve: stage ? { ...stage, factor } : null,
+  };
 }
 
 // Standard 409 payload so the board can open the "new style" form.
@@ -582,8 +625,11 @@ async function recomputeStyle(client, style, {
     }
 
     const units = [...unitsMap.values()].sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : a.firstId - b.firstId));
+    // 📈 Learning curves of this line, built AFTER removing the style's own
+    // cells: each day placed below counts as one more day of its curve.
+    const curves = await curvesForLine(client, { lineNo });
     // Free room per day for this style, AFTER removing its own cells.
-    const load = await lineLoadRange(client, { lineNo, from, to: horizonEnd, fallbackTarget: lineTarget });
+    const load = await lineLoadRange(client, { lineNo, from, to: horizonEnd, fallbackTarget: lineTarget, curves });
     const lineSummary = {
       line_no: lineNo, orders: units.length, daysBefore: 0, daysAfter: 0,
       target_pcs: Math.round(lineTarget * 100) / 100, ownStandard: lineParams.line_no != null,
@@ -597,11 +643,15 @@ async function recomputeStyle(client, style, {
       const placed = [];
       while (remaining > 0.0001 && day <= horizonEnd) {
         if (ymdWeekend(day) || blocked.has(day) || locked(day)) { day = ymdAdd(day, 1); continue; }
-        const free = Math.max(0, Math.floor((1 - (load.get(day) || 0)) * lineTarget + 1e-6));
+        // Pre-order holds are not part of a learning curve (factor 1).
+        const f = u.kind === "assignment" ? curves.factor(key, day, lineParams.efficiency) : 1;
+        const dayTarget = lineTarget * f;
+        const free = Math.max(0, Math.floor((1 - (load.get(day) || 0)) * dayTarget + 1e-6));
         if (free < 1) { day = ymdAdd(day, 1); continue; }
         const chunk = Math.min(remaining, free);
-        placed.push({ d: day, qty: chunk });
-        load.set(day, (load.get(day) || 0) + chunk / lineTarget);
+        placed.push({ d: day, qty: chunk, rate: dayTarget, minutes: minutes * f });
+        load.set(day, (load.get(day) || 0) + chunk / dayTarget);
+        if (u.kind === "assignment") curves.addDate(key, day);
         remaining = Math.round((remaining - chunk) * 100) / 100;
         day = ymdAdd(day, 1);
       }
@@ -615,7 +665,7 @@ async function recomputeStyle(client, style, {
                (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
                 available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
              VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, 'planned', $9)`,
-            [u.workOrderId, lineNo, c.d, c.qty, minutes, lineTarget, startD, endD, u.color ?? null]
+            [u.workOrderId, lineNo, c.d, c.qty, c.minutes, c.rate, startD, endD, u.color ?? null]
           );
         } else {
           const m = u.meta;
@@ -748,6 +798,13 @@ async function applyScopedEdit(client, { key, line, input, effReason, who, creat
   return { row, prev, before, effRequest, requestedEff, changed: capacityChanged(before, row) };
 }
 
+// Set by register(): re-plan a style on some lines with holidays + week locks.
+let registeredReplan = null;
+async function replanStyleLines(client, style, lines) {
+  if (!registeredReplan) throw new Error("planner-style-params no está registrado");
+  return registeredReplan(client, style, lines);
+}
+
 // ---- routes ----------------------------------------------------------------
 function register(app, {
   authenticateToken, pool, setSchema, holidays = null, planWeekLocks = null,
@@ -852,6 +909,10 @@ function register(app, {
     const set = await planWeekLocks.lockedWeekSet(client);
     return (d) => planWeekLocks.isLockedDay(set, d);
   };
+
+  // Other modules (learning-curves.js) re-plan through the SAME path, so the
+  // holidays and the CEO-locked weeks are respected identically.
+  registeredReplan = (client, key, lines) => recomputeSafely(client, normStyle(key), lines, []);
 
   const recomputeSafely = async (client, key, lines = null, excludeLines = []) => {
     await client.query("SAVEPOINT recompute_style");
@@ -1123,7 +1184,22 @@ function register(app, {
       days.push({ date: k, load: Math.round(load * 10000) / 10000, available: Math.max(0, Math.floor((1 - load) * target + 1e-6)) });
       cur.setUTCDate(cur.getUTCDate() + 1);
     }
-    res.json({ success: true, style: params.style_code, params, target_pcs: target, days });
+    // 📈 `available` stays on the STANDARD pieces/day (backward compatible). With
+    // a learning curve the board packs day by day itself — every day it fills is
+    // one more curve day — using room = (1 − load) × target_pcs × factor, with
+    // the curve and the days the style already has on this line, sent here.
+    const curves = await curvesForLine(client, { lineNo, styles: [style] });
+    const curve = curves.curveOf(style);
+    res.json({
+      success: true, style: params.style_code, params, target_pcs: target, days,
+      learning_curve: curve ? {
+        id: Number(curve.id),
+        start_date: curve.start_ymd,
+        steps: curve.steps,
+        standard_efficiency: Number(params.efficiency) > 1 ? Number(params.efficiency) / 100 : Number(params.efficiency),
+        dates: curves.datesOf(style),
+      } : null,
+    });
   }));
 }
 
@@ -1142,4 +1218,9 @@ module.exports.styleOfWorkOrder = styleOfWorkOrder;
 module.exports.lineLoadRange = lineLoadRange;
 module.exports.cellCapacity = cellCapacity;
 module.exports.recomputeStyle = recomputeStyle;
+module.exports.replanStyleLines = replanStyleLines;
+module.exports.setLearningCurveProvider = setLearningCurveProvider;
+module.exports.curvesForLine = curvesForLine;
+// learning-curves.js checks this so it never ALSO wraps cellCapacity.
+module.exports.learningCurveNative = true;
 module.exports.styleParamsRequired = styleParamsRequired;

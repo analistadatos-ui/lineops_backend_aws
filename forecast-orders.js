@@ -80,7 +80,7 @@
 //          re-pack this forecast's cells on those lines (see below)
 //
 //   GET    /api/forecast-capacity?lineNo=&style=&from=&to=
-//          style = the forecast number (FC0001) — the board keys capacity by it
+//          style = the forecast number (FC0001) — the board keys capacity by
 //          -> { target_pcs, days:[{ date, available }] }
 //
 // Hold rows are returned with the SAME field names the Plan Board uses for

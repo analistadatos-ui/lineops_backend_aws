@@ -707,6 +707,7 @@ await registerOrderSets.initSchema({ pool, setSchema });   // ← must come firs
 await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
 await registerOrderClose.initSchema({ pool, setSchema });   // ✅ cierre manual (después de work_orders)
 await planWeekLocks.initSchema({ pool, setSchema });   // 🔒 después de line_assignments
+await learningCurves.initSchema({ pool, setSchema });  // 📈 curvas de aprendizaje (después de line_assignments)
 await planUrgentChanges.initSchema({ pool, setSchema }); // ⚡ bitácora de cambios urgentes
 await registerPlanRebalance.initSchema({ pool, setSchema }); // ⚖️ plan_board_snapshots
 
@@ -1198,6 +1199,16 @@ const plannerStyleParams = require("./planner-style-params");
 plannerStyleParams(app, {
   authenticateToken, pool, setSchema, holidays: registerHolidays, planWeekLocks,
   effApproverRoles: ["ceo","master"],
+});
+
+// 📈 Curvas de aprendizaje por estilo + línea. Debe ir DESPUÉS de plannerStyleParams:
+// registra su resolvedor en plannerStyleParams, que lo usa en la carga de cada
+// línea-día (asignar, mover, mover en lote, cambios urgentes y re-planeo).
+const learningCurves = require("./learning-curves");
+learningCurves(app, {
+  authenticateToken, pool, setSchema, plannerStyleParams,
+  curveRoles: ["planner", "master", "ceo", "skyrina"],
+  ceoRoles: ["ceo", "master", "skyrina"],
 });
 
 
