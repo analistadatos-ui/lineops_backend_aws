@@ -2762,6 +2762,99 @@ app.get("/api/line-runs/:lineNo", authenticateToken, async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/line-tv/week-efficiency/:lineNo?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+//
+// Per-day SAM efficiency for one line, used by the TV dashboard graphs
+// (last week vs current week). Same formula as the TV cards:
+//   efficiency = Σ(packed pcs × SAM) / Σ(operators × working_hours × 60) × 100
+// Packed pcs = sewed qty of operations whose name contains
+// pack / emp / finished / terminado (same keywords as LineTvDashboard.jsx).
+//
+// Differences vs /api/skyrina/line-efficiency-history:
+//   • open to any logged-in user (the TV runs as soporte_it)
+//   • draft runs (is_draft = true) are excluded
+//   • a run with no packing entries yet still counts (as 0 pcs) instead of
+//     disappearing from the day
+//   • one single query (the pool only has 2 connections)
+//
+// Paste this in server1.js right after app.get("/api/line-runs/:lineNo", ...)
+// ---------------------------------------------------------------------------
+app.get("/api/line-tv/week-efficiency/:lineNo", authenticateToken, async (req, res, next) => {
+  const { lineNo } = req.params;
+  const { startDate, endDate } = req.query;
+  const isYMD = (s) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+  if (!isYMD(startDate) || !isYMD(endDate)) {
+    return res.status(400).json({ success: false, error: "startDate and endDate (YYYY-MM-DD) are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const result = await client.query(
+      `WITH run_totals AS (
+         SELECT
+           lr.run_date,
+           COALESCE(lr.sam_minutes, 0)::numeric     AS sam,
+           COALESCE(lr.working_hours, 0)::numeric   AS wh,
+           COALESCE(lr.target_pcs, 0)::numeric      AS target,
+           COALESCE(
+             NULLIF((SELECT COUNT(*) FROM run_operators ro WHERE ro.run_id = lr.id), 0),
+             lr.operators_count,
+             0
+           )::numeric                               AS ops,
+           COALESCE((
+             SELECT SUM(se.sewed_qty)
+               FROM operator_operations oo
+               JOIN operation_sewed_entries se ON se.operation_id = oo.id
+              WHERE oo.run_id = lr.id
+                AND (   oo.operation_name ILIKE '%pack%'
+                     OR oo.operation_name ILIKE '%emp%'
+                     OR oo.operation_name ILIKE '%finished%'
+                     OR oo.operation_name ILIKE '%terminado%')
+           ), 0)::numeric                           AS packed
+         FROM line_runs lr
+         WHERE lr.line_no = $1
+           AND lr.run_date BETWEEN $2::date AND $3::date
+           AND COALESCE(lr.is_draft, false) = false
+       )
+       SELECT
+         to_char(run_date, 'YYYY-MM-DD') AS date,
+         SUM(packed)                     AS produced,
+         SUM(target)                     AS target,
+         SUM(packed * sam)               AS sam_output,
+         SUM(ops * wh * 60)              AS available_minutes,
+         COUNT(*)                        AS runs
+       FROM run_totals
+       GROUP BY run_date
+       ORDER BY run_date`,
+      [String(lineNo), startDate, endDate]
+    );
+
+    const history = result.rows.map((row) => {
+      const samOutput = parseFloat(row.sam_output) || 0;
+      const availableMinutes = parseFloat(row.available_minutes) || 0;
+      return {
+        date: row.date,
+        produced: parseFloat(row.produced) || 0,
+        target: parseFloat(row.target) || 0,
+        samOutput,
+        availableMinutes,
+        runs: parseInt(row.runs, 10) || 0,
+        efficiency: availableMinutes > 0 ? (samOutput / availableMinutes) * 100 : 0,
+      };
+    });
+
+    res.json({ success: true, lineNo: String(lineNo), period: { startDate, endDate }, history });
+  } catch (err) {
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // mergeOrInsertAssignment — keep one planned row per (work_order, line, day,
 // color). If a matching planned/released row already exists for that cell, add
 // the pieces to it instead of creating a second sliver; otherwise insert a new
