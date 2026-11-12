@@ -568,6 +568,57 @@ async function repackLine(client, { order, lineNo, fromDate, blocked = [], userI
            firstDay: r.firstDay, lastDay: r.lastDay, targetPcs: r.targetPcs };
 }
 
+// Re-sizes a forecast that is already on the board after its quantity changed.
+//   Lower quantity  -> cells are trimmed from the END of the run (latest day
+//                      first) until the board holds no more than the new open
+//                      pieces. Pieces still waiting in the pool go first.
+//   Higher quantity -> the extra pieces are appended after the last cell, on
+//                      the line where the run ends, packed into the free room
+//                      (weekends and `blocked` holidays skipped).
+// Not on the board -> nothing to do; the pool simply shows the new remainder.
+async function resizeOnBoard(client, { order, oldQty, newQty, conv, fromDate, blockedDates = {}, userId = null }) {
+  const out = { trimmed: 0, added: 0, unplaced: 0, line: null };
+  const { rows: cells } = await client.query(
+    `SELECT id, line_no, color, quantity, to_char(assigned_date,'YYYY-MM-DD') AS d
+       FROM forecast_day_holds WHERE forecast_order_id = $1
+      ORDER BY assigned_date DESC, line_no DESC, id DESC`,
+    [order.id]
+  );
+  if (!cells.length) return out;
+  for (const ln of [...new Set(cells.map((c) => String(c.line_no)))].sort()) await lockLine(client, ln);
+
+  const held = cells.reduce((t, c) => t + (Number(c.quantity) || 0), 0);
+  const newOpen = Math.max(0, newQty - conv);
+
+  if (newQty < oldQty) {
+    let cut = Math.max(0, held - newOpen);
+    for (const c of cells) {                       // latest day first
+      if (cut <= 1e-6) break;
+      const q = Number(c.quantity) || 0;
+      if (q <= cut + 1e-6) {
+        await client.query("DELETE FROM forecast_day_holds WHERE id = $1", [c.id]);
+        cut -= q; out.trimmed += q;
+      } else {
+        await client.query("UPDATE forecast_day_holds SET quantity = $2, updated_at = NOW() WHERE id = $1", [c.id, q - cut]);
+        out.trimmed += cut; cut = 0;
+      }
+    }
+  } else if (newQty > oldQty) {
+    const add = newQty - oldQty;
+    const tail = cells[0];                          // the run's last cell
+    const ln = String(tail.line_no);
+    const start = tail.d > fromDate ? tail.d : fromDate;
+    const r = await packIntoLine(client, {
+      order, lineNo: ln, start,
+      qtyByColor: new Map([[tail.color || "", add]]),
+      blocked: Array.isArray(blockedDates[ln]) ? blockedDates[ln] : [],
+      userId,
+    });
+    out.added = r.placed; out.unplaced = r.unplaced; out.line = ln;
+  }
+  return out;
+}
+
 function registerForecastOrders(app, deps) {
   const { authenticateToken, pool, setSchema } = deps;
 
@@ -691,15 +742,25 @@ function registerForecastOrders(app, deps) {
       if (!OPEN_STATUSES.includes(cur.status)) {
         return res.status(400).json({ success: false, error: `A ${cur.status} forecast order can't be edited` });
       }
-      const held = Number(cur.held_quantity) || 0;
+      // The quantity can go up or down freely; the board is re-sized below.
+      // Pieces already converted to SKM are real orders and can't be undone.
       const conv = Number(cur.converted_pieces) || 0;
-      if (data.quantity + 1e-6 < held + conv) {
+      if (data.quantity + 1e-6 < conv) {
         return res.status(400).json({
           success: false,
-          error: `${Math.round(conv).toLocaleString()} pcs are already converted to SKM and ${Math.round(held).toLocaleString()} are placed on the board. The quantity can't go below ${Math.round(held + conv).toLocaleString()}.`,
+          error: `${Math.round(conv).toLocaleString()} pzas ya se convirtieron a SKM; la cantidad no puede ser menor.`,
         });
       }
+      const b = req.body || {};
+      const fromDate = isYmd(b.fromDate) ? b.fromDate : ymdLocal(new Date());
+      const blockedDates = b.blockedDates && typeof b.blockedDates === "object" ? b.blockedDates : {};
+      const uid = req.user?.id ?? null;
       const cust = await resolveCustomer(client, data);
+
+      await client.query("BEGIN");
+      const { rows: lockRows } = await client.query(
+        "SELECT quantity FROM forecast_orders WHERE id = $1 FOR UPDATE", [id]);
+      const oldQty = Number(lockRows[0]?.quantity) || 0;
       await client.query(
         `UPDATE forecast_orders SET
             style_name = $2, style_description = $3, customer_id = $4, customer_name = $5,
@@ -709,9 +770,19 @@ function registerForecastOrders(app, deps) {
           WHERE id = $1`,
         [id, data.styleName, data.styleDescription, cust.customerId, cust.customerName,
          data.season, data.quantity, data.handoverDate, data.operators, data.samMinutes,
-         data.workingHours, data.efficiency, data.notes, req.user?.id ?? null]
+         data.workingHours, data.efficiency, data.notes, uid]
       );
-      res.json({ success: true, forecastOrder: await getOrderById(client, id) });
+      let resized = null;
+      if (Math.abs(data.quantity - oldQty) > 1e-6) {
+        // Read the order back so packing uses the capacity just saved.
+        const { rows: fresh } = await client.query(
+          "SELECT id, forecast_no, status, operators_count, sam_minutes, working_hours, efficiency FROM forecast_orders WHERE id = $1", [id]);
+        resized = await resizeOnBoard(client, {
+          order: fresh[0], oldQty, newQty: data.quantity, conv, fromDate, blockedDates, userId: uid,
+        });
+      }
+      await client.query("COMMIT");
+      res.json({ success: true, resized, forecastOrder: await getOrderById(client, id) });
     }));
 
   // ---- POST /:id/capacity: change capacity for chosen lines and re-pack -----
