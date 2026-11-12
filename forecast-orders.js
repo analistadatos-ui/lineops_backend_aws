@@ -182,6 +182,27 @@ async function initSchema({ pool, setSchema }) {
         CONSTRAINT chk_flp_eff       CHECK (efficiency > 0 AND efficiency <= 1)
       );
     `);
+    // One color per STYLE (not per forecast): every FC#### of the same style
+    // shows the same color on the board and in the lists. palette_idx points
+    // into WO_PALETTE (lib/workOrderColors.js).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS forecast_style_colors(
+        style_key   VARCHAR(120) PRIMARY KEY,                   -- normalized style_name
+        palette_idx INT          NOT NULL CHECK (palette_idx >= 0),
+        updated_by  BIGINT,
+        updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+      );
+    `);
+    // Backfill styles that existing forecasts already use (oldest first).
+    const { rows: noColor } = await client.query(
+      `SELECT MIN(f.style_name) AS style_name
+         FROM forecast_orders f
+        WHERE NOT EXISTS (SELECT 1 FROM forecast_style_colors c WHERE c.style_key = ${styleKeySql("f.style_name")})
+          AND ${styleKeySql("f.style_name")} <> ''
+        GROUP BY ${styleKeySql("f.style_name")}
+        ORDER BY MIN(f.created_at)`
+    );
+    for (const r of noColor) await ensureStyleColor(client, r.style_name);
     console.log("\u2705 forecast_orders + forecast_day_holds + forecast_line_params tables ready in prod_db_schema");
   } finally {
     client.release();
@@ -192,6 +213,55 @@ async function initSchema({ pool, setSchema }) {
 // A forecast still lives on the board while it is active or partly converted.
 const OPEN_STATUSES = ["active", "partially_converted"];
 const OPEN_SQL = "('active','partially_converted')";
+
+// ---- style colors ---------------------------------------------------------
+// Must match WO_PALETTE.length in lib/workOrderColors.js.
+const PALETTE_SIZE = 40;
+// Same normalization in SQL everywhere: "fn-2798 " → "FN2798".
+const styleKeySql = (expr) => `UPPER(REGEXP_REPLACE(COALESCE(${expr}, ''), '[^A-Za-z0-9]', '', 'g'))`;
+
+// Returns the palette index of a style, assigning one the first time.
+// `wanted` (0..PALETTE_SIZE-1) sets it explicitly — for ALL forecasts of that
+// style. New styles get the slot used by the fewest styles that still have an
+// open forecast (lowest index first; the palette is ordered so neighbours look
+// different), so colors only repeat once more than PALETTE_SIZE styles are open.
+async function ensureStyleColor(client, styleName, wanted = null, userId = null) {
+  const { rows: k } = await client.query(`SELECT ${styleKeySql("$1::text")} AS k`, [styleName]);
+  const key = k[0]?.k;
+  if (!key) return null;
+  if (Number.isInteger(wanted) && wanted >= 0 && wanted < PALETTE_SIZE) {
+    await client.query(
+      `INSERT INTO forecast_style_colors (style_key, palette_idx, updated_by, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (style_key) DO UPDATE SET palette_idx = EXCLUDED.palette_idx,
+         updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [key, wanted, userId]
+    );
+    return wanted;
+  }
+  const { rows: cur } = await client.query("SELECT palette_idx FROM forecast_style_colors WHERE style_key = $1", [key]);
+  if (cur[0]) return cur[0].palette_idx;
+  const { rows: pick } = await client.query(
+    `SELECT g.i
+       FROM generate_series(0, $1::int - 1) AS g(i)
+       LEFT JOIN (
+         SELECT c.palette_idx FROM forecast_style_colors c
+          WHERE EXISTS (SELECT 1 FROM forecast_orders f
+                         WHERE f.status IN ${OPEN_SQL} AND ${styleKeySql("f.style_name")} = c.style_key)
+       ) u ON u.palette_idx = g.i
+      GROUP BY g.i
+      ORDER BY COUNT(u.palette_idx), g.i
+      LIMIT 1`,
+    [PALETTE_SIZE]
+  );
+  await client.query(
+    `INSERT INTO forecast_style_colors (style_key, palette_idx, updated_by, updated_at)
+     VALUES ($1, $2, $3, NOW()) ON CONFLICT (style_key) DO NOTHING`,
+    [key, pick[0]?.i ?? 0, userId]
+  );
+  const { rows: fin } = await client.query("SELECT palette_idx FROM forecast_style_colors WHERE style_key = $1", [key]);
+  return fin[0]?.palette_idx ?? null;
+}
 const txt = (v, n) => (v == null ? null : String(v).trim().slice(0, n || 200) || null);
 const col = (v) => String(v == null ? "" : v).trim().toUpperCase().slice(0, 50);
 const numOr = (v, d = 0) => { const n = parseFloat(v); return isNaN(n) ? d : n; };
@@ -242,7 +312,8 @@ const SELECT_COLS = `
   to_char(h.first_day, 'YYYY-MM-DD')               AS first_day,
   to_char(h.last_day,  'YYYY-MM-DD')               AS last_day,
   COALESCE(h.lines, '{}')                          AS lines,
-  COALESCE(lpx.line_params, '[]'::json)            AS line_params
+  COALESCE(lpx.line_params, '[]'::json)            AS line_params,
+  sc.palette_idx                                   AS color_idx            -- style color (WO_PALETTE)
 `;
 const FROM_JOIN = `
   FROM forecast_orders f
@@ -264,6 +335,7 @@ const FROM_JOIN = `
            ) ORDER BY lp.line_no) AS line_params
       FROM forecast_line_params lp WHERE lp.forecast_order_id = f.id
   ) lpx ON true
+  LEFT JOIN forecast_style_colors sc ON sc.style_key = ${styleKeySql("f.style_name")}
 `;
 
 // Efficiency accepts 0.85 or 85 (percent). Empty → 100 %.
@@ -314,6 +386,8 @@ function parseBody(body) {
       workingHours,
       efficiency: isNaN(efficiency) ? 1 : Math.round(efficiency * 1000) / 1000,
       notes: txt(b.notes, 2000),
+      // Optional: palette index chosen in the modal (applies to the whole style).
+      colorIdx: b.colorIdx === "" || b.colorIdx == null ? null : parseInt(b.colorIdx, 10),
     },
   };
 }
@@ -646,6 +720,51 @@ function registerForecastOrders(app, deps) {
       res.json({ success: true, sequence: await nextForecastNo(client) });
     }));
 
+  // Style → color map, for the edit modal's picker and preview.
+  // [{ style_key, palette_idx, styles: ["FN2798", …], open: n }]
+  app.get("/api/forecast-style-colors", authenticateToken,
+    withClient("GET /api/forecast-style-colors", async (client, req, res) => {
+      const { rows } = await client.query(
+        `SELECT c.style_key, c.palette_idx,
+                COALESCE(ARRAY_AGG(DISTINCT f.style_name) FILTER (WHERE f.id IS NOT NULL), '{}') AS styles,
+                COUNT(f.id) FILTER (WHERE f.status IN ${OPEN_SQL})::int AS open
+           FROM forecast_style_colors c
+           LEFT JOIN forecast_orders f ON ${styleKeySql("f.style_name")} = c.style_key
+          GROUP BY c.style_key, c.palette_idx
+          ORDER BY c.style_key`
+      );
+      res.json({ success: true, paletteSize: PALETTE_SIZE, colors: rows });
+    }));
+
+  // Set a style's color from the board / details card.
+  // Body: { forecastOrderId | styleName, colorIdx: 0..PALETTE_SIZE-1 | null }
+  // null → back to automatic (a free color is assigned again).
+  // Applies to EVERY forecast of that style.
+  app.put("/api/forecast-style-colors", authenticateToken,
+    withClient("PUT /api/forecast-style-colors", async (client, req, res) => {
+      const b = req.body || {};
+      let styleName = txt(b.styleName, 120);
+      if (!styleName && b.forecastOrderId != null) {
+        const { rows } = await client.query("SELECT style_name FROM forecast_orders WHERE id = $1", [parseInt(b.forecastOrderId, 10)]);
+        styleName = rows[0]?.style_name || null;
+      }
+      if (!styleName) return res.status(400).json({ success: false, error: "forecastOrderId or styleName is required" });
+      const auto = b.colorIdx === null || b.colorIdx === "" || b.colorIdx === undefined;
+      const idx = auto ? null : parseInt(b.colorIdx, 10);
+      if (!auto && !(Number.isInteger(idx) && idx >= 0 && idx < PALETTE_SIZE)) {
+        return res.status(400).json({ success: false, error: `colorIdx must be 0–${PALETTE_SIZE - 1} or null` });
+      }
+      const uid = req.user?.id ?? null;
+      await client.query("BEGIN");
+      if (auto) {
+        await client.query(`DELETE FROM forecast_style_colors WHERE style_key = ${styleKeySql("$1::text")}`, [styleName]);
+      }
+      const colorIdx = await ensureStyleColor(client, styleName, idx, uid);
+      const { rows: k } = await client.query(`SELECT ${styleKeySql("$1::text")} AS k`, [styleName]);
+      await client.query("COMMIT");
+      res.json({ success: true, styleKey: k[0]?.k || "", colorIdx });
+    }));
+
   app.get("/api/forecast-orders", authenticateToken,
     withClient("GET /api/forecast-orders", async (client, req, res) => {
       const status = String(req.query.status || "active").toLowerCase();
@@ -729,6 +848,7 @@ function registerForecastOrders(app, deps) {
         }
       }
       if (id == null) return res.status(409).json({ success: false, error: "Could not assign a forecast number, try again" });
+      await ensureStyleColor(client, data.styleName, data.colorIdx, req.user?.id ?? null);
       res.json({ success: true, forecastOrder: await getOrderById(client, id) });
     }));
 
@@ -781,6 +901,8 @@ function registerForecastOrders(app, deps) {
           order: fresh[0], oldQty, newQty: data.quantity, conv, fromDate, blockedDates, userId: uid,
         });
       }
+      // A new style gets its color; a color picked in the modal applies to the style.
+      await ensureStyleColor(client, data.styleName, data.colorIdx, uid);
       await client.query("COMMIT");
       res.json({ success: true, resized, forecastOrder: await getOrderById(client, id) });
     }));
@@ -1221,9 +1343,11 @@ function registerForecastOrders(app, deps) {
                 o.season,
                 o.sam_minutes,
                 to_char(o.handover_date, 'YYYY-MM-DD') AS target_date,
-                o.status                          AS pre_status
+                o.status                          AS pre_status,
+                sc.palette_idx                    AS color_idx         -- style color (WO_PALETTE)
            FROM forecast_day_holds h
            JOIN forecast_orders o ON o.id = h.forecast_order_id
+           LEFT JOIN forecast_style_colors sc ON sc.style_key = ${styleKeySql("o.style_name")}
           WHERE ${where.join(" AND ")}
           ORDER BY h.assigned_date, h.line_no, o.forecast_no`,
         params
