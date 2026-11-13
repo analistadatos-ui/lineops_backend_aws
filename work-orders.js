@@ -865,92 +865,22 @@ function registerWorkOrders(app, deps) {
       await client.query("BEGIN");
       await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
 
-      // Bloquear las filas para que dos planeadores no liquiden el mismo dia al
-      // mismo tiempo y el saldo salga reasignado dos veces.
-      const cellRes = await client.query(
-        `SELECT id, color, assigned_quantity
-           FROM line_assignments
-          WHERE work_order_id = $1
-            AND line_no = $2
-            AND assigned_date = $3::date
-            AND status NOT IN ('cancelled', 'rejected')
-          ORDER BY id
-          FOR UPDATE`,
-        [parseInt(workOrderId, 10), String(lineNo), date]
-      );
-
-      if (cellRes.rows.length === 0) {
+      const r = await settleDayInTx(client, { workOrderId, lineNo, date });
+      if (!r.found) {
         await client.query("ROLLBACK");
         return res.status(404).json({ success: false, error: "No hay asignacion en esa celda." });
       }
+      await client.query("COMMIT");
 
-      const prodRes = await client.query(
-        `SELECT COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced
-           FROM work_orders wo
-           JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
-           JOIN operation_sewed_entries se ON se.run_id = lr.id
-           JOIN operator_operations oo     ON oo.id = se.operation_id
-          WHERE wo.id = $1
-            AND lr.line_no = $2
-            AND lr.run_date = $3::date`,
-        [parseInt(workOrderId, 10), String(lineNo), date]
-      );
-
-      const produced = Number(prodRes.rows[0]?.produced) || 0;
-      const assigned = cellRes.rows.reduce((s, r) => s + (Number(r.assigned_quantity) || 0), 0);
-      const balance = Math.max(assigned - produced, 0);
-
-      if (balance <= 0) {
-        await client.query(
-          `UPDATE line_assignments SET status = 'completed', updated_at = now() WHERE id = ANY($1)`,
-          [cellRes.rows.map((r) => r.id)]
-        );
-        await client.query("COMMIT");
+      if (r.balance <= 0) {
         return res.json({
           success: true,
           settled: true,
-          assigned, produced, balance: 0,
-          updated: cellRes.rows.length, deleted: 0,
+          assigned: r.assigned, produced: r.produced, balance: 0,
+          updated: r.updated, deleted: 0,
           message: "El dia alcanzo su meta; no hay saldo que reasignar.",
         });
       }
-
-      // Reparto proporcional. El residuo del redondeo va a la fila mas grande,
-      // para que la suma de las partes sea exactamente `produced` y no aparezcan
-      // saldos fantasma de 1 pza.
-      const parts = cellRes.rows.map((r) => ({
-        id: r.id,
-        color: r.color,
-        assigned: Number(r.assigned_quantity) || 0,
-      }));
-      let repartido = 0;
-      parts.forEach((r) => {
-        r.keep = assigned > 0 ? Math.floor((r.assigned / assigned) * produced) : 0;
-        repartido += r.keep;
-      });
-      const residuo = produced - repartido;
-      if (residuo > 0) {
-        parts.slice().sort((a, b) => b.assigned - a.assigned)[0].keep += residuo;
-      }
-
-      const toDelete = parts.filter((r) => r.keep <= 0).map((r) => r.id);
-      const toUpdate = parts.filter((r) => r.keep > 0);
-
-      for (const r of toUpdate) {
-        await client.query(
-          `UPDATE line_assignments
-              SET assigned_quantity = $2, status = 'completed', updated_at = now()
-            WHERE id = $1`,
-          [r.id, r.keep]
-        );
-      }
-      // assigned_quantity tiene CHECK (> 0): una celda sin nada cosido no se
-      // puede dejar en cero, hay que borrarla.
-      if (toDelete.length) {
-        await client.query(`DELETE FROM line_assignments WHERE id = ANY($1)`, [toDelete]);
-      }
-
-      await client.query("COMMIT");
 
       // El saldo NO se reasigna aqui a proposito: a donde van esas piezas es
       // decision del planeador (misma linea manana, otra linea, o de regreso al
@@ -959,12 +889,12 @@ function registerWorkOrders(app, deps) {
       res.json({
         success: true,
         settled: true,
-        assigned,
-        produced,
-        balance,
-        updated: toUpdate.length,
-        deleted: toDelete.length,
-        colors: parts.filter((r) => r.color).map((r) => r.color),
+        assigned: r.assigned,
+        produced: r.produced,
+        balance: r.balance,
+        updated: r.updated,
+        deleted: r.deleted,
+        colors: r.colors,
       });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
@@ -2224,6 +2154,122 @@ function registerWorkOrders(app, deps) {
 }
 
 
+// --------------------------------------------------------------------------
+// settleDayInTx: cierra UNA celda (orden + linea + dia) por lo que realmente
+// se cosio. Lo usan POST /settle-day (aqui) y POST /carry-balance (server1.js).
+//
+//   • Debe llamarse DENTRO de una transaccion abierta (BEGIN ya hecho). Quien
+//     llama decide si activa el candado de semanas (planWeekLocks.enforce):
+//     settle-day si lo activa; carry-balance NO, a proposito.
+//   • Reparto proporcional entre colores; el residuo del redondeo va a la fila
+//     mas grande para que la suma sea exactamente `produced`.
+//   • Regresa { found:false } si la celda no tiene filas activas, o
+//     { found:true, assigned, produced, balance, updated, deleted, colors,
+//       leftovers:[{ color, qty }] }   (leftovers suma exactamente balance).
+// --------------------------------------------------------------------------
+async function settleDayInTx(client, { workOrderId, lineNo, date }) {
+  await ensureProducedResolved(client);
+  if (!RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) {
+    const e = new Error("No se puede liquidar el dia: la captura de piso no esta ligada a las ordenes.");
+    e.code = "PRODUCED_UNRESOLVED";
+    throw e;
+  }
+  const wo = parseInt(workOrderId, 10);
+  const ln = String(lineNo);
+
+  // Bloquear las filas para que dos planeadores no liquiden el mismo dia al
+  // mismo tiempo y el saldo salga reasignado dos veces.
+  const cellRes = await client.query(
+    `SELECT id, color, assigned_quantity
+       FROM line_assignments
+      WHERE work_order_id = $1
+        AND line_no = $2
+        AND assigned_date = $3::date
+        AND status NOT IN ('cancelled', 'rejected')
+      ORDER BY id
+      FOR UPDATE`,
+    [wo, ln, date]
+  );
+  if (cellRes.rows.length === 0) return { found: false };
+
+  const prodRes = await client.query(
+    `SELECT COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced
+       FROM work_orders wo
+       JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+       JOIN operation_sewed_entries se ON se.run_id = lr.id
+       JOIN operator_operations oo     ON oo.id = se.operation_id
+      WHERE wo.id = $1
+        AND lr.line_no = $2
+        AND lr.run_date = $3::date`,
+    [wo, ln, date]
+  );
+
+  const produced = Number(prodRes.rows[0]?.produced) || 0;
+  const assigned = cellRes.rows.reduce((s, r) => s + (Number(r.assigned_quantity) || 0), 0);
+  const balance = Math.max(assigned - produced, 0);
+
+  if (balance <= 0) {
+    await client.query(
+      `UPDATE line_assignments SET status = 'completed', updated_at = now() WHERE id = ANY($1)`,
+      [cellRes.rows.map((r) => r.id)]
+    );
+    return { found: true, assigned, produced, balance: 0, updated: cellRes.rows.length, deleted: 0, colors: [], leftovers: [] };
+  }
+
+  const parts = cellRes.rows.map((r) => ({
+    id: r.id,
+    color: r.color,
+    assigned: Number(r.assigned_quantity) || 0,
+  }));
+  let repartido = 0;
+  parts.forEach((r) => {
+    r.keep = assigned > 0 ? Math.floor((r.assigned / assigned) * produced) : 0;
+    repartido += r.keep;
+  });
+  const residuo = produced - repartido;
+  if (residuo > 0) {
+    parts.slice().sort((a, b) => b.assigned - a.assigned)[0].keep += residuo;
+  }
+
+  const toDelete = parts.filter((r) => r.keep <= 0).map((r) => r.id);
+  const toUpdate = parts.filter((r) => r.keep > 0);
+
+  for (const r of toUpdate) {
+    await client.query(
+      `UPDATE line_assignments
+          SET assigned_quantity = $2, status = 'completed', updated_at = now()
+        WHERE id = $1`,
+      [r.id, r.keep]
+    );
+  }
+  // assigned_quantity tiene CHECK (> 0): una celda sin nada cosido no se
+  // puede dejar en cero, hay que borrarla.
+  if (toDelete.length) {
+    await client.query(`DELETE FROM line_assignments WHERE id = ANY($1)`, [toDelete]);
+  }
+
+  // Lo que le falto a cada color (sumado por color; suma exactamente balance).
+  const byColor = new Map();
+  for (const r of parts) {
+    const left = r.assigned - r.keep;
+    if (left <= 0) continue;
+    const k = r.color || "";
+    byColor.set(k, (byColor.get(k) || 0) + left);
+  }
+  const leftovers = [...byColor.entries()].map(([color, qty]) => ({ color: color || null, qty }));
+
+  return {
+    found: true,
+    assigned,
+    produced,
+    balance,
+    updated: toUpdate.length,
+    deleted: toDelete.length,
+    colors: parts.filter((r) => r.color).map((r) => r.color),
+    leftovers,
+  };
+}
+
 // Produced (producido) total for a single work order, using the same packing-
 // operation subquery the planner uses. Order-level only — production is not
 // captured per talla/color. Other modules (e.g. finished-warehouse) reuse this
@@ -3154,4 +3200,5 @@ registerWorkOrders.refreshWorkOrderStatusFromProduction = refreshWorkOrderStatus
 registerWorkOrders.producedByLineFor = producedByLineFor;
 registerWorkOrders.producedByLineForMany = producedByLineForMany;
 registerWorkOrders.producedByLineDayForMany = producedByLineDayForMany;
+registerWorkOrders.settleDayInTx = settleDayInTx;
 module.exports = registerWorkOrders;

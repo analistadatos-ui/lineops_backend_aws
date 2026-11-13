@@ -3401,6 +3401,260 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// POST /api/line-assignments/carry-balance
+//
+// «Confirmar» en la campana de Saldos del Plan Board (órdenes abiertas: en
+// proceso o pendientes).
+// Una celda pasada cerró corta (se asignaron 500, se cosieron 300): este
+// endpoint, en UNA transacción,
+//   1. liquida esa celda por lo que sí se cosió (misma lógica que settle-day,
+//      registerWorkOrders.settleDayInTx);
+//   2. pone el saldo (200) en el SIGUIENTE día laborable de la MISMA línea
+//      (el día siguiente a la celda corta, nunca antes de hoy), como celda(s)
+//      de día completo según el estándar del estilo;
+//   3. recorre hacia adelante lo que ya estaba en esos días: cada día ocupado
+//      se corre al siguiente día laborable y el primer hueco absorbe el
+//      empuje (cola FIFO), así se conserva el orden de la línea y los huecos
+//      posteriores siguen ahí.
+//
+// 🔒 A diferencia de las demás rutas del planner, ésta NO llama a
+//    planWeekLocks.enforce(): el saldo debe seguir al día siguiente aunque
+//    ese día (o la celda corta) caiga en una semana bloqueada por el CEO.
+//    Sólo se recorren celdas 'planned' / 'released' de hoy en adelante de
+//    esa línea; completadas e historia no se tocan.
+//    El tablero bloqueado (plan_board_lock) sí aplica: el middleware de
+//    BOARD_WRITE_PREFIXES rechaza esta ruta cuando está bloqueado.
+//
+// Body: { workOrderId, lineNo, date }   (date = día que cerró corto)
+// ---------------------------------------------------------------------------
+app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  const addDaysStr = (ymdStr, k) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + k);
+    return dt.toISOString().slice(0, 10);
+  };
+  const isWeekend = (ymdStr) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+    return dow === 0 || dow === 6;
+  };
+  const MAX_DAYS = 400; // tope del recorrido (días naturales)
+  let inTx = false;
+  try {
+    await setSchema(client);
+    const { workOrderId, lineNo, date } = req.body || {};
+    const woId = parseInt(workOrderId, 10);
+    const line = String(lineNo == null ? "" : lineNo);
+    const shortDay = String(date || "").slice(0, 10);
+    if (!Number.isFinite(woId) || !line || !/^\d{4}-\d{2}-\d{2}$/.test(shortDay)) {
+      return res.status(400).json({ success: false, error: "Faltan workOrderId, lineNo o date." });
+    }
+
+    const today = (await client.query("SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS d")).rows[0].d;
+    if (shortDay >= today) {
+      return res.status(400).json({ success: false, error: "Sólo se confirman saldos de días que ya cerraron (anteriores a hoy)." });
+    }
+
+    // Sólo órdenes abiertas (en proceso o pendientes).
+    const woRes = await client.query("SELECT id, work_order_no, status FROM work_orders WHERE id = $1", [woId]);
+    const wo = woRes.rows[0];
+    if (!wo) return res.status(404).json({ success: false, error: "Orden no encontrada." });
+    const st = String(wo.status || "").toLowerCase();
+    if (["completed", "cancelled", "canceled", "closed"].includes(st)) {
+      return res.status(409).json({ success: false, error: `La orden ${wo.work_order_no} ya no está abierta (${st}).` });
+    }
+
+    // Estándar del planner para el estilo: tamaño de la celda de día completo.
+    const style = await plannerStyleParams.styleOfWorkOrder(client, woId);
+    if (!(await plannerStyleParams.getParams(client, style))) {
+      return plannerStyleParams.styleParamsRequired(res, style);
+    }
+
+    // Días festivos / paros de esa línea (fuera de la transacción: si la tabla
+    // no existe, el error no aborta la transacción).
+    const holidaySet = new Set();
+    try {
+      const hrows = await registerHolidays.holidaysBetween(client, { from: shortDay, to: addDaysStr(shortDay, MAX_DAYS + 30) });
+      for (const h of hrows) if (h.line_no == null || String(h.line_no) === line) holidaySet.add(String(h.holiday_date).slice(0, 10));
+    } catch (e) { console.warn("⚠️  holidays not available for carry-balance:", e.message); }
+    // Las semanas bloqueadas NO se brincan: es justo lo que pide esta acción.
+    const isWorkday = (d) => !isWeekend(d) && !holidaySet.has(d);
+    const nextWorkday = (d) => { let x = addDaysStr(d, 1); while (!isWorkday(x)) x = addDaysStr(x, 1); return x; };
+
+    // Primer día destino: el día laborable siguiente a la celda corta; si ese
+    // ya pasó, hoy (o el siguiente laborable desde hoy).
+    let start = nextWorkday(shortDay);
+    if (start < today) { start = today; while (!isWorkday(start)) start = addDaysStr(start, 1); }
+
+    await client.query("BEGIN");
+    inTx = true;
+    // (sin planWeekLocks.enforce a propósito, ver arriba)
+    // Un solo «Confirmar» a la vez por línea.
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`carry-balance:${line}`]);
+
+    // 1) Liquidar la celda corta.
+    const settled = await registerWorkOrders.settleDayInTx(client, { workOrderId: woId, lineNo: line, date: shortDay });
+    if (!settled.found) {
+      await client.query("ROLLBACK"); inTx = false;
+      return res.status(404).json({ success: false, error: "No hay asignación en esa celda." });
+    }
+    if (!(settled.balance > 0)) {
+      await client.query("COMMIT"); inTx = false;
+      return res.json({ success: true, balance: 0, placed: [], shifted: 0, message: "El día ya estaba completo; no hay saldo que mover." });
+    }
+
+    // 2) Partir el saldo en celdas de día completo (por color, en orden).
+    const queue = settled.leftovers.map((l) => ({ color: l.color, qty: Number(l.qty) || 0 })).filter((l) => l.qty > 0);
+    const chunks = []; // [{ date, availableMinutes, target, rows:[{ color, qty }] }]
+    {
+      let day = start, scanned = 0;
+      while (queue.length && scanned < MAX_DAYS) {
+        scanned++;
+        const cap = await plannerStyleParams.cellCapacity(client, { lineNo: line, date: day, style });
+        const target = Math.floor(Number(cap.target) || 0);
+        if (target <= 0) {
+          await client.query("ROLLBACK"); inTx = false;
+          return res.status(409).json({ success: false, error: `La Línea ${line} no tiene estándar de capacidad para ${style} el ${day}.` });
+        }
+        let room = target;
+        const rows = [];
+        while (room > 0 && queue.length) {
+          const head = queue[0];
+          const q = Math.min(room, head.qty);
+          rows.push({ color: head.color, qty: q });
+          head.qty -= q; room -= q;
+          if (head.qty <= 0) queue.shift();
+        }
+        chunks.push({ date: day, availableMinutes: cap.availableMinutes, target, rows });
+        day = nextWorkday(day);
+      }
+      if (queue.length) {
+        await client.query("ROLLBACK"); inTx = false;
+        return res.status(400).json({ success: false, error: `La línea ${line} no tiene días con capacidad para el saldo de ${wo.work_order_no}.` });
+      }
+    }
+
+    // 3) Lo que hay en la línea de `start` en adelante que se puede recorrer.
+    const occRes = await client.query(
+      `SELECT id, status, to_char(assigned_date, 'YYYY-MM-DD') AS d
+         FROM line_assignments
+        WHERE line_no = $1
+          AND assigned_date >= $2::date
+          AND status IN ('planned', 'released')
+        ORDER BY assigned_date, id
+        FOR UPDATE`,
+      [line, start]
+    );
+    const occ = new Map(); // día -> [filas]
+    for (const r of occRes.rows) {
+      if (!isWorkday(r.d)) continue; // filas en fin de semana / festivo: no se tocan
+      if (!occ.has(r.d)) occ.set(r.d, []);
+      occ.get(r.d).push(r);
+    }
+
+    // Cola FIFO: cada día laborable recibe lo primero de la cola y lo que tenía
+    // pasa al final de la cola. Un día vacío absorbe y la cola se acorta. Las
+    // celdas del saldo van primero, así que caen exactamente en chunks[i].date.
+    const carry = chunks.map(() => ({ kind: "balance" }));
+    const moves = []; // { from, to, rows }
+    {
+      let day = start, scanned = 0;
+      while (carry.length && scanned < MAX_DAYS) {
+        scanned++;
+        const item = carry.shift();
+        if (item.kind === "day") moves.push({ from: item.from, to: day, rows: item.rows });
+        const here = occ.get(day);
+        if (here && here.length) carry.push({ kind: "day", from: day, rows: here });
+        day = nextWorkday(day);
+      }
+      if (carry.length) {
+        await client.query("ROLLBACK"); inTx = false;
+        return res.status(400).json({ success: false, error: `No se pudo recorrer la Línea ${line}: el horizonte de ${MAX_DAYS} días no alcanza.` });
+      }
+    }
+
+    // 4) Aplicar los recorridos del más lejano al más cercano: cada día llega a
+    //    un lugar que ya quedó libre y nunca chocan dos filas 'planned' en
+    //    uq_line_assign_planned_cell.
+    moves.sort((a, b) => (a.from < b.from ? 1 : a.from > b.from ? -1 : 0));
+    let shifted = 0, shiftedReleased = 0;
+    const touchedDays = new Set();
+    for (const mv of moves) {
+      for (const r of mv.rows) {
+        await client.query(
+          `UPDATE line_assignments
+              SET assigned_date = $1, planned_start_date = $1, planned_end_date = $1,
+                  line_run_id = CASE WHEN status = 'released' THEN NULL ELSE line_run_id END,
+                  updated_at = now()
+            WHERE id = $2`,
+          [mv.to, r.id]
+        );
+        shifted++;
+        if (r.status === "released") shiftedReleased++;
+      }
+      touchedDays.add(mv.from); touchedDays.add(mv.to);
+    }
+
+    // 5) Poner el saldo en sus días (ya libres).
+    const placed = [];
+    for (const c of chunks) {
+      for (const r of c.rows) {
+        await mergeOrInsertAssignment(client, {
+          workOrderId: woId,
+          lineRunId: null,
+          lineNo: line,
+          assignedDate: c.date,
+          quantity: r.qty,
+          availableMinutes: c.availableMinutes,
+          requiredRate: c.target,
+          startDate: c.date,
+          endDate: c.date,
+          status: "planned",
+          color: r.color,
+        });
+      }
+      placed.push({ date: c.date, qty: c.rows.reduce((t, r) => t + r.qty, 0) });
+      touchedDays.add(c.date);
+    }
+
+    // 6) Corridas borrador que quedaron sin celda.
+    touchedDays.add(shortDay);
+    for (const d of touchedDays) await cleanupOrphanDraftRuns(client, line, d);
+
+    // Semanas bloqueadas que se tocaron (para el aviso del tablero).
+    const lockedWeeks = await planWeekLocks.lockedWeekSet(client);
+    const lockedTouched = [...new Set([...touchedDays].filter((d) => planWeekLocks.isLockedDay(lockedWeeks, d)).map((d) => planWeekLocks.weekStartOf(d)))].sort();
+
+    await client.query("COMMIT"); inTx = false;
+    console.log(
+      `[carry-balance] wo=${woId} line=${line} short=${shortDay} balance=${settled.balance} ` +
+      `start=${start} cells=${placed.length} shifted=${shifted} lockedWeeks=${lockedTouched.join(",") || "-"} by=${req.user?.id ?? "?"}`
+    );
+    res.json({
+      success: true,
+      assigned: settled.assigned,
+      produced: settled.produced,
+      balance: settled.balance,
+      startDate: start,
+      placed,
+      shifted,
+      shiftedReleased,
+      lockedWeeks: lockedTouched,
+    });
+  } catch (err) {
+    if (inTx) await client.query("ROLLBACK").catch(() => {});
+    if (err && err.code === "PRODUCED_UNRESOLVED") return res.status(409).json({ success: false, error: err.message });
+    console.error("❌ Error en carry-balance:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // POST /api/line-assignments/insert-shift-batch
 //
