@@ -46,6 +46,16 @@
 // CEO en su tabla users (o pase `lockerRoles` al registrar el módulo).
 const DEFAULT_LOCKER_ROLES = ["ceo", "skyrina", "master"];
 
+// 🔔 Aviso al CEO. Cuando un usuario con uno de estos roles REALES
+// (req.user.actual_role; factory_director entra como "master" por el alias)
+// bloquea o desbloquea una semana, el CEO lo ve en su campana
+// (GET /api/ceo/week-lock-events, ver CeoActivityBell.jsx).
+const DEFAULT_NOTIFY_ACTOR_ROLES = ["factory_director"];
+// Quién recibe esos avisos (por req.user.role, ya con alias). Los que tienen
+// un rol de notifyActorRoles quedan fuera aunque su alias sea "master": el
+// aviso es para el CEO, no para los directores.
+const DEFAULT_CEO_VIEWER_ROLES = ["ceo", "master"];
+
 // SQLSTATE propio para reconocer el rechazo del trigger sin parsear textos.
 const LOCK_SQLSTATE = "WKLCK";
 
@@ -78,6 +88,18 @@ async function initSchema({ pool, setSchema }) {
         note        TEXT,
         created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
       );
+    `);
+    // 🔔 Aviso al CEO: rol real de quien actuó, si se le avisa y si ya lo vio.
+    // Las filas viejas quedan con notify_ceo = false (no aparecen de golpe).
+    await client.query(`
+      ALTER TABLE plan_week_lock_log
+        ADD COLUMN IF NOT EXISTS actor_role  TEXT,
+        ADD COLUMN IF NOT EXISTS notify_ceo  BOOLEAN NOT NULL DEFAULT false,
+        ADD COLUMN IF NOT EXISTS ceo_seen_at TIMESTAMPTZ;
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_plan_week_lock_log_ceo
+        ON plan_week_lock_log (created_at DESC) WHERE notify_ceo;
     `);
 
     // El nombre del esquema se incrusta en la función para que el trigger no
@@ -262,6 +284,16 @@ function registerPlanWeekLocks(app, deps) {
     : DEFAULT_LOCKER_ROLES;
   const canLock = (user) => !!user && lockerRoles.includes(user.role);
 
+  const notifyActorRoles = Array.isArray(deps.notifyActorRoles) && deps.notifyActorRoles.length
+    ? deps.notifyActorRoles
+    : DEFAULT_NOTIFY_ACTOR_ROLES;
+  const ceoViewerRoles = Array.isArray(deps.ceoViewerRoles) && deps.ceoViewerRoles.length
+    ? deps.ceoViewerRoles
+    : DEFAULT_CEO_VIEWER_ROLES;
+  const realRole = (user) => user?.actual_role || user?.role || null;
+  const isCeoViewer = (user) =>
+    !!user && ceoViewerRoles.includes(user.role) && !notifyActorRoles.includes(realRole(user));
+
   // Cualquier usuario autenticado puede LEER los candados (el planner los
   // necesita para bloquear su tablero). `canLock` le dice al frontend si este
   // usuario puede cambiarlos.
@@ -304,6 +336,7 @@ function registerPlanWeekLocks(app, deps) {
         [weekStart]
       )).rows[0].d;
 
+      let wasLocked = false;
       if (locked) {
         // No se bloquea una semana con pre-órdenes. SHARE detiene las altas /
         // bajas de reservas mientras se revisa y se guarda el candado, así nadie
@@ -340,6 +373,11 @@ function registerPlanWeekLocks(app, deps) {
             });
           }
         }
+        // ¿Ya estaba bloqueada? (re-bloquear sólo cambia la nota: no se avisa)
+        wasLocked = (await client.query(
+          "SELECT 1 FROM plan_week_locks WHERE week_start = $1::date FOR UPDATE",
+          [monday]
+        )).rowCount > 0;
         await client.query(
           `INSERT INTO plan_week_locks (week_start, locked_by, locked_by_name, note)
            VALUES ($1::date, $2, $3, $4)
@@ -351,7 +389,9 @@ function registerPlanWeekLocks(app, deps) {
           [monday, req.user.id ?? null, userName, note]
         );
       } else {
-        await client.query("DELETE FROM plan_week_locks WHERE week_start = $1::date", [monday]);
+        wasLocked = (await client.query(
+          "DELETE FROM plan_week_locks WHERE week_start = $1::date", [monday]
+        )).rowCount > 0;
         // Reservas PRE que se quedaron en esta semana porque estaba bloqueada
         // cuando su pre-orden se convirtió o canceló: al desbloquear ya se sueltan.
         const holdsReg = (await client.query("SELECT to_regclass('pre_order_day_holds') AS t")).rows[0].t;
@@ -366,10 +406,14 @@ function registerPlanWeekLocks(app, deps) {
           );
         }
       }
+      // 🔔 Se avisa al CEO sólo si quien actuó tiene un rol de notifyActorRoles
+      // y el estado de la semana de verdad cambió.
+      const actorRole = realRole(req.user);
+      const notifyCeo = notifyActorRoles.includes(actorRole) && wasLocked !== locked;
       await client.query(
-        `INSERT INTO plan_week_lock_log (week_start, action, user_id, user_name, note)
-         VALUES ($1::date, $2, $3, $4, $5)`,
-        [monday, locked ? "lock" : "unlock", req.user.id ?? null, userName, note]
+        `INSERT INTO plan_week_lock_log (week_start, action, user_id, user_name, note, actor_role, notify_ceo)
+         VALUES ($1::date, $2, $3, $4, $5, $6, $7)`,
+        [monday, locked ? "lock" : "unlock", req.user.id ?? null, userName, note, actorRole, notifyCeo]
       );
       await client.query("COMMIT");
 
@@ -377,6 +421,102 @@ function registerPlanWeekLocks(app, deps) {
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       console.error("❌ Error updating plan week lock:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ------------------------------------------------------------------------
+  // 🔔 Avisos al CEO: semanas bloqueadas / desbloqueadas por un director.
+  // Mismo formato que /api/ceo/urgent-changes para que la campana los mezcle.
+  // Ids con prefijo "wl-".
+  // ------------------------------------------------------------------------
+  const ROLE_LABEL = { factory_director: "Director de fábrica" };
+
+  app.get("/api/ceo/week-lock-events", authenticateToken, async (req, res) => {
+    // Quien no es el CEO (p. ej. el propio director, que comparte el panel)
+    // recibe lista vacía en vez de 403, para no ensuciar la campana.
+    if (!isCeoViewer(req.user)) return res.json({ success: true, items: [], unread: 0 });
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { rows } = await client.query(
+        `SELECT l.id, l.action, l.user_name, l.actor_role, l.note, l.created_at,
+                l.ceo_seen_at IS NULL AS unread,
+                to_char(l.week_start, 'YYYY-MM-DD')              AS week_start,
+                to_char(l.week_start + 6, 'YYYY-MM-DD')          AS week_end,
+                to_char(l.week_start, 'IW')::int                 AS iso_week,
+                to_char(l.week_start, 'DD/MM')                   AS from_dm,
+                to_char(l.week_start + 6, 'DD/MM/YYYY')          AS to_dmy,
+                EXISTS (SELECT 1 FROM plan_week_locks k WHERE k.week_start = l.week_start) AS locked_now
+           FROM plan_week_lock_log l
+          WHERE l.notify_ceo
+          ORDER BY l.created_at DESC
+          LIMIT $1`,
+        [limit]
+      );
+      const unread = Number((await client.query(
+        "SELECT COUNT(*)::int AS n FROM plan_week_lock_log WHERE notify_ceo AND ceo_seen_at IS NULL"
+      )).rows[0].n) || 0;
+      const items = rows.map((r) => ({
+        id: `wl-${r.id}`,
+        action: r.action === "lock" ? "week_lock" : "week_unlock",
+        summary: `${r.action === "lock" ? "🔒 Bloqueó" : "🔓 Desbloqueó"} la Sem ${r.iso_week} (${r.from_dm} – ${r.to_dmy})`,
+        user_name: r.user_name,
+        created_at: r.created_at,
+        unread: r.unread,
+        details: {
+          weekStart: r.week_start,
+          weekEnd: r.week_end,
+          isoWeek: r.iso_week,
+          note: r.note,
+          actorRole: r.actor_role,
+          actorRoleLabel: ROLE_LABEL[r.actor_role] || r.actor_role,
+          lockedNow: r.locked_now,
+        },
+      }));
+      res.json({ success: true, items, unread });
+    } catch (err) {
+      console.error("❌ Error listing week lock events:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Marcar todo como visto.
+  app.post("/api/ceo/week-lock-events/seen", authenticateToken, async (req, res) => {
+    if (!isCeoViewer(req.user)) return res.status(403).json({ success: false, error: "Sólo el CEO." });
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const r = await client.query(
+        "UPDATE plan_week_lock_log SET ceo_seen_at = now() WHERE notify_ceo AND ceo_seen_at IS NULL"
+      );
+      res.json({ success: true, updated: r.rowCount });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // Marcar uno como visto.
+  app.post("/api/ceo/week-lock-events/:id/seen", authenticateToken, async (req, res) => {
+    if (!isCeoViewer(req.user)) return res.status(403).json({ success: false, error: "Sólo el CEO." });
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ success: false, error: "id inválido" });
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      await client.query(
+        "UPDATE plan_week_lock_log SET ceo_seen_at = COALESCE(ceo_seen_at, now()) WHERE id = $1 AND notify_ceo",
+        [id]
+      );
+      res.json({ success: true });
+    } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     } finally {
       client.release();
