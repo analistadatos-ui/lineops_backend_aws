@@ -51,7 +51,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const express = require("express");
 const { Pool } = require("pg");
-const serverlessExpress = require("@vendia/serverless-express");
+
 // Existing read-only analytics modules (only their GET routes are registered).
 const registerCutOrderAnalytics = require("./cut-order-analytics");
 const registerFinishedWarehouseAnalytics = require("./finished-warehouse-analytics");
@@ -279,7 +279,7 @@ app.use((req, res, next) => {
   const sendJson = res.json.bind(res);
   res.json = (body) => {
     // Never return SQL / stack details to the caller; keep them in the log.
-    if (res.statusCode >= 500) {
+    if (res.statusCode >= 500 && !res.locals.safeError) {
       console.error(JSON.stringify({
         type: "report_error", reqId, path: req.path,
         error: body && (body.error || body.message), detail: body && body.detail,
@@ -312,7 +312,10 @@ app.use((req, res, next) => {
 
 // ---- 2. gatekeeper: key, method, allowlist, parameters ------------------
 app.use((req, res, next) => {
-  const deny = (status, error) => res.status(status).json({ success: false, error, requestId: res.locals.reqId });
+  const deny = (status, error) => {
+    res.locals.safeError = true; // our own message: no need to hide it
+    return res.status(status).json({ success: false, error, requestId: res.locals.reqId });
+  };
 
   if (API_KEYS.length === 0) return deny(503, "Reporting API not configured"); // fail closed
   if (!keyMatches(req.get("x-api-key"))) return deny(401, "Invalid API key");
@@ -347,6 +350,7 @@ app.use(async (req, res, next) => {
   try {
     const verdict = await checkReadOnly();
     if (verdict !== true) {
+      res.locals.safeError = true;
       return res.status(503).json({ success: false, error: "Reporting disabled: database user is not read-only.", requestId: res.locals.reqId });
     }
     next();
@@ -684,5 +688,30 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   res.status(500).json({ success: false, error: err && err.message });
 });
 
-exports.handler = serverlessExpress({ app });
+// --------------------------------------------------------------------------
+// Start-up: two ways to run, same code.
+//
+//  A) AWS Lambda Web Adapter (how the LineOps image runs): the container starts
+//     `node reporting-lambda.js`, which listens on PORT (default 8080), and the
+//     lambda-adapter extension forwards API Gateway events to it.
+//     Lambda CMD override:  node,reporting-lambda.js
+//
+//  B) Classic handler (Lambda Node.js base image): CMD reporting-lambda.handler
+//     Needs @codegenie/serverless-express (or @vendia/serverless-express).
+// --------------------------------------------------------------------------
+if (require.main === module) {
+  const port = Number(process.env.PORT || process.env.AWS_LWA_PORT) || 8080;
+  app.listen(port, () => console.log(`reporting API listening on ${port}`));
+} else {
+  let handler = null;
+  exports.handler = async (event, context) => {
+    if (!handler) {
+      let serverlessExpress;
+      try { serverlessExpress = require("@codegenie/serverless-express"); }
+      catch { serverlessExpress = require("@vendia/serverless-express"); }
+      handler = serverlessExpress({ app });
+    }
+    return handler(event, context);
+  };
+}
 exports.app = app; // for local tests
