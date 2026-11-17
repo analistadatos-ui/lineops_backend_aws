@@ -10,7 +10,10 @@
 // Roll life cycle (fabric_rolls.status):
 //   requested     → pulled from Skytex and requested by Skyrina
 //   assigned      → container chosen (F01, parked on spot A01), waiting for the truck
-//   in_stock      → QR scanned on arrival, stored in its container
+//   arrived       → Recepción step 1: scanned at the dock, not in a container yet
+//   temporary     → Recepción step 3: no container had room; parked in a temporary
+//                   place with a written reason, until it is put in a container
+//   in_stock      → stored in its container (Recepción step 2, or the old one-step scan)
 //   at_inspection → sent to the fabric inspection team
 //   returned      → returned to the supplier
 //   cancelled     → request cancelled before arrival
@@ -380,7 +383,7 @@ async function initSchema({ pool, setSchema }) {
         out_reference VARCHAR(120),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         CONSTRAINT chk_fabric_roll_status CHECK (status IN
-          ('requested','assigned','in_stock','at_inspection','returned','cancelled'))
+          ('requested','assigned','arrived','temporary','in_stock','at_inspection','returned','cancelled'))
       );
     `);
     await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_status ON fabric_rolls(status);");
@@ -538,6 +541,32 @@ async function initSchema({ pool, setSchema }) {
         PRIMARY KEY (request_id, roll_id)
       );
     `);
+
+    // Recepción in three steps: 1 scan the rolls that arrived (status 'arrived'),
+    // 2 put them in a container (spot + container scanned → 'in_stock'),
+    // 3 when no container has room, a temporary place with a reason ('temporary').
+    // planned_box_code keeps the container a roll was reserved in before it
+    // arrived; it is only a hint for step 2.
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS arrived_at TIMESTAMPTZ;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS arrived_by BIGINT;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS planned_box_code VARCHAR(40);");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS temp_place VARCHAR(120);");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS temp_reason TEXT;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS temp_at TIMESTAMPTZ;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS temp_by BIGINT;");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_arrived_at ON fabric_rolls(arrived_at);");
+    // Databases created before: widen the status check once (it is not rebuilt on every start).
+    const chk = await client.query(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conname = 'chk_fabric_roll_status' AND conrelid = 'fabric_rolls'::regclass`
+    );
+    if (!chk.rows[0] || !chk.rows[0].def.includes("temporary")) {
+      await client.query("ALTER TABLE fabric_rolls DROP CONSTRAINT IF EXISTS chk_fabric_roll_status;");
+      await client.query(
+        `ALTER TABLE fabric_rolls ADD CONSTRAINT chk_fabric_roll_status CHECK (status IN
+          ('requested','assigned','arrived','temporary','in_stock','at_inspection','returned','cancelled'))`
+      );
+    }
 
     console.log("✅ fabric-warehouse tables ready in prod_db_schema");
   } finally {
@@ -1061,7 +1090,7 @@ function registerFabricWarehouse(app, deps) {
               COUNT(r.id)::int AS rolls,
               COUNT(r.id) FILTER (WHERE r.status = 'requested')::int AS en_skytex,
               COUNT(r.id) FILTER (WHERE r.status = 'assigned')::int AS reserved,
-              COUNT(r.id) FILTER (WHERE r.status IN ('in_stock','at_inspection','returned'))::int AS received,
+              COUNT(r.id) FILTER (WHERE r.status IN ('arrived','temporary','in_stock','at_inspection','returned'))::int AS received,
               COUNT(r.id) FILTER (WHERE r.status = 'cancelled')::int AS cancelled,
               COALESCE(SUM(r.yards) FILTER (WHERE r.status <> 'cancelled'), 0) AS yards,
               to_char(MIN(r.arrival_date) FILTER (WHERE r.status IN ('requested','assigned')), 'YYYY-MM-DD') AS next_delivery,
@@ -1412,7 +1441,8 @@ function registerFabricWarehouse(app, deps) {
       return { status: 200, body: { success: true, duplicate: false, unrequested: true, roll: fresh.rows[0] } };
     }
 
-    const pending = f.rows.filter((r) => ["requested", "assigned"].includes(r.status));
+    // arrived / temporary: already scanned at the dock (Recepción step 1) → stored here.
+    const pending = f.rows.filter((r) => ["requested", "assigned", "arrived", "temporary"].includes(r.status));
     if (!pending.length) {
       const r = f.rows[0];
       const where = r.box_code ? ` en ${r.box_code}${r.location_code ? ` (${r.location_code})` : ""}` : r.location_code ? ` en ${r.location_code}` : "";
@@ -1621,15 +1651,24 @@ function registerFabricWarehouse(app, deps) {
   // Undo a receipt scanned by mistake (only while still in stock).
   app.post(`${BASE}/rolls/:id/undo-receive`, authenticateToken, withClient(async (req, res, client) => {
     await client.query("BEGIN");
+    // Scanned at the dock first (arrived_at set) → back to «Asignar a contenedor»,
+    // out of the container. Otherwise → reserved in its container, as before.
     const { rows } = await client.query(
-      `UPDATE fabric_rolls SET status = 'assigned', received_at = NULL, received_by = NULL, updated_at = now()
-        WHERE id = $1 AND status = 'in_stock' RETURNING id, location_id`,
+      `UPDATE fabric_rolls r
+          SET status       = CASE WHEN r.arrived_at IS NOT NULL THEN 'arrived' ELSE 'assigned' END,
+              box_id       = CASE WHEN r.arrived_at IS NOT NULL THEN NULL ELSE r.box_id END,
+              location_id  = CASE WHEN r.arrived_at IS NOT NULL THEN NULL ELSE r.location_id END,
+              container_id = CASE WHEN r.arrived_at IS NOT NULL THEN NULL ELSE r.container_id END,
+              received_at = NULL, received_by = NULL, updated_at = now()
+         FROM (SELECT id, location_id AS old_loc, box_id AS old_box FROM fabric_rolls WHERE id = $1 FOR UPDATE) prev
+        WHERE r.id = prev.id AND r.status = 'in_stock'
+        RETURNING r.id, r.status, prev.old_loc, (SELECT code FROM fabric_boxes WHERE id = prev.old_box) AS old_box_code`,
       [req.params.id]
     );
     if (!rows.length) { await client.query("ROLLBACK"); return fail(res, 409, "Solo se puede deshacer un rollo que sigue en inventario."); }
-    await logMove(client, { rollId: rows[0].id, type: "receive_undone", from: rows[0].location_id, userId: req.user?.id });
+    await logMove(client, { rollId: rows[0].id, type: "receive_undone", from: rows[0].old_loc, fromBox: rows[0].old_box_code, userId: req.user?.id });
     await client.query("COMMIT");
-    res.json({ success: true });
+    res.json({ success: true, status: rows[0].status });
   }));
 
   // Resolve a scanned code to a roll (used by the inspection send screen).
@@ -1645,6 +1684,254 @@ function registerFabricWarehouse(app, deps) {
     );
     if (!rows.length) return fail(res, 404, `No existe el rollo ${scan.roll_no}.`);
     res.json({ success: true, rolls: rows });
+  }));
+
+  // ======================================================================
+  //  RECEPCIÓN: 1 Escanear rollos → 2 Asignar a contenedor → 3 Lugar temporal
+  // ======================================================================
+  //   1  POST /reception/arrive        a roll that arrived (Skytex list or any roll)
+  //                                    → 'arrived'. Saved on every scan.
+  //   2  POST /rolls/put-away          selected 'arrived'/'temporary' rolls → one
+  //                                    container (spot + container scanned) → 'in_stock'
+  //   3  POST /rolls/to-temporary      no container with room: 'arrived' → 'temporary',
+  //                                    with a required reason and an optional place
+  //      POST /reception/identify      what is this code? (spot, container or roll); saves nothing
+  //      GET  /reception               everything the screen shows
+  const MAX_PUTAWAY = 500;
+
+  const arrivedMessage = (r) => ({
+    arrived: `${r.roll_no} ya se escaneó. Falta asignarlo a un contenedor.`,
+    temporary: `${r.roll_no} ya llegó y está en el lugar temporal${r.temp_place ? ` «${r.temp_place}»` : ""}.`,
+    in_stock: `${r.roll_no} ya está guardado en ${r.box_code || "—"}${r.location_code ? ` (${r.location_code})` : ""}.`,
+    at_inspection: `${r.roll_no} está en inspección.`,
+    returned: `${r.roll_no} fue devuelto al proveedor.`,
+  }[r.status] || `El rollo ${r.roll_no} está en estado «${r.status}».`);
+
+  // ?date=YYYY-MM-DD → the PDA's «today» for the scanned-today list.
+  app.get(`${BASE}/reception`, authenticateToken, withClient(async (req, res, client) => {
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || "") ? req.query.date : new Date().toISOString().slice(0, 10);
+    const expected = await client.query(
+      `${ROLL_SELECT} WHERE r.status IN ('requested','assigned') ORDER BY r.po_number NULLS LAST, r.roll_no LIMIT 3000`
+    );
+    const arrived = await client.query(
+      `${ROLL_SELECT} WHERE r.status = 'arrived' ORDER BY r.arrived_at DESC NULLS LAST, r.id DESC LIMIT 2000`
+    );
+    const temporary = await client.query(
+      `${ROLL_SELECT} WHERE r.status = 'temporary' ORDER BY r.temp_at NULLS LAST, r.id LIMIT 2000`
+    );
+    const today = await client.query(
+      `${ROLL_SELECT} WHERE r.arrived_at::date = $1::date AND r.status <> 'cancelled'
+        ORDER BY r.arrived_at DESC, r.id DESC LIMIT 2000`,
+      [day]
+    );
+    // Free room in the containers that are on a spot (the same count roomInBox uses).
+    const roomy = await client.query(
+      `SELECT * FROM (
+         SELECT b.id, b.code, l.code AS location_code,
+                GREATEST(COALESCE(b.capacity, l.capacity, 0)
+                  - (SELECT COUNT(*) FROM fabric_rolls r WHERE r.box_id = b.id AND r.status IN ('assigned','in_stock')), 0)::int AS free
+           FROM fabric_boxes b JOIN fabric_locations l ON l.id = b.location_id
+          WHERE b.is_active) x
+        ORDER BY x.free DESC, x.code`
+    );
+    const withRoom = roomy.rows.filter((b) => b.free > 0);
+    const places = await client.query(
+      `SELECT temp_place AS place FROM fabric_rolls
+        WHERE temp_place IS NOT NULL AND temp_at >= now() - interval '90 days'
+        GROUP BY temp_place ORDER BY MAX(temp_at) DESC LIMIT 8`
+    );
+    res.json({
+      success: true, date: day,
+      expected: expected.rows, arrived: arrived.rows, temporary: temporary.rows, today: today.rows,
+      space: {
+        placed: roomy.rows.length,
+        withRoom: withRoom.length,
+        free: withRoom.reduce((s, b) => s + b.free, 0),
+        boxes: withRoom.slice(0, 8),
+      },
+      places: places.rows.map((p) => p.place),
+      maxPutAway: MAX_PUTAWAY,
+    });
+  }));
+
+  // Step 1. Body: { raw, allowUnrequested? }
+  //   → { roll, unrequested?, reservedIn? } | { duplicate: true, roll, message }
+  //   → 404 code "not_requested" when the roll is not on the Skytex list
+  app.post(`${BASE}/reception/arrive`, authenticateToken, withClient(async (req, res, client) => {
+    const raw = str(req.body?.raw);
+    if (!raw) return fail(res, 400, "Código vacío.");
+    const label = await classifyCode(client, raw);
+    if (label && (label.kind === "box" || label.kind === "location")) {
+      const what = label.kind === "box" ? `del contenedor ${label.box.code}` : `del lugar ${label.location.code}`;
+      return fail(res, 409, `Esa es la etiqueta ${what}. Aquí solo se escanean rollos; el contenedor se elige en «Asignar a contenedor».`, { code: "label" });
+    }
+    const f = await findScannedRoll(client, raw);
+    if (f.error) return fail(res, f.status, f.error);
+    const { scan } = f;
+    const userId = req.user?.id ?? null;
+
+    // Not on the Skytex list.
+    if (!f.rows.length) {
+      if (req.body?.allowUnrequested !== true) {
+        return fail(res, 404, `El rollo ${scan.roll_no} no está en la lista de Skytex.`, { code: "not_requested", rollNo: scan.roll_no });
+      }
+      await client.query("BEGIN");
+      const ins = await client.query(
+        `INSERT INTO fabric_rolls (skytex_key, roll_no, supplier_code, raw, status, source, arrived_at, arrived_by, requested_by)
+         VALUES ($1, $2, $3, $4, 'arrived', 'scan', now(), $5, $5)
+         ON CONFLICT (skytex_key) DO UPDATE
+           SET status = 'arrived', box_id = NULL, container_id = NULL, location_id = NULL,
+               arrived_at = now(), arrived_by = EXCLUDED.arrived_by,
+               received_at = NULL, received_by = NULL, updated_at = now()
+         WHERE fabric_rolls.status = 'cancelled'
+         RETURNING id`,
+        [`SCAN|${scan.roll_no.toUpperCase()}`, scan.roll_no, scan.supplier_code, JSON.stringify({ scanned: scan.raw }), userId]
+      );
+      if (!ins.rows.length) {
+        await client.query("ROLLBACK");
+        return fail(res, 409, `El rollo ${scan.roll_no} ya está registrado. Actualice la pantalla.`);
+      }
+      await logMove(client, { rollId: ins.rows[0].id, type: "arrived", reason: "Sin solicitud a Skytex", userId });
+      await client.query("COMMIT");
+      const fresh = await client.query(`${ROLL_SELECT} WHERE r.id = $1`, [ins.rows[0].id]);
+      return res.json({ success: true, duplicate: false, unrequested: true, roll: fresh.rows[0] });
+    }
+
+    const open = f.rows.filter((r) => ["requested", "assigned"].includes(r.status));
+    if (!open.length) {
+      const r = f.rows[0];
+      return res.json({ success: true, duplicate: true, roll: r, message: arrivedMessage(r) });
+    }
+    if (open.length > 1) {
+      return fail(res, 409, `Hay ${open.length} rollos ${scan.roll_no} de distintos proveedores. Escanee el código completo.`);
+    }
+    const roll = open[0];
+    const reservedIn = roll.status === "assigned" ? roll.box_code || null : null;
+    await client.query("BEGIN");
+    // The roll leaves its reserved container (it is at the dock now); the code
+    // stays in planned_box_code as a hint for step 2.
+    const upd = await client.query(
+      `UPDATE fabric_rolls
+          SET status = 'arrived', arrived_at = now(), arrived_by = $2,
+              planned_box_code = COALESCE($3, planned_box_code),
+              box_id = NULL, location_id = NULL, container_id = NULL, updated_at = now()
+        WHERE id = $1 AND status IN ('requested','assigned')
+        RETURNING id`,
+      [roll.id, userId, reservedIn]
+    );
+    if (!upd.rows.length) {
+      await client.query("ROLLBACK");
+      return fail(res, 409, "El rollo cambió de estado. Actualice e intente de nuevo.");
+    }
+    await logMove(client, {
+      rollId: roll.id, type: "arrived", from: roll.location_id, fromBox: roll.box_code || null,
+      reference: roll.po_number, userId,
+    });
+    await client.query("COMMIT");
+    const fresh = await client.query(`${ROLL_SELECT} WHERE r.id = $1`, [roll.id]);
+    res.json({ success: true, duplicate: false, roll: fresh.rows[0], reservedIn });
+  }));
+
+  // Undo a step-1 scan made by mistake (only while it waits for a container).
+  // Skytex roll → back to the Skytex list; roll without request → removed (cancelled).
+  app.post(`${BASE}/rolls/:id/undo-arrival`, authenticateToken, withClient(async (req, res, client) => {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `UPDATE fabric_rolls
+          SET status = CASE WHEN source = 'scan' THEN 'cancelled' ELSE 'requested' END,
+              arrived_at = NULL, arrived_by = NULL, updated_at = now()
+        WHERE id = $1 AND status = 'arrived'
+        RETURNING id, status`,
+      [req.params.id]
+    );
+    if (!rows.length) {
+      await client.query("ROLLBACK");
+      return fail(res, 409, "Solo se puede deshacer un rollo que todavía espera contenedor.");
+    }
+    await logMove(client, { rollId: rows[0].id, type: "arrival_undone", userId: req.user?.id });
+    await client.query("COMMIT");
+    res.json({ success: true, status: rows[0].status });
+  }));
+
+  // What is this code? Saves nothing. Body: { raw, expect? }
+  //   → { kind: "location", location } | { kind: "box", box } | { kind: "invalid_box", error }
+  //   → { kind: "roll", rollNo, rolls }   (rolls: every match, any status)
+  app.post(`${BASE}/reception/identify`, authenticateToken, withClient(async (req, res, client) => {
+    const raw = str(req.body?.raw);
+    if (!raw) return fail(res, 400, "Código vacío.");
+    const label = await classifyCode(client, raw, req.body?.expect);
+    if (label) return res.json({ success: true, ...label });
+    const f = await findScannedRoll(client, raw);
+    if (f.error) return fail(res, f.status, f.error);
+    res.json({ success: true, kind: "roll", rollNo: f.scan.roll_no, rolls: f.rows });
+  }));
+
+  // Step 2 (and from step 3). Body: { ids, boxId }. All or nothing.
+  app.post(`${BASE}/rolls/put-away`, authenticateToken, withClient(async (req, res, client) => {
+    const ids = idList(req.body?.ids);
+    const boxId = parseInt(req.body?.boxId, 10);
+    if (!ids.length) return fail(res, 400, "Seleccione al menos un rollo.");
+    if (ids.length > MAX_PUTAWAY) return fail(res, 400, `Máximo ${MAX_PUTAWAY} rollos por guardado.`);
+    if (!boxId) return fail(res, 400, "Escanee el lugar y después el contenedor.");
+    const userId = req.user?.id ?? null;
+
+    await client.query("BEGIN");
+    // Lock the container so two PDAs cannot fill the same free space.
+    await client.query(`SELECT id FROM fabric_boxes WHERE id = $1 FOR UPDATE`, [boxId]);
+    const cur = await client.query(
+      `SELECT id, status, po_number, temp_place FROM fabric_rolls WHERE id = ANY($1::bigint[]) FOR UPDATE`, [ids]
+    );
+    const ok = cur.rows.filter((r) => r.status === "arrived" || r.status === "temporary");
+    if (!ok.length) {
+      await client.query("ROLLBACK");
+      return fail(res, 409, "Ninguno de esos rollos espera contenedor. Actualice la lista.");
+    }
+    const room = await roomInBox(client, boxId, ok.map((r) => r.id), ok.length);
+    if (room.error) {
+      await client.query("ROLLBACK");
+      const free = room.B && room.B.capacity != null ? Math.max(0, room.B.capacity - room.B.used) : null;
+      return fail(res, room.status, room.error, { code: room.code, free });
+    }
+    const B = room.B;
+    await client.query(
+      `UPDATE fabric_rolls
+          SET status = 'in_stock', box_id = $2, location_id = $3, container_id = $4,
+              received_at = now(), received_by = $5, location_set_at = now(), updated_at = now()
+        WHERE id = ANY($1::bigint[])`,
+      [ok.map((r) => r.id), B.id, B.location_id, B.container_id, userId]
+    );
+    for (const r of ok) {
+      await logMove(client, {
+        rollId: r.id, type: "received", to: B.location_id, toBox: B.code, reference: r.po_number, userId,
+        reason: r.status === "temporary" ? `Desde el lugar temporal${r.temp_place ? ` «${r.temp_place}»` : ""}` : null,
+      });
+    }
+    await client.query("COMMIT");
+    res.json({ success: true, saved: ok.length, skipped: ids.length - ok.length, box: await boxInfo(client, B.id) });
+  }));
+
+  // Step 3. Body: { ids, reason, place? }
+  app.post(`${BASE}/rolls/to-temporary`, authenticateToken, withClient(async (req, res, client) => {
+    const ids = idList(req.body?.ids);
+    const reason = str(req.body?.reason);
+    const place = str(req.body?.place);
+    if (!ids.length) return fail(res, 400, "Seleccione al menos un rollo.");
+    if (!reason || reason.length < 3) return fail(res, 400, "Escriba por qué los rollos van al lugar temporal.");
+    if (reason.length > 500) return fail(res, 400, "El motivo es demasiado largo (máximo 500 caracteres).");
+    if (place && place.length > 120) return fail(res, 400, "El nombre del lugar es demasiado largo (máximo 120 caracteres).");
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `UPDATE fabric_rolls
+          SET status = 'temporary', temp_reason = $2, temp_place = $3, temp_at = now(), temp_by = $4, updated_at = now()
+        WHERE id = ANY($1::bigint[]) AND status = 'arrived'
+        RETURNING id`,
+      [ids, reason, place, req.user?.id ?? null]
+    );
+    for (const r of rows) {
+      await logMove(client, { rollId: r.id, type: "temporary", reference: place, reason, userId: req.user?.id });
+    }
+    await client.query("COMMIT");
+    res.json({ success: true, moved: rows.length, skipped: ids.length - rows.length });
   }));
 
   // ======================================================================
@@ -2342,7 +2629,7 @@ function registerFabricWarehouse(app, deps) {
     if (po) { params.push(po); poSql = ` AND COALESCE(r.po_number, 'Sin PO') = $${params.length}`; }
     const scope = `r.source = 'skytex' AND r.status <> 'cancelled'
                    AND (r.status IN ('requested','assigned') OR r.requested_at >= now() - make_interval(days => $1))${poSql}`;
-    const RECEIVED = `r.status IN ('in_stock','at_inspection','returned')`;
+    const RECEIVED = `r.status IN ('arrived','temporary','in_stock','at_inspection','returned')`;
 
     const byPo = await client.query(
       `SELECT COALESCE(r.po_number, 'Sin PO') AS po_number,
