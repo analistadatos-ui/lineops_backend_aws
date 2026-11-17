@@ -26,7 +26,7 @@
 // 2. In the async startup block, by the other initSchema calls:
 //        await registerPreOrderHolds.initSchema({ pool, setSchema });
 // 3. Where the other modules register:
-//        registerPreOrderHolds(app, { authenticateToken, pool, setSchema });
+//        registerPreOrderHolds(app, { authenticateToken, pool, setSchema, holidays: registerHolidays });
 //
 // Gated by authenticateToken only. created_by records who placed the hold; the
 // board is ORG-WIDE like the merchant plan.
@@ -97,9 +97,25 @@ const txt = (v, n) => (v == null ? null : String(v).trim().slice(0, n || 200) ||
 const col = (v) => String(v == null ? "" : v).trim().toUpperCase().slice(0, 50);
 const numOr = (v, d = 0) => { const n = Number(v); return isNaN(n) ? d : n; };
 const isYmd = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+// Date helpers in UTC (no timezone drift), same as server.js.
+const addDaysStr = (ymdStr, n) => {
+  const [y, m, d] = ymdStr.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+};
+const isWeekend = (ymdStr) => {
+  const [y, m, d] = ymdStr.split("-").map(Number);
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sun, 6 = Sat
+  return dow === 0 || dow === 6;
+};
+// How far forward a hold may spill looking for free capacity.
+const MAX_SPILL_DAYS = 180;
 
 function registerPreOrderHolds(app, deps) {
   const { authenticateToken, pool, setSchema } = deps;
+  // Optional: holidays module (registerHolidays) so the spill skips días festivos.
+  const holidays = deps.holidays || null;
 
   // ---- GET: all holds (optionally within a date window) ------------------
   app.get("/api/pre-order-holds", authenticateToken, async (req, res) => {
@@ -164,13 +180,25 @@ function registerPreOrderHolds(app, deps) {
     }
   });
 
-  // ---- POST: upsert one hold (merges quantity on conflict) ---------------
+  // ---- POST: upsert a hold (merges quantity on conflict) -----------------
   // Capacity check (planner style standards): the hold's style must have a
-  // standard (else 409 STYLE_PARAMS_REQUIRED so the board asks the planner),
-  // and `quantity` must fit what is left of that line-day for that style after
-  // every assignment and other hold already there (else 400).
-  // Body may send { skipCapacityCheck: true } only to restore a hold exactly as
-  // it was (e.g. an undo); the board never sends it for a normal drop.
+  // standard (else 409 STYLE_PARAMS_REQUIRED so the board asks the planner).
+  //
+  // FIX (capacity mismatch board vs server): the board estimates per day how
+  // many pieces fit, but the server's cellCapacity() (planner standard +
+  // learning curve + other loads) is the only truth. Instead of rejecting a
+  // chunk that is bigger than what the server says fits, the server now
+  // places what fits on the requested day and SPILLS the rest forward onto the
+  // next working days of the same line (skips weekends, holidays and CEO-locked
+  // weeks), exactly like the PO move endpoint does. All-or-nothing: if the
+  // whole quantity can't be placed within MAX_SPILL_DAYS, nothing is saved.
+  //
+  // Body flags:
+  //   { spread: false }          -> old strict behaviour (400 if it doesn't fit)
+  //   { skipCapacityCheck: true } -> restore a hold exactly as it was (undo)
+  //
+  // Response keeps `hold` (first row) for compatibility and adds `holds`
+  // (every row written), `spilled` (true when it went past the requested day).
   app.post("/api/pre-order-holds", authenticateToken, async (req, res) => {
     const b = req.body || {};
     const preOrderId = b.preOrderId ?? b.pre_order_id ?? null;
@@ -180,20 +208,19 @@ function registerPreOrderHolds(app, deps) {
     if (preOrderId == null || lineNo == null || String(lineNo).trim() === "" || !isYmd(assignedDate) || quantity <= 0) {
       return res.status(400).json({ success: false, error: "preOrderId, lineNo, assignedDate (YYYY-MM-DD) y quantity (>0) son obligatorios" });
     }
+    const line = String(lineNo).trim();
+    const preId = parseInt(preOrderId, 10);
     const client = await pool.connect();
     try {
       await setSchema(client);
       await client.query("BEGIN");
       await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
-      // Serialize writers on this line-day so two drops can't both take the
-      // last free pieces.
-      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`hold|${String(lineNo).trim()}|${assignedDate}`]);
 
       // Una PRE convertida o cancelada ya no puede reservar (ni por mover una
       // celda vieja ni por deshacer): el planner debe asignar la PO real.
       const st = await client.query(
         "SELECT status, work_order_nos FROM pre_orders WHERE id = $1",
-        [parseInt(preOrderId, 10)]
+        [preId]
       );
       if (!st.rows.length) {
         await client.query("ROLLBACK");
@@ -217,57 +244,140 @@ function registerPreOrderHolds(app, deps) {
         const po = await client.query(
           `SELECT UPPER(TRIM(COALESCE(NULLIF(TRIM(style_code), ''), NULLIF(TRIM(estilo), ''), ''))) AS style
              FROM pre_orders WHERE id = $1`,
-          [parseInt(preOrderId, 10)]
+          [preId]
         );
         style = po.rows[0]?.style || "";
       }
 
-      if (b.skipCapacityCheck !== true) {
-        const cap = await plannerStyleParams.cellCapacity(client, {
-          lineNo: String(lineNo).trim(), date: assignedDate, style,
-        });
-        if (!cap.params) {
-          await client.query("ROLLBACK");
-          return plannerStyleParams.styleParamsRequired(res, style);
-        }
-        if (quantity > cap.available) {
+      const meta = {
+        color: col(b.color),
+        preOrderNo: txt(b.preOrderNo ?? b.pre_order_no, 80),
+        customerName: txt(b.customerName ?? b.customer_name, 150),
+        styleCode: txt(b.styleCode ?? b.style_code, 20) || txt(style, 20),
+        estilo: txt(b.estilo, 120),
+        userId: req.user?.id ?? null,
+      };
+      const insertHold = async (day, qty) => {
+        const { rows } = await client.query(
+          `INSERT INTO pre_order_day_holds
+             (pre_order_id, line_no, assigned_date, quantity, color,
+              pre_order_no, customer_name, style_code, estilo, created_by, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())
+           ON CONFLICT (pre_order_id, line_no, assigned_date, color) DO UPDATE SET
+             quantity      = pre_order_day_holds.quantity + EXCLUDED.quantity,
+             pre_order_no  = EXCLUDED.pre_order_no,
+             customer_name = EXCLUDED.customer_name,
+             style_code    = EXCLUDED.style_code,
+             estilo        = EXCLUDED.estilo,
+             updated_at    = NOW()
+           RETURNING id, line_no, to_char(assigned_date,'YYYY-MM-DD') AS assigned_date, quantity`,
+          [preId, line, day, qty, meta.color, meta.preOrderNo, meta.customerName,
+           meta.styleCode, meta.estilo, meta.userId]
+        );
+        return rows[0];
+      };
+      // Serialize writers on a line-day so two drops can't both take the
+      // last free pieces.
+      const lockCell = (day) =>
+        client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`hold|${line}|${day}`]);
+
+      // ---- Undo / exact restore: no capacity check --------------------------
+      if (b.skipCapacityCheck === true) {
+        await lockCell(assignedDate);
+        const row = await insertHold(assignedDate, quantity);
+        await client.query("COMMIT");
+        return res.json({ success: true, hold: row, holds: [row], spilled: false });
+      }
+
+      // ---- Requested day ------------------------------------------------------
+      await lockCell(assignedDate);
+      const firstCap = await plannerStyleParams.cellCapacity(client, { lineNo: line, date: assignedDate, style });
+      if (!firstCap.params) {
+        await client.query("ROLLBACK");
+        return plannerStyleParams.styleParamsRequired(res, style);
+      }
+
+      // Strict mode (old behaviour), only if the caller explicitly asks for it.
+      if (b.spread === false) {
+        if (quantity > firstCap.available) {
           await client.query("ROLLBACK");
           return res.status(400).json({
             success: false,
-            error: `La Línea ${String(lineNo).trim()} solo tiene capacidad para ${Math.floor(cap.available)} pzas de ${style} el ${assignedDate}.`,
-            available: cap.available,
+            error: `La Línea ${line} solo tiene capacidad para ${Math.floor(firstCap.available)} pzas de ${style} el ${assignedDate}.`,
+            available: firstCap.available,
           });
+        }
+        const row = await insertHold(assignedDate, quantity);
+        await client.query("COMMIT");
+        return res.json({ success: true, hold: row, holds: [row], spilled: false });
+      }
+
+      // ---- Spread: fill the requested day, spill the rest forward ------------
+      const written = [];
+      let remaining = quantity;
+
+      const fit = (available) => Math.min(remaining, Math.max(0, Math.floor(Number(available) || 0)));
+      let chunk = fit(firstCap.available);
+      // Less than one piece left to place: put it where the planner dropped it.
+      if (remaining < 1) chunk = remaining;
+      if (chunk > 0) {
+        written.push(await insertHold(assignedDate, chunk));
+        remaining -= chunk;
+      }
+
+      if (remaining > 0) {
+        // Days the walk must hop over: weekends, holidays of this line or the
+        // whole plant, and weeks the CEO locked.
+        const holidaySet = new Set();
+        if (holidays && typeof holidays.holidaysBetween === "function") {
+          try {
+            const hrows = await holidays.holidaysBetween(client, {
+              from: assignedDate, to: addDaysStr(assignedDate, MAX_SPILL_DAYS + 30),
+            });
+            for (const h of hrows) {
+              if (h.line_no == null || String(h.line_no) === line) holidaySet.add(String(h.holiday_date).slice(0, 10));
+            }
+          } catch (e) {
+            console.warn("⚠️  holidays not available for pre-order hold spill:", e.message);
+          }
+        }
+        let lockedWeeks = null;
+        try { lockedWeeks = await planWeekLocks.lockedWeekSet(client); } catch (_) { lockedWeeks = null; }
+
+        let day = assignedDate;
+        let scanned = 0;
+        while (remaining > 0 && scanned < MAX_SPILL_DAYS) {
+          scanned++;
+          day = addDaysStr(day, 1);
+          if (isWeekend(day) || holidaySet.has(day)) continue;
+          if (lockedWeeks && planWeekLocks.isLockedDay(lockedWeeks, day)) continue;
+          await lockCell(day);
+          const cap = await plannerStyleParams.cellCapacity(client, { lineNo: line, date: day, style });
+          chunk = remaining < 1 ? remaining : fit(cap.available);
+          if (chunk <= 0) continue;
+          written.push(await insertHold(day, chunk));
+          remaining -= chunk;
         }
       }
 
-      const { rows } = await client.query(
-        `INSERT INTO pre_order_day_holds
-           (pre_order_id, line_no, assigned_date, quantity, color,
-            pre_order_no, customer_name, style_code, estilo, created_by, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())
-         ON CONFLICT (pre_order_id, line_no, assigned_date, color) DO UPDATE SET
-           quantity      = pre_order_day_holds.quantity + EXCLUDED.quantity,
-           pre_order_no  = EXCLUDED.pre_order_no,
-           customer_name = EXCLUDED.customer_name,
-           style_code    = EXCLUDED.style_code,
-           estilo        = EXCLUDED.estilo,
-           updated_at    = NOW()
-         RETURNING id, to_char(assigned_date,'YYYY-MM-DD') AS assigned_date, quantity`,
-        [
-          parseInt(preOrderId, 10),
-          String(lineNo).trim(),
-          assignedDate,
-          quantity,
-          col(b.color),
-          txt(b.preOrderNo ?? b.pre_order_no, 80),
-          txt(b.customerName ?? b.customer_name, 150),
-          txt(b.styleCode ?? b.style_code, 20) || txt(style, 20),
-          txt(b.estilo, 120),
-          req.user?.id ?? null,
-        ]
-      );
+      if (remaining > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          error: `La Línea ${line} no tiene capacidad para ${Math.ceil(remaining)} de las ${quantity} pzas de ${style} ` +
+                 `entre el ${assignedDate} y los siguientes ${MAX_SPILL_DAYS} días. No se reservó nada.`,
+          available: firstCap.available,
+          unplaced: remaining,
+        });
+      }
+
       await client.query("COMMIT");
-      res.json({ success: true, hold: rows[0] });
+      res.json({
+        success: true,
+        hold: written[0],
+        holds: written,
+        spilled: written.some((h) => h.assigned_date !== assignedDate),
+      });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);

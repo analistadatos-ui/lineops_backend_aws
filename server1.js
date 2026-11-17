@@ -1220,7 +1220,7 @@ const registerFinishedWarehouseAnalytics = require("./finished-warehouse-analyti
 registerFinishedWarehouseAnalytics(app, { authenticateToken, pool, setSchema });
 
 const registerPreOrderHolds = require("./pre-order-holds");
-registerPreOrderHolds(app, { authenticateToken, pool, setSchema });
+registerPreOrderHolds(app, { authenticateToken, pool, setSchema, holidays: registerHolidays });
 
 // 📈 Tablero de pronóstico del cliente: pronósticos FC#### + sus reservas de línea/día.
 const registerForecastOrders = require("./forecast-orders");
