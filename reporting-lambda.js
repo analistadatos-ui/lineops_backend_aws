@@ -24,6 +24,7 @@
 //        GET /reports/pending-approvals             pending cut requests + close requests
 //        GET /reports/sam-compliance                planning: merchant SAM vs production SAM
 //        GET /reports/delivery-plan                 planning: plan finish vs merchant delivery date
+//        GET /reports/pre-orders                    pre-orders: pending/converted pieces, overdue, board holds
 //
 // Security layers (each one stops what the others miss)
 //   1. API Gateway: API key + usage plan (rate limit / daily quota)
@@ -243,7 +244,7 @@ const ROUTES = {
     required: ["customer"],
   },
   "/reports/plan-load": {
-    desc: "Carga del plan: piezas asignadas por línea y día, y días bloqueados.",
+    desc: "Carga del plan: piezas asignadas (POs) y apartadas por pre-órdenes por línea y día, y días bloqueados.",
     params: { ...RANGE, lineNo: P.text(20, "Línea") },
     required: ["startDate", "endDate"],
     maxDays: 120,
@@ -264,6 +265,16 @@ const ROUTES = {
       verdict: P.oneOf(["all", "ontime", "late", "sinplan", "nofecha"], "Filtrar por resultado de entrega"),
       customer: P.text(100, "Cliente (exacto, sin distinguir mayúsculas)"),
       q: P.text(50, "Buscar número de orden, PO o estilo"),
+    },
+  },
+  "/reports/pre-orders": {
+    desc: "Pre-órdenes (PRE####): piezas comprometidas, convertidas a PO y por convertir; vencidas sin convertir; apartados en el tablero; las que llegan del pronóstico.",
+    params: {
+      status: P.oneOf(["open", "pending", "partially_converted", "converted", "cancelled", "all"], "Status (open = pendientes + parcialmente convertidas)"),
+      customer: P.text(100, "Cliente (exacto, sin distinguir mayúsculas)"),
+      startDate: P.ymd("Capturadas desde (YYYY-MM-DD)"),
+      endDate: P.ymd("Capturadas hasta (YYYY-MM-DD)"),
+      q: P.text(50, "Buscar PRE, estilo, PO cliente o pronóstico"),
     },
   },
   "/reports/pending-approvals": {
@@ -647,14 +658,46 @@ app.get("/reports/plan-load", withClient(async (req, res, client) => {
     blockedDays = h.rows;
   }
 
-  const cells = rows.map((r) => ({ lineNo: r.line_no, day: r.day, plannedPcs: num(r.planned_pcs), orders: num(r.orders) }));
+  // Pre-order holds (PRE#### reserved on the Plan Board) also take capacity.
+  let holdRows = [];
+  if ((await client.query("SELECT to_regclass('pre_order_day_holds') AS t")).rows[0].t) {
+    ({ rows: holdRows } = await client.query(
+      `SELECT h.line_no,
+              to_char(h.assigned_date, 'YYYY-MM-DD') AS day,
+              SUM(h.quantity)                         AS hold_pcs,
+              COUNT(DISTINCT h.pre_order_id)          AS pre_orders
+         FROM pre_order_day_holds h
+         JOIN pre_orders p ON p.id = h.pre_order_id
+        WHERE h.assigned_date BETWEEN $1::date AND $2::date
+          AND p.status IN ('pending', 'partially_converted')
+          AND ($3::text IS NULL OR h.line_no = $3)
+        GROUP BY h.line_no, h.assigned_date`,
+      [startDate, endDate, lineNo]
+    ));
+  }
+
+  const cellMap = new Map();
+  const cellOf = (l, d) => {
+    const k = `${l}|${d}`;
+    if (!cellMap.has(k)) cellMap.set(k, { lineNo: l, day: d, plannedPcs: 0, orders: 0, preOrderHoldPcs: 0, preOrders: 0 });
+    return cellMap.get(k);
+  };
+  for (const r of rows) Object.assign(cellOf(r.line_no, r.day), { plannedPcs: num(r.planned_pcs), orders: num(r.orders) });
+  for (const r of holdRows) Object.assign(cellOf(r.line_no, r.day), { preOrderHoldPcs: num(r.hold_pcs), preOrders: num(r.pre_orders) });
+  const cells = [...cellMap.values()].sort((a, b) => a.day.localeCompare(b.day) || String(a.lineNo).localeCompare(String(b.lineNo), undefined, { numeric: true }));
+
   const byLine = {};
-  for (const c of cells) byLine[c.lineNo] = (byLine[c.lineNo] || 0) + c.plannedPcs;
+  for (const c of cells) {
+    const b = byLine[c.lineNo] || (byLine[c.lineNo] = { lineNo: c.lineNo, plannedPcs: 0, preOrderHoldPcs: 0 });
+    b.plannedPcs += c.plannedPcs;
+    b.preOrderHoldPcs += c.preOrderHoldPcs;
+  }
   res.json({
     success: true,
     period: { startDate, endDate },
     totalPlannedPcs: cells.reduce((s, c) => s + c.plannedPcs, 0),
-    byLine: Object.entries(byLine).map(([lineNo2, plannedPcs]) => ({ lineNo: lineNo2, plannedPcs })),
+    totalPreOrderHoldPcs: cells.reduce((s, c) => s + c.preOrderHoldPcs, 0),
+    byLine: Object.values(byLine),
     cells,
     blockedDays,
   });
@@ -702,6 +745,137 @@ app.get("/reports/pending-approvals", withClient(async (req, res, client) => {
     };
   }
   res.json(out);
+}));
+
+// GET /reports/pre-orders?status&customer&startDate&endDate&q
+// pending pieces   = pieces - converted_pieces (open pre-orders only)
+// overdue          = open, with a target date already past
+// held on board    = pre_order_day_holds (soft reservations on the Plan Board)
+app.get("/reports/pre-orders", withClient(async (req, res, client) => {
+  const status = req.query.status || "open";
+  const params = [];
+  const base = [];
+  if (req.query.customer) { params.push(req.query.customer); base.push(`UPPER(TRIM(p.customer_name)) = UPPER(TRIM($${params.length}))`); }
+  if (req.query.startDate) { params.push(req.query.startDate); base.push(`(p.created_at AT TIME ZONE '${PLANT_TZ}')::date >= $${params.length}::date`); }
+  if (req.query.endDate) { params.push(req.query.endDate); base.push(`(p.created_at AT TIME ZONE '${PLANT_TZ}')::date <= $${params.length}::date`); }
+  if (req.query.q) {
+    params.push(`%${req.query.q.replace(/[\\%_]/g, "\\$&")}%`);
+    const x = `$${params.length}`;
+    base.push(`(p.pre_order_no ILIKE ${x} OR p.style_code ILIKE ${x} OR p.estilo ILIKE ${x} OR p.customer_po ILIKE ${x} OR p.source_forecast_no ILIKE ${x})`);
+  }
+  const baseWhere = base.length ? `WHERE ${base.join(" AND ")}` : "";
+
+  // Counts per status with the same filters (status filter not applied).
+  const { rows: countRows } = await client.query(
+    `SELECT p.status, COUNT(*)::int AS n FROM pre_orders p ${baseWhere} GROUP BY p.status`, params);
+  const countsByStatus = { pending: 0, partially_converted: 0, converted: 0, cancelled: 0 };
+  for (const r of countRows) countsByStatus[r.status] = r.n;
+
+  const listWhere = [...base];
+  if (status === "open") listWhere.push("p.status IN ('pending', 'partially_converted')");
+  else if (status !== "all") { params.push(status); listWhere.push(`p.status = $${params.length}`); }
+  params.push(MAX_ROWS + 1);
+
+  const hasHolds = (await client.query("SELECT to_regclass('pre_order_day_holds') AS t")).rows[0].t;
+  const holdsCte = hasHolds
+    ? `WITH h AS (
+         SELECT pre_order_id, SUM(quantity) AS held,
+                array_agg(DISTINCT line_no ORDER BY line_no) AS lines,
+                to_char(MIN(assigned_date), 'YYYY-MM-DD') AS first_day,
+                to_char(MAX(assigned_date), 'YYYY-MM-DD') AS last_day
+           FROM pre_order_day_holds GROUP BY pre_order_id)`
+    : `WITH h AS (SELECT NULL::bigint AS pre_order_id, 0::numeric AS held, NULL::text[] AS lines,
+                         NULL::text AS first_day, NULL::text AS last_day WHERE false)`;
+
+  const { rows } = await client.query(
+    `${holdsCte}
+     SELECT p.pre_order_no, p.style_code, p.estilo, p.style_description, p.customer_name, p.customer_po,
+            p.pieces, p.converted_pieces, p.sam_minutes, p.status, p.work_order_nos,
+            to_char(p.target_date, 'YYYY-MM-DD')  AS target_date,
+            to_char(p.planned_week, 'YYYY-MM-DD') AS planned_week,
+            to_char(p.created_at AT TIME ZONE '${PLANT_TZ}', 'YYYY-MM-DD')   AS created_date,
+            to_char(p.converted_at AT TIME ZONE '${PLANT_TZ}', 'YYYY-MM-DD') AS converted_date,
+            p.source_forecast_no, p.source_season,
+            (p.source_forecast_id IS NOT NULL AND p.merchant_seen_at IS NULL) AS unseen_by_merchant,
+            COALESCE(h.held, 0) AS held, h.lines, h.first_day, h.last_day
+       FROM pre_orders p
+       LEFT JOIN h ON h.pre_order_id = p.id
+      ${listWhere.length ? `WHERE ${listWhere.join(" AND ")}` : ""}
+      ORDER BY (p.status IN ('pending', 'partially_converted')) DESC, p.target_date NULLS LAST, p.created_at DESC
+      LIMIT $${params.length}`,
+    params
+  );
+  const truncated = rows.length > MAX_ROWS;
+  const today = todayPlant();
+
+  const preOrders = rows.slice(0, MAX_ROWS).map((r) => {
+    const open = r.status === "pending" || r.status === "partially_converted";
+    const pieces = num(r.pieces);
+    const converted = num(r.converted_pieces);
+    const pendingPcs = open ? Math.max(pieces - converted, 0) : 0;
+    const held = open ? num(r.held) : 0;
+    return {
+      preOrderNo: r.pre_order_no,
+      customer: r.customer_name,
+      customerPo: r.customer_po,
+      style: r.style_code,
+      clientStyle: r.estilo,
+      description: r.style_description,
+      status: r.status,
+      pieces,
+      convertedPieces: converted,
+      pendingPieces: pendingPcs,
+      samMinutes: num(r.sam_minutes) || null,
+      targetDate: r.target_date,
+      overdue: open && !!r.target_date && r.target_date < today,
+      plannedWeek: r.planned_week,
+      heldOnBoardPcs: held,
+      notHeldPcs: open ? Math.max(pendingPcs - held, 0) : 0,
+      heldLines: open ? r.lines || [] : [],
+      heldFrom: open ? r.first_day : null,
+      heldTo: open ? r.last_day : null,
+      createdDate: r.created_date,
+      convertedDate: r.converted_date,
+      daysToConvert: r.converted_date ? daysDiff(r.created_date, r.converted_date) : null,
+      workOrders: r.work_order_nos || null,
+      fromForecast: r.source_forecast_no || null,
+      season: r.source_season || null,
+      unseenByMerchant: open && !!r.unseen_by_merchant,
+    };
+  });
+
+  const open = preOrders.filter((p) => p.status === "pending" || p.status === "partially_converted");
+  const sum = (list, k) => list.reduce((s, p) => s + p[k], 0);
+  const byCustomer = {};
+  for (const p of open) {
+    const c = byCustomer[p.customer || "—"] || (byCustomer[p.customer || "—"] = { customer: p.customer || "—", preOrders: 0, pendingPieces: 0, heldOnBoardPcs: 0, overdue: 0 });
+    c.preOrders++; c.pendingPieces += p.pendingPieces; c.heldOnBoardPcs += p.heldOnBoardPcs; if (p.overdue) c.overdue++;
+  }
+  const conv = preOrders.filter((p) => p.daysToConvert != null);
+  const decided = countsByStatus.converted + countsByStatus.cancelled; // finished one way or the other
+
+  res.json({
+    success: true,
+    asOf: today,
+    truncated,
+    summary: {
+      countsByStatus,
+      openPreOrders: open.length,
+      openPieces: sum(open, "pieces"),
+      convertedPiecesOfOpen: sum(open, "convertedPieces"),
+      pendingPieces: sum(open, "pendingPieces"),
+      heldOnBoardPcs: sum(open, "heldOnBoardPcs"),
+      notHeldPcs: sum(open, "notHeldPcs"),
+      overdue: open.filter((p) => p.overdue).length,
+      withoutTargetDate: open.filter((p) => !p.targetDate).length,
+      fromForecast: open.filter((p) => p.fromForecast).length,
+      unseenByMerchant: open.filter((p) => p.unseenByMerchant).length,
+      conversionRatePct: decided ? Math.round((countsByStatus.converted / decided) * 1000) / 10 : null, // converted vs cancelled
+      avgDaysToConvert: conv.length ? Math.round((conv.reduce((s, p) => s + p.daysToConvert, 0) / conv.length) * 10) / 10 : null,
+    },
+    byCustomer: Object.values(byCustomer).sort((a, b) => b.pendingPieces - a.pendingPieces),
+    preOrders,
+  });
 }));
 
 // ==========================================================================
@@ -963,4 +1137,4 @@ if (require.main === module) {
     return handler(event, context);
   };
 }
-exports.app = app; 
+exports.app = app; // for local tests
