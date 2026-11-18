@@ -14,6 +14,13 @@
 //   semana, festivos y días sin ese estilo no cuentan. Si el planeador mueve
 //   casillas, el conteo sigue al tablero.
 //
+//   PRE-ÓRDENES: las reservas PRE#### del tablero (pre_order_day_holds) cuentan
+//   igual que las casillas de una PO real. Un estilo que arranca como pre-orden
+//   tiene su curva desde la primera reserva y, al convertirse a SKM (mismo
+//   estilo = tipo+modelo+correlativo), la PO sigue en el mismo día de la curva.
+//   Reservas de pre-órdenes convertidas o canceladas no cuentan (su PO real ya
+//   ocupa la línea, igual que en /api/planning/available-lines).
+//
 //   Capacidad del día con curva:
 //     piezas/día = operarios × horas × 60 × eficiencia_curva ÷ SAM
 //   La curva nunca sube la eficiencia por encima del estándar del estilo
@@ -111,18 +118,59 @@ function validSteps(steps) {
 // style_code, si no estilo).
 const WO_STYLE_SQL = "UPPER(TRIM(COALESCE(NULLIF(TRIM(wo.style_code), ''), NULLIF(TRIM(wo.estilo), ''), '')))";
 
+// SQL: clave de estilo de una reserva PRE (la del hold; si no, la de su pre-orden).
+const HOLD_STYLE_SQL =
+  "UPPER(TRIM(COALESCE(NULLIF(TRIM(h.style_code), ''), NULLIF(TRIM(p.style_code), ''), " +
+  "NULLIF(TRIM(h.estilo), ''), NULLIF(TRIM(p.estilo), ''), '')))";
+
+// ¿Existe pre_order_day_holds? (se cachea en cuanto aparece; si el módulo de
+// reservas no está instalado, la curva sigue funcionando sólo con POs).
+let holdsTableKnown = false;
+async function hasHoldsTable(client) {
+  if (holdsTableKnown) return true;
+  try {
+    const r = await client.query("SELECT to_regclass('pre_order_day_holds') IS NOT NULL AS ok");
+    holdsTableKnown = !!r.rows[0]?.ok;
+  } catch {
+    holdsTableKnown = false;
+  }
+  return holdsTableKnown;
+}
+
+// Subconsulta "pr" con TODO lo planeado en el tablero, una fila por casilla:
+//   (style, line_no, d DATE, qty, src 'la'|'hold', row_id)
+//   • casillas de POs reales (line_assignments vivas)
+//   • reservas de pre-órdenes (pre_order_day_holds de PRE pendientes/parciales)
+async function planRowsSql(client) {
+  const la = `
+      SELECT ${WO_STYLE_SQL} AS style, la.line_no::text AS line_no, la.assigned_date AS d,
+             la.assigned_quantity::float AS qty, 'la'::text AS src, la.id::bigint AS row_id
+        FROM line_assignments la
+        JOIN work_orders wo ON wo.id = la.work_order_id
+       WHERE COALESCE(la.status, 'planned') NOT IN ('cancelled', 'rejected')
+         AND COALESCE(la.assigned_quantity, 0) > 0`;
+  if (!(await hasHoldsTable(client))) return `(${la}) pr`;
+  return `(${la}
+      UNION ALL
+      SELECT ${HOLD_STYLE_SQL} AS style, h.line_no::text AS line_no, h.assigned_date AS d,
+             h.quantity::float AS qty, 'hold'::text AS src, h.id::bigint AS row_id
+        FROM pre_order_day_holds h
+        LEFT JOIN pre_orders p ON p.id = h.pre_order_id
+       WHERE COALESCE(p.status, 'pending') NOT IN ('converted', 'cancelled')
+         AND COALESCE(h.quantity, 0) > 0
+    ) pr`;
+}
+
 // Fechas distintas (YYYY-MM-DD, ordenadas) en que el estilo tiene piezas en la
 // línea desde `fromDate`.
+// Incluye las reservas de pre-órdenes (ver planRowsSql).
 async function assignedDates(client, { style, lineNo, fromDate }) {
   const r = await client.query(
-    `SELECT DISTINCT to_char(la.assigned_date, 'YYYY-MM-DD') AS d
-       FROM line_assignments la
-       JOIN work_orders wo ON wo.id = la.work_order_id
-      WHERE la.line_no::text = $1
-        AND la.assigned_date >= $2::date
-        AND COALESCE(la.status, 'planned') NOT IN ('cancelled', 'rejected')
-        AND COALESCE(la.assigned_quantity, 0) > 0
-        AND ${WO_STYLE_SQL} = $3
+    `SELECT DISTINCT to_char(pr.d, 'YYYY-MM-DD') AS d
+       FROM ${await planRowsSql(client)}
+      WHERE pr.line_no = $1
+        AND pr.d >= $2::date
+        AND pr.style = $3
       ORDER BY d`,
     [normLine(lineNo), fromDate, norm(style)]
   );
@@ -142,7 +190,7 @@ async function activeCurve(client, style, lineNo) {
 
 // ---------------------------------------------------------------------------
 // Resolvedor por LÍNEA (lo usa planner-style-params.js para toda la capacidad).
-//   forLine(client, { lineNo, styles?, excludeIds? }) → {
+//   forLine(client, { lineNo, styles?, excludeIds?, excludeHoldIds? }) → {
 //     active, curveOf(style), datesOf(style),
 //     stageOn(style, ymd) → { curveId, day, eff, index, ... } | null,
 //     factor(style, ymd, stdEff) → min(curva, estándar) ÷ estándar   (1 sin curva)
@@ -150,12 +198,14 @@ async function activeCurve(client, style, lineNo) {
 //   }
 // Día N de una fecha = (fechas distintas del estilo en la línea antes de ella) + 1.
 // excludeIds: asignaciones que se están moviendo (no cuentan como días).
+// excludeHoldIds: reservas PRE que se están moviendo (mismo efecto).
+// Las fechas incluyen las reservas de pre-órdenes (planRowsSql).
 // ---------------------------------------------------------------------------
 const NO_CURVES = Object.freeze({
   active: false, factor: () => 1, stageOn: () => null, addDate: () => {}, curveOf: () => null, datesOf: () => [],
 });
 
-async function forLine(client, { lineNo, styles = null, excludeIds = [] } = {}) {
+async function forLine(client, { lineNo, styles = null, excludeIds = [], excludeHoldIds = [] } = {}) {
   const line = normLine(lineNo);
   if (!line) return NO_CURVES;
   const keys = Array.isArray(styles) ? [...new Set(styles.map(norm).filter(Boolean))] : null;
@@ -177,18 +227,20 @@ async function forLine(client, { lineNo, styles = null, excludeIds = [] } = {}) 
   const byStyle = new Map(rows.map((c) => [norm(c.style), { curve: c, dates: [] }]));
   const minStart = rows.reduce((m, c) => (c.start_ymd < m ? c.start_ymd : m), rows[0].start_ymd);
   const ids = (excludeIds || []).map(Number).filter(Number.isFinite);
+  // Los ids de reserva pueden venir como "hold:123" (forma del tablero).
+  const holdIds = (excludeHoldIds || [])
+    .map((v) => Number(String(v).replace(/^hold:/, "")))
+    .filter(Number.isFinite);
   const d = await client.query(
-    `SELECT DISTINCT ${WO_STYLE_SQL} AS style, to_char(la.assigned_date, 'YYYY-MM-DD') AS d
-       FROM line_assignments la
-       JOIN work_orders wo ON wo.id = la.work_order_id
-      WHERE la.line_no::text = $1
-        AND la.assigned_date >= $2::date
-        AND COALESCE(la.status, 'planned') NOT IN ('cancelled', 'rejected')
-        AND COALESCE(la.assigned_quantity, 0) > 0
-        AND ${WO_STYLE_SQL} = ANY($3::text[])
-        AND NOT (la.id = ANY($4::bigint[]))
+    `SELECT DISTINCT pr.style, to_char(pr.d, 'YYYY-MM-DD') AS d
+       FROM ${await planRowsSql(client)}
+      WHERE pr.line_no = $1
+        AND pr.d >= $2::date
+        AND pr.style = ANY($3::text[])
+        AND NOT (pr.src = 'la' AND pr.row_id = ANY($4::bigint[]))
+        AND NOT (pr.src = 'hold' AND pr.row_id = ANY($5::bigint[]))
       ORDER BY 2`,
-    [line, minStart, [...byStyle.keys()], ids]
+    [line, minStart, [...byStyle.keys()], ids, holdIds]
   );
   for (const r of d.rows) {
     const e = byStyle.get(r.style);
@@ -407,11 +459,18 @@ async function sweepTransitions(client, { force = false } = {}) {
   return written;
 }
 
+// Roles comparados sin mayúsculas ni espacios ("Planner " = "planner").
+const roleKey = (r) => String(r ?? "").trim().toLowerCase();
+// LEARNING_CURVE_ROLES=planner,master,ceo,admin  → reemplaza la lista de server1.js.
+const rolesFromEnv = (v) => (v ? String(v).split(",").map(roleKey).filter(Boolean) : null);
+
 function registerLearningCurves(app, deps) {
   const {
     authenticateToken, pool, setSchema, plannerStyleParams,
-    curveRoles = DEFAULT_CURVE_ROLES, ceoRoles = DEFAULT_CEO_ROLES,
   } = deps;
+  const curveRoles = (rolesFromEnv(process.env.LEARNING_CURVE_ROLES) || deps.curveRoles || DEFAULT_CURVE_ROLES).map(roleKey);
+  const ceoRoles = (rolesFromEnv(process.env.LEARNING_CURVE_CEO_ROLES) || deps.ceoRoles || DEFAULT_CEO_ROLES).map(roleKey);
+  const hasRole = (req, roles) => roles.includes(roleKey(req.user?.role));
 
   // La capacidad del Plan Board consulta las curvas a través de este resolvedor.
   if (typeof plannerStyleParams?.setLearningCurveProvider === "function") {
@@ -442,8 +501,16 @@ function registerLearningCurves(app, deps) {
   const userName = (req) => req.user?.full_name || req.user?.username || null;
   const requireRoles = (roles) => (req, res, next) => {
     if (!req.user) return res.status(401).json({ success: false, error: "Not authenticated" });
-    if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ success: false, error: "No tiene permiso para esta acción." });
+    if (!hasRole(req, roles)) {
+      // Dice qué rol tiene el usuario y cuáles se permiten, para que sea fácil
+      // corregir la lista (curveRoles en server1.js o LEARNING_CURVE_ROLES).
+      return res.status(403).json({
+        success: false,
+        code: "ROLE_NOT_ALLOWED",
+        role: req.user.role || null,
+        allowedRoles: roles,
+        error: `No tiene permiso para esta acción. Su rol es "${req.user.role || "—"}"; permitido: ${roles.join(", ")}.`,
+      });
     }
     next();
   };
@@ -493,14 +560,12 @@ function registerLearningCurves(app, deps) {
   const overloadReport = async (client, curve) => {
     const std = await standardOf(client, curve.style, curve.line_no);
     if (!std?.efficiency || !(std.target > 0)) return [];
+    // POs reales + reservas de pre-órdenes del estilo en la línea.
     const r = await client.query(
-      `SELECT to_char(la.assigned_date, 'YYYY-MM-DD') AS d, SUM(la.assigned_quantity)::float AS qty
-         FROM line_assignments la
-         JOIN work_orders wo ON wo.id = la.work_order_id
-        WHERE la.line_no::text = $1 AND la.assigned_date >= $2::date
-          AND COALESCE(la.status, 'planned') NOT IN ('cancelled', 'rejected')
-          AND COALESCE(la.assigned_quantity, 0) > 0
-          AND ${WO_STYLE_SQL} = $3
+      `SELECT to_char(pr.d, 'YYYY-MM-DD') AS d, SUM(pr.qty)::float AS qty,
+              SUM(CASE WHEN pr.src = 'hold' THEN pr.qty ELSE 0 END)::float AS held
+         FROM ${await planRowsSql(client)}
+        WHERE pr.line_no = $1 AND pr.d >= $2::date AND pr.style = $3
         GROUP BY 1 ORDER BY 1`,
       [curve.line_no, curve.start_ymd, norm(curve.style)]
     );
@@ -510,7 +575,11 @@ function registerLearningCurves(app, deps) {
       const eff = Math.min(st.eff, std.efficiency);
       const capacity = std.target * (eff / std.efficiency);
       if (row.qty > capacity + 0.5) {
-        out.push({ date: row.d, day: i + 1, efficiency: eff, qty: Math.round(row.qty), capacity: Math.floor(capacity), excess: Math.round(row.qty - capacity) });
+        out.push({
+          date: row.d, day: i + 1, efficiency: eff, qty: Math.round(row.qty),
+          held: Math.round(row.held || 0), // de eso, piezas de reservas PRE
+          capacity: Math.floor(capacity), excess: Math.round(row.qty - capacity),
+        });
       }
     });
     return out;
@@ -539,7 +608,7 @@ function registerLearningCurves(app, deps) {
       success: true,
       curves: r.rows.map(shapeCurve),
       presets: PRESETS,
-      canEdit: curveRoles.includes(req.user?.role),
+      canEdit: hasRole(req, curveRoles),
     });
   }));
 
@@ -552,16 +621,15 @@ function registerLearningCurves(app, deps) {
     const style = norm(req.query.style);
     const lineNo = normLine(req.query.lineNo);
     if (!style) return res.status(400).json({ success: false, error: "style es obligatorio" });
+    // "Asignado" incluye reservas de pre-órdenes: un estilo que ya se reservó
+    // como PRE#### deja de ser nuevo (igual que tras la primera casilla de una PO).
+    const planRows = await planRowsSql(client);
     const hist = await client.query(
       `SELECT
-         EXISTS (SELECT 1 FROM line_assignments la JOIN work_orders wo ON wo.id = la.work_order_id
-                  WHERE COALESCE(la.status, 'planned') NOT IN ('cancelled', 'rejected')
-                    AND ${WO_STYLE_SQL} = $1) AS assigned,
+         EXISTS (SELECT 1 FROM ${planRows} WHERE pr.style = $1) AS assigned,
          EXISTS (SELECT 1 FROM line_runs lr
                   WHERE UPPER(TRIM(lr.style)) = $1 AND COALESCE(lr.is_draft, false) = false) AS produced,
-         EXISTS (SELECT 1 FROM line_assignments la JOIN work_orders wo ON wo.id = la.work_order_id
-                  WHERE COALESCE(la.status, 'planned') NOT IN ('cancelled', 'rejected')
-                    AND la.line_no::text = $2 AND ${WO_STYLE_SQL} = $1) AS on_line`,
+         EXISTS (SELECT 1 FROM ${planRows} WHERE pr.style = $1 AND pr.line_no = $2) AS on_line`,
       [style, lineNo]
     );
     const h = hist.rows[0] || {};
@@ -681,14 +749,12 @@ function registerLearningCurves(app, deps) {
     const series = [];
     for (const c of curves.rows) {
       const std = await standardOf(client, c.style, c.line_no);
+      // Días planeados: POs reales + reservas de pre-órdenes.
       const q = await client.query(
-        `SELECT to_char(la.assigned_date, 'YYYY-MM-DD') AS d, SUM(la.assigned_quantity)::float AS qty
-           FROM line_assignments la
-           JOIN work_orders wo ON wo.id = la.work_order_id
-          WHERE la.line_no::text = $1 AND la.assigned_date >= $2::date
-            AND COALESCE(la.status, 'planned') NOT IN ('cancelled', 'rejected')
-            AND COALESCE(la.assigned_quantity, 0) > 0
-            AND ${WO_STYLE_SQL} = $3
+        `SELECT to_char(pr.d, 'YYYY-MM-DD') AS d, SUM(pr.qty)::float AS qty,
+                SUM(CASE WHEN pr.src = 'hold' THEN pr.qty ELSE 0 END)::float AS held
+           FROM ${await planRowsSql(client)}
+          WHERE pr.line_no = $1 AND pr.d >= $2::date AND pr.style = $3
           GROUP BY 1 ORDER BY 1`,
         [c.line_no, c.start_ymd, style]
       );
@@ -729,6 +795,7 @@ function registerLearningCurves(app, deps) {
           planned_efficiency: used,
           curve_efficiency: st.eff,
           planned_qty: Math.round(row.qty),
+          held_qty: Math.round(row.held || 0), // parte de planned_qty que es reserva PRE
           produced: act ? Math.round(Number(act.produced)) : null,
           actual_efficiency: actualEff,
           is_past: row.d <= today,
@@ -815,3 +882,4 @@ module.exports.forLine = forLine;
 module.exports.sweepTransitions = sweepTransitions;
 module.exports.stageForDay = stageForDay;
 module.exports.PRESETS = PRESETS;
+module.exports.planRowsSql = planRowsSql;

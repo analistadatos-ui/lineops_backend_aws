@@ -378,9 +378,9 @@ async function holdsTableExists(client) {
 // feature) fall back to the rate stored on the assignment. Pre-order holds use
 // their pre-order's style standard. Anything with no known rate is measured
 // with `fallbackTarget` (the pieces/day of the style being placed).
-// 📈 Assignments of a style with a learning curve on this line are measured
-// against the CURVE's pieces/day for that date (target × factor), so a curve
-// day correctly takes a bigger share of the line. Pass `curves` to reuse a
+// 📈 Assignments AND pre-order holds of a style with a learning curve on this
+// line are measured against the CURVE's pieces/day for that date (target ×
+// factor), so a curve day correctly takes a bigger share of the line. Pass `curves` to reuse a
 // resolver the caller already built.
 async function lineLoadRange(client, { lineNo, from, to, fallbackTarget, excludeIds = [], curves = null }) {
   const rows = await client.query(
@@ -426,7 +426,9 @@ async function lineLoadRange(client, { lineNo, from, to, fallbackTarget, exclude
     const hmap = await getParamsMap(client, held.rows.map((h) => h.style), lineNo);
     for (const h of held.rows) {
       const p = hmap.get(h.style);
-      add(h.d, h.qty, p ? targetOf(p) : fallbackTarget);
+      // 📈 A pre-order hold runs on its style's learning curve too (curve days
+      // count PO cells AND holds, see learning-curves.js → planRowsSql).
+      add(h.d, h.qty, p ? targetOf(p) * lc.factor(h.style, h.d, p.efficiency) : fallbackTarget);
     }
   }
   return load;
@@ -643,15 +645,15 @@ async function recomputeStyle(client, style, {
       const placed = [];
       while (remaining > 0.0001 && day <= horizonEnd) {
         if (ymdWeekend(day) || blocked.has(day) || locked(day)) { day = ymdAdd(day, 1); continue; }
-        // Pre-order holds are not part of a learning curve (factor 1).
-        const f = u.kind === "assignment" ? curves.factor(key, day, lineParams.efficiency) : 1;
+        // 📈 POs and pre-order holds share the style's learning curve.
+        const f = curves.factor(key, day, lineParams.efficiency);
         const dayTarget = lineTarget * f;
         const free = Math.max(0, Math.floor((1 - (load.get(day) || 0)) * dayTarget + 1e-6));
         if (free < 1) { day = ymdAdd(day, 1); continue; }
         const chunk = Math.min(remaining, free);
         placed.push({ d: day, qty: chunk, rate: dayTarget, minutes: minutes * f });
         load.set(day, (load.get(day) || 0) + chunk / dayTarget);
-        if (u.kind === "assignment") curves.addDate(key, day);
+        curves.addDate(key, day); // every placed day (PO or PRE) is one more curve day
         remaining = Math.round((remaining - chunk) * 100) / 100;
         day = ymdAdd(day, 1);
       }
