@@ -3401,7 +3401,6 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
   }
 });
 
-
 // ---------------------------------------------------------------------------
 // POST /api/line-assignments/carry-balance
 //
@@ -3412,18 +3411,19 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
 //   1. liquida esa celda por lo que sí se cosió (misma lógica que settle-day,
 //      registerWorkOrders.settleDayInTx);
 //   2. pone el saldo (200) en el SIGUIENTE día laborable de la MISMA línea
-//      (el día siguiente a la celda corta, nunca antes de hoy), como celda(s)
-//      de día completo según el estándar del estilo;
+//      (el día siguiente a la celda corta, nunca antes de hoy). Si ese día ya
+//      tiene otra orden y le sobra capacidad, el saldo se COMBINA ahí; lo que
+//      no quepa va en celda(s) de día completo según el estándar del estilo;
 //   3. recorre hacia adelante lo que ya estaba en esos días: cada día ocupado
 //      se corre al siguiente día laborable y el primer hueco absorbe el
 //      empuje (cola FIFO), así se conserva el orden de la línea y los huecos
 //      posteriores siguen ahí.
 //
 // 🔒 A diferencia de las demás rutas del planner, ésta NO llama a
-//    planWeekLocks.enforce(): el saldo debe seguir al día siguiente aunque
-//    ese día (o la celda corta) caiga en una semana bloqueada por el CEO.
-//    Sólo se recorren celdas 'planned' / 'released' de hoy en adelante de
-//    esa línea; completadas e historia no se tocan.
+//    planWeekLocks.enforce(): el saldo de una orden en proceso debe seguir al
+//    día siguiente aunque ese día (o la celda corta) caiga en una semana
+//    bloqueada por el CEO. Sólo se recorren celdas 'planned' / 'released' de
+//    hoy en adelante de esa línea; completadas e historia no se tocan.
 //    El tablero bloqueado (plan_board_lock) sí aplica: el middleware de
 //    BOARD_WRITE_PREFIXES rechaza esta ruta cuando está bloqueado.
 //
@@ -3459,7 +3459,7 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
       return res.status(400).json({ success: false, error: "Sólo se confirman saldos de días que ya cerraron (anteriores a hoy)." });
     }
 
-    // Sólo órdenes abiertas (en proceso o pendientes).
+    // Sólo órdenes abiertas.
     const woRes = await client.query("SELECT id, work_order_no, status FROM work_orders WHERE id = $1", [woId]);
     const wo = woRes.rows[0];
     if (!wo) return res.status(404).json({ success: false, error: "Orden no encontrada." });
@@ -3467,6 +3467,8 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
     if (["completed", "cancelled", "canceled", "closed"].includes(st)) {
       return res.status(409).json({ success: false, error: `La orden ${wo.work_order_no} ya no está abierta (${st}).` });
     }
+    // Órdenes abiertas en proceso o pendientes: ambas se pueden confirmar
+    // (las completadas / canceladas ya se rechazaron arriba).
 
     // Estándar del planner para el estilo: tamaño de la celda de día completo.
     const style = await plannerStyleParams.styleOfWorkOrder(client, woId);
@@ -3507,11 +3509,78 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
       return res.json({ success: true, balance: 0, placed: [], shifted: 0, message: "El día ya estaba completo; no hay saldo que mover." });
     }
 
-    // 2) Partir el saldo en celdas de día completo (por color, en orden).
     const queue = settled.leftovers.map((l) => ({ color: l.color, qty: Number(l.qty) || 0 })).filter((l) => l.qty > 0);
+    const takeFromQueue = (room) => {
+      const rows = [];
+      while (room > 0 && queue.length) {
+        const head = queue[0];
+        const q = Math.min(room, head.qty);
+        rows.push({ color: head.color, qty: q });
+        head.qty -= q; room -= q;
+        if (head.qty <= 0) queue.shift();
+      }
+      return rows;
+    };
+    const touchedDays = new Set();
+
+    // 2a) Combinar con lo que YA está en el primer día destino. Si ese día la
+    //     línea tiene otra(s) orden(es) y le sobra capacidad (p. ej. SKM0041
+    //     con 300 de 400), el saldo llena ese hueco en el MISMO día, sin
+    //     recorrer nada. cellCapacity().available ya descuenta lo planeado ahí
+    //     (ponderado por estilo). Sólo lo que no quepa sigue al paso 2b.
+    let combined = null;
+    let chunkStart = start;
+    {
+      const others = await client.query(
+        `SELECT DISTINCT wo.work_order_no
+           FROM line_assignments la
+           JOIN work_orders wo ON wo.id = la.work_order_id
+          WHERE la.line_no = $1
+            AND la.assigned_date = $2::date
+            AND la.status NOT IN ('cancelled', 'rejected')
+            AND la.work_order_id <> $3
+          ORDER BY wo.work_order_no`,
+        [line, start, woId]
+      );
+      if (others.rows.length) {
+        const cap0 = await plannerStyleParams.cellCapacity(client, { lineNo: line, date: start, style });
+        const room0 = Math.floor(Number(cap0.available) || 0);
+        if (room0 > 0) {
+          const rows = takeFromQueue(room0);
+          for (const r of rows) {
+            await mergeOrInsertAssignment(client, {
+              workOrderId: woId,
+              lineRunId: null,
+              lineNo: line,
+              assignedDate: start,
+              quantity: r.qty,
+              availableMinutes: cap0.availableMinutes,
+              requiredRate: Math.floor(Number(cap0.target) || 0),
+              startDate: start,
+              endDate: start,
+              status: "planned",
+              color: r.color,
+            });
+          }
+          combined = {
+            date: start,
+            qty: rows.reduce((t, r) => t + r.qty, 0),
+            with: others.rows.map((r) => r.work_order_no),
+          };
+          touchedDays.add(start);
+          // Lo que no cupo entra desde el día siguiente (ese día ya quedó lleno).
+          chunkStart = nextWorkday(start);
+        }
+        // Sin hueco ese día: como antes, el saldo entra primero en `start` y lo
+        // que ya estaba ahí se recorre.
+      }
+    }
+
+    // 2b) Partir lo que queda del saldo en celdas de día completo (por color,
+    //     en orden), desde chunkStart.
     const chunks = []; // [{ date, availableMinutes, target, rows:[{ color, qty }] }]
     {
-      let day = start, scanned = 0;
+      let day = chunkStart, scanned = 0;
       while (queue.length && scanned < MAX_DAYS) {
         scanned++;
         const cap = await plannerStyleParams.cellCapacity(client, { lineNo: line, date: day, style });
@@ -3520,15 +3589,7 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
           await client.query("ROLLBACK"); inTx = false;
           return res.status(409).json({ success: false, error: `La Línea ${line} no tiene estándar de capacidad para ${style} el ${day}.` });
         }
-        let room = target;
-        const rows = [];
-        while (room > 0 && queue.length) {
-          const head = queue[0];
-          const q = Math.min(room, head.qty);
-          rows.push({ color: head.color, qty: q });
-          head.qty -= q; room -= q;
-          if (head.qty <= 0) queue.shift();
-        }
+        const rows = takeFromQueue(target);
         chunks.push({ date: day, availableMinutes: cap.availableMinutes, target, rows });
         day = nextWorkday(day);
       }
@@ -3537,8 +3598,7 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
         return res.status(400).json({ success: false, error: `La línea ${line} no tiene días con capacidad para el saldo de ${wo.work_order_no}.` });
       }
     }
-
-    // 3) Lo que hay en la línea de `start` en adelante que se puede recorrer.
+    // 3) Lo que hay en la línea de `chunkStart` en adelante que se puede recorrer.
     const occRes = await client.query(
       `SELECT id, status, to_char(assigned_date, 'YYYY-MM-DD') AS d
          FROM line_assignments
@@ -3547,7 +3607,7 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
           AND status IN ('planned', 'released')
         ORDER BY assigned_date, id
         FOR UPDATE`,
-      [line, start]
+      [line, chunkStart]
     );
     const occ = new Map(); // día -> [filas]
     for (const r of occRes.rows) {
@@ -3558,11 +3618,12 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
 
     // Cola FIFO: cada día laborable recibe lo primero de la cola y lo que tenía
     // pasa al final de la cola. Un día vacío absorbe y la cola se acorta. Las
-    // celdas del saldo van primero, así que caen exactamente en chunks[i].date.
+    // celdas del saldo van primero, así que caen exactamente en chunks[i].date
+    // (los mismos días laborables consecutivos desde `start`).
     const carry = chunks.map(() => ({ kind: "balance" }));
     const moves = []; // { from, to, rows }
     {
-      let day = start, scanned = 0;
+      let day = chunkStart, scanned = 0;
       while (carry.length && scanned < MAX_DAYS) {
         scanned++;
         const item = carry.shift();
@@ -3582,7 +3643,6 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
     //    uq_line_assign_planned_cell.
     moves.sort((a, b) => (a.from < b.from ? 1 : a.from > b.from ? -1 : 0));
     let shifted = 0, shiftedReleased = 0;
-    const touchedDays = new Set();
     for (const mv of moves) {
       for (const r of mv.rows) {
         await client.query(
@@ -3621,7 +3681,8 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
       touchedDays.add(c.date);
     }
 
-    // 6) Corridas borrador que quedaron sin celda.
+    // 6) Corridas borrador que quedaron sin celda (día corto vacío o días que
+    //    se recorrieron).
     touchedDays.add(shortDay);
     for (const d of touchedDays) await cleanupOrphanDraftRuns(client, line, d);
 
@@ -3631,8 +3692,8 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
 
     await client.query("COMMIT"); inTx = false;
     console.log(
-      `[carry-balance] wo=${woId} line=${line} short=${shortDay} balance=${settled.balance} ` +
-      `start=${start} cells=${placed.length} shifted=${shifted} lockedWeeks=${lockedTouched.join(",") || "-"} by=${req.user?.id ?? "?"}`
+      `[carry-balance v3-combine] wo=${woId} line=${line} short=${shortDay} balance=${settled.balance} ` +
+      `start=${start} combined=${combined ? `${combined.qty}@${combined.with.join("+")}` : "-"} cells=${placed.length} shifted=${shifted} lockedWeeks=${lockedTouched.join(",") || "-"} by=${req.user?.id ?? "?"}`
     );
     res.json({
       success: true,
@@ -3640,6 +3701,7 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
       produced: settled.produced,
       balance: settled.balance,
       startDate: start,
+      combined,
       placed,
       shifted,
       shiftedReleased,
@@ -3654,6 +3716,7 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
     client.release();
   }
 });
+
 
 // ---------------------------------------------------------------------------
 // POST /api/line-assignments/insert-shift-batch
