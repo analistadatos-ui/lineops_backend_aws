@@ -22,6 +22,8 @@
 //        GET /reports/customer-production           produced per order / line / day for a customer
 //        GET /reports/plan-load                     planned pieces per line-day + blocked days
 //        GET /reports/pending-approvals             pending cut requests + close requests
+//        GET /reports/sam-compliance                planning: merchant SAM vs production SAM
+//        GET /reports/delivery-plan                 planning: plan finish vs merchant delivery date
 //
 // Security layers (each one stops what the others miss)
 //   1. API Gateway: API key + usage plan (rate limit / daily quota)
@@ -190,7 +192,7 @@ const ROUTES = {
     desc: "Almacén PT: desglose por talla de una orden.",
     params: {
       ...RANGE,
-      workOrder: P.text(50, "Número de orden (work_order_no)"),
+      workOrder: P.text(50, "Número de orden (ej. SKM0156-NIK-DAMTSH06)"),
       po: P.text(80, "PO cliente ('__ALL__' = todos)", { allowEmpty: true }),
     },
     required: ["workOrder"],
@@ -246,6 +248,24 @@ const ROUTES = {
     required: ["startDate", "endDate"],
     maxDays: 120,
   },
+  "/reports/sam-compliance": {
+    desc: "Planeación — SAM: SAM del merchant vs SAM de producción (debe ser MENOR). Por estilo, línea u orden. Misma lógica que Analíticas de planeación.",
+    params: {
+      grain: P.oneOf(["style", "line", "order"], "Nivel de detalle"),
+      only: P.oneOf(["all", "ok", "bad", "nodata"], "Filtrar por resultado (ok = cumple, bad = incumple, nodata = sin dato)"),
+      customer: P.text(100, "Cliente (exacto, sin distinguir mayúsculas)"),
+      q: P.text(50, "Buscar estilo, orden, PO o color"),
+    },
+  },
+  "/reports/delivery-plan": {
+    desc: "Planeación — Entregas: fin de plan (último día asignado) vs fecha de entrega del merchant. A tiempo, atrasada, por planear, sin fecha. Misma lógica que Analíticas de planeación.",
+    params: {
+      status: P.oneOf(["all", "open"], "all = todas menos canceladas (como la pantalla); open = sin completadas"),
+      verdict: P.oneOf(["all", "ontime", "late", "sinplan", "nofecha"], "Filtrar por resultado de entrega"),
+      customer: P.text(100, "Cliente (exacto, sin distinguir mayúsculas)"),
+      q: P.text(50, "Buscar número de orden, PO o estilo"),
+    },
+  },
   "/reports/pending-approvals": {
     desc: "Pendientes: solicitudes de corte por urgencia y solicitudes/alertas de cierre de órdenes.",
     params: {},
@@ -262,6 +282,7 @@ for (const [path, r] of Object.entries(ROUTES)) {
 // --------------------------------------------------------------------------
 const app = express();
 app.disable("x-powered-by");
+app.set("etag", false); // no framework fingerprint; reports are never cached anyway
 app.set("query parser", "simple"); // no nested objects; repeated keys become arrays (rejected below)
 
 const sha = (s) => crypto.createHash("sha256").update(String(s)).digest();
@@ -683,6 +704,234 @@ app.get("/reports/pending-approvals", withClient(async (req, res, client) => {
   res.json(out);
 }));
 
+// ==========================================================================
+// PLANNING ANALYTICS — same rules as PlannerAnalytics.jsx
+// ==========================================================================
+const normKey = (v) => String(v == null ? "" : v).trim().toUpperCase();
+const DEAD_STATUSES = ["cancelled", "rejected"];
+const daysDiff = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000);
+const matchesQ = (q, ...fields) => !q || fields.join(" ").toUpperCase().includes(q.toUpperCase());
+
+// GET /reports/sam-compliance?grain=style|line|order&only&customer&q
+// Rule: production SAM (line_runs.sam_minutes) must be LOWER than merchant SAM.
+// Merchant SAM: merchant plan first (authoritative), else work-order snapshot
+// (largest value when a style carries several). Production SAM: latest run per
+// line+style; style/order level takes the worst (highest) of its lines.
+app.get("/reports/sam-compliance", withClient(async (req, res, client) => {
+  const grain = req.query.grain || "style";
+  const only = req.query.only || "all";
+  const customer = req.query.customer ? normKey(req.query.customer) : null;
+  const q = req.query.q || "";
+
+  const [wo, mp, runs] = await Promise.all([
+    client.query(`SELECT id, work_order_no, customer_name, customer_po, style_code, estilo,
+                         style_description, color, sam_minutes, status
+                    FROM work_orders`),
+    client.query(`SELECT work_order_no, color, style_code, estilo, style_description,
+                         customer_name, sam_minutes
+                    FROM merchant_week_plan
+                   ORDER BY week_start, work_order_no, color`),
+    client.query(`SELECT DISTINCT ON (line_no, UPPER(TRIM(style)))
+                         line_no, style, sam_minutes, efficiency, work_order_id,
+                         to_char(run_date, 'YYYY-MM-DD') AS run_date
+                    FROM line_runs
+                   ORDER BY line_no, UPPER(TRIM(style)), run_date DESC, id DESC`),
+  ]);
+
+  // ---- merchant SAM per style --------------------------------------------
+  const styles = new Map();
+  const ensure = (code) => {
+    let e = styles.get(code);
+    if (!e) { e = { styleCode: code, description: "", planSam: 0, woSam: 0, seen: new Set(), customers: new Set() }; styles.set(code, e); }
+    return e;
+  };
+  const woSamById = new Map();
+  for (const w of wo.rows) {
+    const code = normKey(w.style_code) || normKey(w.estilo);
+    if (!code) continue;
+    const e = ensure(code);
+    const sam = num(w.sam_minutes);
+    if (sam > 0) { if (!(e.woSam > 0)) e.woSam = sam; e.seen.add(sam); woSamById.set(String(w.id), sam); }
+    if (!e.description && w.style_description) e.description = w.style_description;
+    if (w.customer_name) e.customers.add(normKey(w.customer_name));
+  }
+  const mpSamByOrder = new Map();
+  for (const r of mp.rows) {
+    const code = normKey(r.style_code) || normKey(r.estilo);
+    const sam = num(r.sam_minutes);
+    if (code) {
+      const e = ensure(code);
+      if (sam > 0) { if (!(e.planSam > 0)) e.planSam = sam; e.seen.add(sam); }
+      if (!e.description && r.style_description) e.description = r.style_description;
+      if (r.customer_name) e.customers.add(normKey(r.customer_name));
+    }
+    if (sam > 0 && r.work_order_no) mpSamByOrder.set(`${normKey(r.work_order_no)}|${normKey(r.color)}`, sam);
+  }
+  for (const e of styles.values()) {
+    const distinct = [...e.seen].filter((x) => x > 0).sort((a, b) => a - b);
+    e.conflict = distinct.length > 1;
+    e.samValues = distinct;
+    e.merchantSam = e.planSam > 0 ? e.planSam : (distinct.length ? distinct[distinct.length - 1] : 0);
+  }
+
+  // ---- production SAM (latest run per line+style) -------------------------
+  const prodByStyle = new Map();
+  const prodSamByWo = new Map();
+  for (const r of runs.rows) {
+    const code = normKey(r.style);
+    const ps = num(r.sam_minutes);
+    const arr = prodByStyle.get(code) || [];
+    arr.push({ lineNo: String(r.line_no), prodSam: ps, plannedEfficiencyPct: Math.round(num(r.efficiency) * 1000) / 10, runDate: r.run_date, workOrderId: r.work_order_id });
+    prodByStyle.set(code, arr);
+    if (ps > 0 && r.work_order_id != null) {
+      const k = String(r.work_order_id);
+      prodSamByWo.set(k, Math.max(prodSamByWo.get(k) || 0, ps));
+    }
+  }
+  const worstOf = (arr) => Math.max(0, ...arr.map((x) => x.prodSam).filter((x) => x > 0));
+  const verdict = (m, p) => (!(m > 0) || !(p > 0) ? "nodata" : p < m ? "ok" : "bad");
+  const round2 = (v) => Math.round(v * 100) / 100;
+  const row = (base, m, p) => ({
+    ...base,
+    merchantSam: m || null,
+    productionSam: p || null,
+    marginMinutes: m > 0 && p > 0 ? round2(m - p) : null,
+    productionVsMerchantPct: m > 0 && p > 0 ? Math.round((p / m) * 1000) / 10 : null,
+    result: verdict(m, p),
+  });
+
+  let rows = [];
+  if (grain === "style") {
+    for (const [code, e] of styles) {
+      if (customer && !e.customers.has(customer)) continue;
+      const prod = prodByStyle.get(code) || [];
+      rows.push(row({ style: code, description: e.description, lines: prod.map((x) => x.lineNo),
+                      merchantSamConflict: e.conflict, merchantSamValues: e.samValues },
+                    e.merchantSam, worstOf(prod)));
+    }
+  } else if (grain === "line") {
+    for (const [code, prod] of prodByStyle) {
+      const e = styles.get(code);
+      if (customer && !(e && e.customers.has(customer))) continue;
+      for (const r of prod) {
+        const exact = r.workOrderId != null ? woSamById.get(String(r.workOrderId)) || 0 : 0;
+        const m = exact > 0 ? exact : (e ? e.merchantSam : 0);
+        rows.push(row({ lineNo: r.lineNo, style: code, description: e ? e.description : "", lastRunDate: r.runDate,
+                        plannedEfficiencyPct: r.plannedEfficiencyPct,
+                        merchantSamConflict: exact > 0 ? false : !!(e && e.conflict) },
+                      m, r.prodSam));
+      }
+    }
+  } else {
+    for (const w of wo.rows) {
+      if (DEAD_STATUSES.includes(String(w.status || "").toLowerCase())) continue;
+      if (customer && normKey(w.customer_name) !== customer) continue;
+      const code = normKey(w.style_code) || normKey(w.estilo);
+      if (!code) continue;
+      const e = styles.get(code);
+      const m = mpSamByOrder.get(`${normKey(w.work_order_no)}|${normKey(w.color)}`) || num(w.sam_minutes);
+      const p = prodSamByWo.get(String(w.id)) || worstOf(prodByStyle.get(code) || []);
+      rows.push(row({ workOrderNo: w.work_order_no, customer: w.customer_name, customerPo: w.customer_po,
+                      style: code, color: w.color, description: w.style_description || (e ? e.description : ""),
+                      status: w.status, styleSamConflict: !!(e && e.conflict) },
+                    m, p));
+    }
+  }
+
+  rows = rows.filter((r) => matchesQ(q, r.style, r.workOrderNo || "", r.customerPo || "", r.color || "", r.description || "", r.lineNo || ""));
+  const counts = { ok: 0, bad: 0, nodata: 0 };
+  for (const r of rows) counts[r.result]++;
+  const judged = counts.ok + counts.bad;
+  if (only !== "all") rows = rows.filter((r) => r.result === only);
+  // worst first: smallest (most negative) margin on top, no-data last
+  rows.sort((a, b) => (a.marginMinutes == null) - (b.marginMinutes == null) || (a.marginMinutes ?? 0) - (b.marginMinutes ?? 0));
+
+  res.json({
+    success: true,
+    grain,
+    rule: "La SAM de producción debe ser MENOR que la SAM del merchant.",
+    summary: { complies: counts.ok, fails: counts.bad, noData: counts.nodata,
+               compliancePct: judged ? Math.round((counts.ok / judged) * 1000) / 10 : null },
+    truncated: rows.length > MAX_ROWS,
+    rows: rows.slice(0, MAX_ROWS),
+  });
+}));
+
+// GET /reports/delivery-plan?status&verdict&customer&q
+// Plan finish = last assigned day (line_assignments, not cancelled/rejected).
+// late = plan finish AFTER merchant delivery (commitment_date).
+app.get("/reports/delivery-plan", withClient(async (req, res, client) => {
+  const status = req.query.status || "all";
+  const only = req.query.verdict || "all";
+  const params = [DEAD_STATUSES];
+  const where = ["COALESCE(LOWER(wo.status), '') <> ALL($1::text[])"];
+  if (status === "open") where.push("COALESCE(LOWER(wo.status), '') <> 'completed'");
+  if (req.query.customer) { params.push(req.query.customer); where.push(`UPPER(TRIM(wo.customer_name)) = UPPER(TRIM($${params.length}))`); }
+  if (req.query.q) {
+    params.push(`%${req.query.q.replace(/[\\%_]/g, "\\$&")}%`);
+    where.push(`(wo.work_order_no ILIKE $${params.length} OR wo.customer_po ILIKE $${params.length} OR wo.style_code ILIKE $${params.length})`);
+  }
+  params.push(MAX_ROWS + 1);
+
+  const { rows } = await client.query(
+    `WITH plan AS (
+       SELECT work_order_id,
+              to_char(MIN(assigned_date), 'YYYY-MM-DD') AS plan_start,
+              to_char(MAX(assigned_date), 'YYYY-MM-DD') AS plan_finish,
+              SUM(assigned_quantity)                     AS assigned,
+              array_agg(DISTINCT line_no ORDER BY line_no) AS lines
+         FROM line_assignments
+        WHERE COALESCE(LOWER(status), '') <> ALL($1::text[])
+        GROUP BY work_order_id
+     )
+     SELECT wo.id, wo.work_order_no, wo.customer_name, wo.customer_po, wo.style_code, wo.color, wo.status,
+            COALESCE(wo.total_to_produce, wo.quantity) AS target,
+            to_char(wo.commitment_date, 'YYYY-MM-DD') AS merchant_date,
+            p.plan_start, p.plan_finish, COALESCE(p.assigned, 0) AS assigned, p.lines
+       FROM work_orders wo
+       LEFT JOIN plan p ON p.work_order_id = wo.id
+      WHERE ${where.join(" AND ")}
+      ORDER BY wo.commitment_date NULLS LAST, wo.work_order_no
+      LIMIT $${params.length}`,
+    params
+  );
+  const truncated = rows.length > MAX_ROWS;
+  const list = rows.slice(0, MAX_ROWS);
+  const byLine = await workOrders.producedByLineForMany(client, list.map((r) => Number(r.id)));
+
+  let orders = list.map((r) => {
+    const target = num(r.target);
+    const produced = (byLine.get(Number(r.id)) || []).reduce((s, l) => s + num(l.finished), 0);
+    const st = String(r.status || "").toLowerCase();
+    const progress = st === "completed" || (target > 0 && produced >= target) ? "completed" : produced > 0 ? "in_progress" : "pending";
+    const v = !r.merchant_date ? "nofecha" : !r.plan_finish ? "sinplan" : daysDiff(r.merchant_date, r.plan_finish) > 0 ? "late" : "ontime";
+    return {
+      workOrderNo: r.work_order_no, customer: r.customer_name, customerPo: r.customer_po,
+      style: r.style_code, color: r.color, status: r.status, progress,
+      quantity: target, assigned: num(r.assigned), produced,
+      progressPct: pct(produced, target),
+      merchantDeliveryDate: r.merchant_date, planStart: r.plan_start, planFinish: r.plan_finish,
+      daysAfterDelivery: r.merchant_date && r.plan_finish ? daysDiff(r.merchant_date, r.plan_finish) : null,
+      verdict: v, lines: r.lines || [],
+    };
+  });
+
+  const counts = { ontime: 0, late: 0, sinplan: 0, nofecha: 0 };
+  for (const o of orders) counts[o.verdict]++;
+  const judged = counts.ontime + counts.late;
+  if (only !== "all") orders = orders.filter((o) => o.verdict === only);
+  res.json({
+    success: true,
+    asOf: todayPlant(),
+    rule: "El fin de plan debe caer antes o el mismo día que la entrega del merchant.",
+    truncated,
+    summary: { onTime: counts.ontime, late: counts.late, toPlan: counts.sinplan + counts.nofecha,
+               withoutPlan: counts.sinplan, withoutDeliveryDate: counts.nofecha,
+               onTimePct: judged ? Math.round((counts.ontime / judged) * 1000) / 10 : null },
+    orders,
+  });
+}));
+
 // ---- 6. errors -------------------------------------------------------------
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   res.status(500).json({ success: false, error: err && err.message });
@@ -714,4 +963,4 @@ if (require.main === module) {
     return handler(event, context);
   };
 }
-exports.app = app; // for local tests
+exports.app = app; 
