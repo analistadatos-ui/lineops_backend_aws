@@ -100,7 +100,7 @@ const FIELDS = [
   { key: "width_unit", label: "Width Unit", aliases: ["unidadancho", "widthuom"] },
   { key: "weight", label: "Weight", aliases: ["peso", "rollweight", "pesorollo"] },
   { key: "weight_unit", label: "Weight Unit", aliases: ["unidadpeso", "pesounidad", "weightuom", "uompeso"] },
-  { key: "weight_gsm", label: "Gramaje (g/m²)", aliases: ["gsm", "gramaje", "grammage", "gm2", "grm2", "gramsm2"] },
+  { key: "weight_gsm", label: "Gramaje (g/m²)", aliases: ["gsm", "gramaje", "gramajegm2", "grammage", "gm2", "grm2", "gramsm2"] },
   { key: "composition", label: "Composition", aliases: ["composicion", "content"] },
   { key: "month_buy", label: "Month Buy", aliases: ["mescompra", "buymonth"] },
   { key: "fabric_item_number", label: "Fabric item number", aliases: ["itemnumber", "fabricitem", "fabriccode", "articulo"] },
@@ -169,6 +169,114 @@ function normalizeRoll(obj) {
 
 // Dedup key for a roll: supplier code + roll number.
 const rollKeyOf = (r) => `${String(r.supplier_code || r.supplier || "").trim().toUpperCase()}|${String(r.roll_no || "").trim().toUpperCase()}`;
+
+// ---------------------------------------------------------------------------
+// Upload of the roll list in an Excel / CSV file (Recepción › Escanear rollos).
+// The screen reads the file and sends its cells as rows of values; the header
+// row is found here (any of the first 20 rows) and matched with the same
+// aliases as the Skytex JSON. Every IMPORT_COLUMNS column must be present —
+// the fields of the roll detail plus the roll number. Yardas / Metros and any
+// other agreed field are read when present.
+// ---------------------------------------------------------------------------
+const IMPORT_COLUMNS = [
+  ["roll_no", "Rollo de tela"],
+  ["fabric_name", "Fabric name"], ["color", "Color"],
+  ["lot", "Lote"], ["po_number", "Purchase order number"],
+  ["supplier", "Supplier"], ["customer", "Cliente"],
+  ["supplier_code", "Supplier Code"], ["width", "Width"],
+  ["width_unit", "Width Unit"], ["weight", "Weight"],
+  ["weight_unit", "Weight Unit"], ["weight_gsm", "Gramaje (g/m²)"],
+  ["composition", "Composition"], ["month_buy", "Month Buy"],
+  ["fabric_item_number", "Fabric item number"], ["fabric_type", "Tipo de tela"],
+  ["arrival_date", "Fecha de entrega"], ["size", "Size"],
+  ["item_sku_code", "Item SKU code"], ["purchase_term", "Término de compra"],
+  ["import_ref", "Importación"], ["remarks", "Remarks"],
+].map(([key, label]) => ({ key, label }));
+const IMPORT_MAX_ROWS = 3000;
+// Column sizes of fabric_rolls: longer text is cut so one cell can't fail the whole file.
+const IMPORT_MAX_LEN = {
+  po_number: 80, supplier: 150, supplier_code: 60, color: 80, lot: 80, width: 40, width_unit: 20,
+  weight: 40, weight_unit: 20, weight_gsm: 40, month_buy: 40, fabric_item_number: 80, fabric_name: 200,
+  fabric_type: 80, customer: 150, size: 40, item_sku_code: 120, purchase_term: 80, import_ref: 120,
+};
+const SCI_NUMBER = /^\d+(?:\.\d+)?E\+?\d+$/i;
+const filled = (c) => c != null && String(c).trim() !== "";
+
+// → { items, errors, duplicates, headerRow, extraColumns } | { status, error, extra }
+function readImportSheet(matrix, firstRow = 1) {
+  const rows = Array.isArray(matrix) ? matrix.map((r) => (Array.isArray(r) ? r : [])) : [];
+  if (!rows.some((r) => r.some(filled))) return { status: 400, error: "El archivo está vacío." };
+
+  // Header row: among the first 20 rows, the one that names the most fields.
+  let head = -1;
+  let best = 0;
+  for (let i = 0; i < Math.min(rows.length, 20); i++) {
+    const n = new Set(rows[i].map((c) => ALIAS.get(normKey(c))?.key).filter(Boolean)).size;
+    if (n > best) { best = n; head = i; }
+  }
+  if (best < 2) {
+    const firstFilled = rows.find((r) => r.some(filled)) || [];
+    return {
+      status: 422,
+      error: "No se encontró la fila de encabezados. La primera fila del archivo debe tener los nombres de las columnas.",
+      extra: { code: "missing_columns", missing: IMPORT_COLUMNS.map((f) => f.label), found: firstFilled.filter(filled).map(String), headerRow: null },
+    };
+  }
+
+  const header = rows[head].map((c) => (c == null ? "" : String(c).trim()));
+  const col = {};
+  header.forEach((h, i) => {
+    const f = h && ALIAS.get(normKey(h));
+    if (f && col[f.key] == null) col[f.key] = i;
+  });
+  const headerRow = firstRow + head;
+  const missing = IMPORT_COLUMNS.filter((f) => col[f.key] == null).map((f) => f.label);
+  if (missing.length) {
+    return {
+      status: 422,
+      error: `Faltan ${missing.length} columna(s) en el archivo: ${missing.join(", ")}.`,
+      extra: { code: "missing_columns", missing, found: header.filter(Boolean), headerRow },
+    };
+  }
+
+  const items = [];
+  const errors = [];
+  const duplicates = [];
+  const seen = new Map();
+  for (let i = head + 1; i < rows.length; i++) {
+    const cells = rows[i];
+    if (!cells.some(filled)) continue;
+    const rowNo = firstRow + i;
+    const obj = {};
+    for (const [k, idx] of Object.entries(col)) obj[k] = cells[idx];
+    const raw = {};
+    header.forEach((h, idx) => { if (h && filled(cells[idx])) raw[h] = cells[idx]; });
+    const r = normalizeRoll(obj);
+    if (!r.roll_no) { errors.push({ row: rowNo, error: "Sin número de rollo" }); continue; }
+    if (SCI_NUMBER.test(r.roll_no)) {
+      errors.push({ row: rowNo, roll_no: r.roll_no, error: "El número de rollo quedó en notación científica. Dé formato de texto a la columna en Excel y guarde de nuevo." });
+      continue;
+    }
+    if (r.roll_no.length > 80) { errors.push({ row: rowNo, roll_no: r.roll_no.slice(0, 30), error: "Número de rollo de más de 80 caracteres" }); continue; }
+    for (const [k, max] of Object.entries(IMPORT_MAX_LEN)) if (r[k] && r[k].length > max) r[k] = r[k].slice(0, max);
+    const key = rollKeyOf(r);
+    if (seen.has(key)) { duplicates.push({ row: rowNo, roll_no: r.roll_no, first: seen.get(key) }); continue; }
+    seen.set(key, rowNo);
+    items.push({ row: rowNo, r, raw, key });
+  }
+  if (items.length > IMPORT_MAX_ROWS) {
+    return { status: 400, error: `Máximo ${IMPORT_MAX_ROWS} rollos por archivo; este tiene ${items.length}. Divídalo en varios archivos.` };
+  }
+  if (!items.length) {
+    return {
+      status: 422,
+      error: errors.length ? `Ningún renglón tiene un número de rollo válido (${errors.length} con error).` : "No hay rollos debajo de los encabezados.",
+      extra: { code: "no_rolls", errors: errors.slice(0, 100), headerRow },
+    };
+  }
+  const extraColumns = header.filter((h) => h && !ALIAS.has(normKey(h)));
+  return { items, errors, duplicates, headerRow, extraColumns };
+}
 
 // Find the first array of objects inside whatever Skytex returns.
 function extractArray(payload) {
@@ -1866,6 +1974,169 @@ function registerFabricWarehouse(app, deps) {
     res.json({ success: true, kind: "roll", rollNo: f.scan.roll_no, rolls: f.rows });
   }));
 
+  // ======================================================================
+  //  UPLOAD: the roll list in an Excel / CSV file
+  // ======================================================================
+  // Body: { fileName, firstRow, rows: [[cell, …], …], dryRun }
+  //   The screen reads the file (xlsx, xls, csv) and sends its cells.
+  //   dryRun (default) → what would happen; nothing is saved.
+  //   dryRun false     → the rolls go on the «por llegar» list (status requested,
+  //                      the same list the Skytex transfers fill), so the normal
+  //                      scan in «Escanear rollos» checks them off.
+  // Per roll (matched by supplier code + roll number, like Skytex):
+  //   new        → added to the list
+  //   update     → already on the list: its data is updated with the file
+  //   rerequest  → was cancelled: back on the list
+  //   link       → was scanned without a request: gets the file's data
+  //   received   → already arrived / in stock: only empty fields are filled
+  // 422 code "missing_columns" { missing, found, headerRow } when a column is missing.
+  async function planImport(client, items, lock = false) {
+    const keys = items.map((it) => it.key);
+    const nos = [...new Set(items.map((it) => it.r.roll_no.toUpperCase()))];
+    const { rows } = await client.query(
+      `SELECT id, skytex_key, UPPER(roll_no) AS rn, UPPER(COALESCE(supplier_code, '')) AS sc, status, source
+         FROM fabric_rolls
+        WHERE skytex_key = ANY($1::text[]) OR (UPPER(roll_no) = ANY($2::text[]) AND status <> 'cancelled')
+        ORDER BY id${lock ? " FOR UPDATE" : ""}`,
+      [keys, nos]
+    );
+    const byKey = new Map(rows.map((x) => [x.skytex_key, x]));
+    const byNo = new Map();
+    for (const x of rows) if (x.status !== "cancelled") byNo.set(x.rn, [...(byNo.get(x.rn) || []), x]);
+    const used = new Set();
+    return items.map((it) => {
+      const sc = String(it.r.supplier_code || "").trim().toUpperCase();
+      const same = (byNo.get(it.r.roll_no.toUpperCase()) || []).filter((x) => !used.has(x.id));
+      let hit = byKey.get(it.key);
+      let action;
+      if (hit && hit.status !== "cancelled") {
+        action = hit.source === "scan" ? "link" : ["requested", "assigned"].includes(hit.status) ? "update" : "received";
+      } else if (same.some((x) => x.source === "scan")) {
+        hit = same.find((x) => x.source === "scan");
+        action = "link";
+      } else {
+        // The same roll registered with or without the supplier code.
+        const loose = same.filter((x) => x.source !== "scan" && (!x.sc || !sc || x.sc === sc));
+        if (loose.length === 1) {
+          hit = loose[0];
+          action = ["requested", "assigned"].includes(hit.status) ? "update" : "received";
+        } else if (hit) {
+          action = "rerequest";
+        } else {
+          action = "new";
+        }
+      }
+      if (hit) {
+        if (used.has(hit.id)) return { ...it, action: "duplicate" };
+        used.add(hit.id);
+      }
+      return { ...it, action, id: hit?.id ?? null, status: hit?.status ?? null };
+    });
+  }
+
+  app.post(`${BASE}/reception/import`, authenticateToken, withClient(async (req, res, client) => {
+    const fileName = (str(req.body?.fileName) || "archivo").slice(0, 150);
+    const sheet = readImportSheet(req.body?.rows, Math.max(1, parseInt(req.body?.firstRow, 10) || 1));
+    if (sheet.error) return fail(res, sheet.status, sheet.error, sheet.extra || {});
+    const dryRun = req.body?.dryRun !== false;
+    const userId = req.user?.id ?? null;
+
+    if (!dryRun) await client.query("BEGIN");
+    const plan = await planImport(client, sheet.items, !dryRun);
+    const counts = { new: 0, update: 0, rerequest: 0, link: 0, received: 0, duplicate: 0 };
+    for (const p of plan) counts[p.action]++;
+
+    const summary = {
+      fileName,
+      headerRow: sheet.headerRow,
+      total: plan.length,
+      counts,
+      errors: sheet.errors.slice(0, 200),
+      errorCount: sheet.errors.length,
+      duplicates: [
+        ...sheet.duplicates,
+        ...plan.filter((p) => p.action === "duplicate").map((p) => ({ row: p.row, roll_no: p.r.roll_no, first: null })),
+      ].slice(0, 200),
+      extraColumns: sheet.extraColumns,
+    };
+
+    if (dryRun) {
+      const byPo = new Map();
+      for (const p of plan) {
+        if (p.action === "duplicate") continue;
+        const k = p.r.po_number || "Sin PO";
+        const c = byPo.get(k) || { po: k, rolls: 0, yards: 0 };
+        c.rolls++; c.yards += Number(p.r.yards) || 0;
+        byPo.set(k, c);
+      }
+      return res.json({
+        success: true, dryRun: true, ...summary,
+        yards: plan.reduce((s, p) => s + (p.action === "duplicate" ? 0 : Number(p.r.yards) || 0), 0),
+        byPo: [...byPo.values()].sort((a, b) => b.rolls - a.rolls),
+        preview: plan.slice(0, 300).map((p) => ({
+          row: p.row, action: p.action, status: p.status,
+          roll_no: p.r.roll_no, po_number: p.r.po_number, supplier: p.r.supplier,
+          fabric_name: p.r.fabric_name, color: p.r.color, lot: p.r.lot, yards: p.r.yards,
+        })),
+      });
+    }
+
+    const reason = `Cargado desde el archivo «${fileName}»`;
+    const vals = (r) => FIELD_KEYS.map((k) => r[k]);
+    const sets = (start, fillOnly = false) => FIELD_KEYS
+      .map((k, i) => (fillOnly ? `${k} = COALESCE(${k}, $${start + i})` : `${k} = COALESCE($${start + i}, ${k})`))
+      .join(", ");
+    const saved = { new: 0, update: 0, rerequest: 0, link: 0, received: 0, skipped: 0 };
+
+    for (const p of plan) {
+      const { r, key } = p;
+      const rawJson = JSON.stringify({ ...p.raw, _archivo: fileName, _renglon: p.row });
+      if (p.action === "duplicate") { saved.skipped++; continue; }
+      if (p.action === "new") {
+        const cols = ["skytex_key", ...FIELD_KEYS, "raw", "requested_by"];
+        const ins = await client.query(
+          `INSERT INTO fabric_rolls (${cols.join(",")})
+           VALUES (${cols.map((_, i) => `$${i + 1}`).join(",")})
+           ON CONFLICT (skytex_key) DO NOTHING RETURNING id`,
+          [key, ...vals(r), rawJson, userId]
+        );
+        if (!ins.rows.length) { saved.skipped++; continue; }
+        await logMove(client, { rollId: ins.rows[0].id, type: "requested", reference: r.po_number, reason, userId });
+      } else if (p.action === "update") {
+        await client.query(`UPDATE fabric_rolls SET ${sets(2)}, updated_at = now() WHERE id = $1`, [p.id, ...vals(r)]);
+      } else if (p.action === "rerequest") {
+        const upd = await client.query(
+          `UPDATE fabric_rolls
+              SET ${sets(4)}, raw = $2, status = 'requested', requested_by = $3, requested_at = now(),
+                  container_id = NULL, location_id = NULL, box_id = NULL, location_set_at = NULL, updated_at = now()
+            WHERE id = $1 AND status = 'cancelled' RETURNING id`,
+          [p.id, rawJson, userId, ...vals(r)]
+        );
+        if (!upd.rows.length) { saved.skipped++; continue; }
+        await logMove(client, { rollId: p.id, type: "requested", reference: r.po_number, reason, userId });
+      } else if (p.action === "link") {
+        // Keeps its own key if another (cancelled) row already uses this one.
+        await client.query(
+          `UPDATE fabric_rolls
+              SET skytex_key = CASE WHEN EXISTS (SELECT 1 FROM fabric_rolls x WHERE x.skytex_key = $2 AND x.id <> $1)
+                                    THEN skytex_key ELSE $2 END,
+                  raw = $3, source = 'skytex', ${sets(4)}, updated_at = now()
+            WHERE id = $1`,
+          [p.id, key, rawJson, ...vals(r)]
+        );
+      } else if (p.action === "received") {
+        await client.query(`UPDATE fabric_rolls SET ${sets(2, true)}, updated_at = now() WHERE id = $1`, [p.id, ...vals(r)]);
+      }
+      saved[p.action]++;
+    }
+    await client.query("COMMIT");
+    res.json({
+      success: true, dryRun: false, ...summary, saved,
+      onList: saved.new + saved.update + saved.rerequest,
+    });
+  }));
+
+
   // Step 2 (and from step 3). Body: { ids, boxId }. All or nothing.
   app.post(`${BASE}/rolls/put-away`, authenticateToken, withClient(async (req, res, client) => {
     const ids = idList(req.body?.ids);
@@ -2747,6 +3018,7 @@ function registerFabricWarehouse(app, deps) {
 
 registerFabricWarehouse.initSchema = initSchema;
 registerFabricWarehouse.normalizeRoll = normalizeRoll;
+registerFabricWarehouse.readImportSheet = readImportSheet;
 registerFabricWarehouse.parseRollScan = parseRollScan;
 registerFabricWarehouse.cleanScan = cleanScan;
 registerFabricWarehouse.labelCandidates = labelCandidates;
