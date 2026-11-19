@@ -2763,6 +2763,81 @@ app.get("/api/line-runs/:lineNo", authenticateToken, async (req, res, next) => {
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// GET /api/line-tv/operator-week-efficiency/:lineNo?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+//
+// Per-day, per-operator totals for one line, used by the TV operator table
+// ("Prom. semana" column). Same formula as the table:
+//   operator meta for a day = target_pcs of the run × number of operations
+//   efficiency              = Σ sewed qty / Σ meta × 100
+//
+// run_operators has no permanent employee id, so an operator is matched across
+// days by name (trimmed, case-insensitive). If the name is empty, by operator_no.
+// Draft runs are excluded.
+//
+// Paste this in server1.js right after the /api/line-tv/week-efficiency/:lineNo
+// endpoint.
+// ---------------------------------------------------------------------------
+app.get("/api/line-tv/operator-week-efficiency/:lineNo", authenticateToken, async (req, res, next) => {
+  const { lineNo } = req.params;
+  const { startDate, endDate } = req.query;
+  const isYMD = (s) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+  if (!isYMD(startDate) || !isYMD(endDate)) {
+    return res.status(400).json({ success: false, error: "startDate and endDate (YYYY-MM-DD) are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const result = await client.query(
+      `SELECT
+         to_char(lr.run_date, 'YYYY-MM-DD')                                        AS date,
+         COALESCE(NULLIF(lower(btrim(ro.operator_name)), ''), '#' || ro.operator_no) AS operator_key,
+         MAX(ro.operator_name)                                                      AS operator_name,
+         MIN(ro.operator_no)                                                        AS operator_no,
+         SUM(COALESCE(sw.qty, 0))                                                   AS produced,
+         SUM(COALESCE(lr.target_pcs, 0))                                            AS meta
+       FROM line_runs lr
+       JOIN run_operators ro       ON ro.run_id = lr.id
+       JOIN operator_operations oo ON oo.run_operator_id = ro.id
+       LEFT JOIN LATERAL (
+         SELECT SUM(se.sewed_qty) AS qty
+           FROM operation_sewed_entries se
+          WHERE se.operation_id = oo.id
+       ) sw ON true
+       WHERE lr.line_no = $1
+         AND lr.run_date BETWEEN $2::date AND $3::date
+         AND COALESCE(lr.is_draft, false) = false
+       GROUP BY lr.run_date, operator_key
+       ORDER BY lr.run_date, MIN(ro.operator_no)`,
+      [String(lineNo), startDate, endDate]
+    );
+
+    const days = result.rows.map((row) => {
+      const produced = parseFloat(row.produced) || 0;
+      const meta = parseFloat(row.meta) || 0;
+      return {
+        date: row.date,
+        operatorKey: row.operator_key,
+        operatorName: row.operator_name,
+        operatorNo: row.operator_no,
+        produced,
+        meta,
+        efficiency: meta > 0 ? (produced / meta) * 100 : null,
+      };
+    });
+
+    res.json({ success: true, lineNo: String(lineNo), period: { startDate, endDate }, days });
+  } catch (err) {
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // GET /api/line-tv/week-efficiency/:lineNo?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
 //
