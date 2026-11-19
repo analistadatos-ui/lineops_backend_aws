@@ -2087,6 +2087,7 @@ function registerFabricWarehouse(app, deps) {
       .map((k, i) => (fillOnly ? `${k} = COALESCE(${k}, $${start + i})` : `${k} = COALESCE($${start + i}, ${k})`))
       .join(", ");
     const saved = { new: 0, update: 0, rerequest: 0, link: 0, received: 0, skipped: 0 };
+    const ids = []; // every roll of the file, in file order (for printing its labels)
 
     for (const p of plan) {
       const { r, key } = p;
@@ -2101,6 +2102,7 @@ function registerFabricWarehouse(app, deps) {
           [key, ...vals(r), rawJson, userId]
         );
         if (!ins.rows.length) { saved.skipped++; continue; }
+        p.id = ins.rows[0].id;
         await logMove(client, { rollId: ins.rows[0].id, type: "requested", reference: r.po_number, reason, userId });
       } else if (p.action === "update") {
         await client.query(`UPDATE fabric_rolls SET ${sets(2)}, updated_at = now() WHERE id = $1`, [p.id, ...vals(r)]);
@@ -2128,11 +2130,17 @@ function registerFabricWarehouse(app, deps) {
         await client.query(`UPDATE fabric_rolls SET ${sets(2, true)}, updated_at = now() WHERE id = $1`, [p.id, ...vals(r)]);
       }
       saved[p.action]++;
+      ids.push(p.id);
     }
     await client.query("COMMIT");
+    // The saved rolls with all their data, so the screen can print their labels.
+    const fresh = ids.length ? (await client.query(`${ROLL_SELECT} WHERE r.id = ANY($1::bigint[])`, [ids])).rows : [];
+    const order = new Map(ids.map((id, i) => [String(id), i]));
+    fresh.sort((a, b) => order.get(String(a.id)) - order.get(String(b.id)));
     res.json({
       success: true, dryRun: false, ...summary, saved,
       onList: saved.new + saved.update + saved.rerequest,
+      rolls: fresh,
     });
   }));
 
