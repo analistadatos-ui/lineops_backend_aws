@@ -3410,14 +3410,13 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
 // endpoint, en UNA transacción,
 //   1. liquida esa celda por lo que sí se cosió (misma lógica que settle-day,
 //      registerWorkOrders.settleDayInTx);
-//   2. pone el saldo (200) en el SIGUIENTE día laborable de la MISMA línea
-//      (el día siguiente a la celda corta, nunca antes de hoy). Si ese día ya
-//      tiene otra orden y le sobra capacidad, el saldo se COMBINA ahí; lo que
-//      no quepa va en celda(s) de día completo según el estándar del estilo;
-//   3. recorre hacia adelante lo que ya estaba en esos días: cada día ocupado
-//      se corre al siguiente día laborable y el primer hueco absorbe el
-//      empuje (cola FIFO), así se conserva el orden de la línea y los huecos
-//      posteriores siguen ahí.
+//   2. pone el saldo (200) al FRENTE del siguiente día laborable de la MISMA
+//      línea (el día siguiente a la celda corta, nunca antes de hoy);
+//   3. reacomoda POR PIEZAS lo que ya estaba planeado: cada día se llena hasta
+//      su capacidad y lo que no cabe pasa al frente del día siguiente, donde
+//      se combina con lo que haya; el empuje termina en el primer día con
+//      hueco. La misma orden + color + estado en el mismo día queda en una
+//      sola celda (saldo 82 + 268 = 350).
 //
 // 🔒 A diferencia de las demás rutas del planner, ésta NO llama a
 //    planWeekLocks.enforce(): el saldo de una orden en proceso debe seguir al
@@ -3509,127 +3508,105 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
       return res.json({ success: true, balance: 0, placed: [], shifted: 0, message: "El día ya estaba completo; no hay saldo que mover." });
     }
 
-    const queue = settled.leftovers.map((l) => ({ color: l.color, qty: Number(l.qty) || 0 })).filter((l) => l.qty > 0);
-    const takeFromQueue = (room) => {
-      const rows = [];
-      while (room > 0 && queue.length) {
-        const head = queue[0];
-        const q = Math.min(room, head.qty);
-        rows.push({ color: head.color, qty: q });
-        head.qty -= q; room -= q;
-        if (head.qty <= 0) queue.shift();
-      }
-      return rows;
+    // 2) REFLUJO POR PIEZAS desde el primer día destino.
+    //
+    //    La línea es una fila: el saldo entra al FRENTE del primer día y todo
+    //    lo que ya estaba planeado se acomoda detrás, llenando cada día hasta
+    //    su capacidad. Lo que no cabe en un día pasa al frente del siguiente;
+    //    en cuanto un día tiene hueco suficiente, el empuje se acaba.
+    //
+    //    Ejemplo (capacidad 350): día 19 = saldo SKM0442 82 + SKM0442 350.
+    //      → día 19: 82 + 268 = 350 (se fusionan en una sola celda)
+    //      → día 20: recibe 82 al frente; si ahí hay otra orden con hueco, se
+    //        combina con ella; si no, sus últimas piezas pasan al día 21, etc.
+    //
+    //    Capacidad con estilos mezclados: cada pieza "pesa" 1/target de su
+    //    estilo ese día (target = cellCapacity().target, piezas/día del estilo),
+    //    y un día está lleno cuando la suma de pesos llega a 1.
+    //    Filas 'planned'/'released' se reacomodan; las demás (completed, etc.)
+    //    sólo ocupan capacidad y no se mueven. El orden de la línea se respeta:
+    //    en cuanto algo de un día se desborda, todo lo que va detrás también.
+    const styleOfWo = new Map([[woId, style]]);
+    const getStyle = async (id) => {
+      if (!styleOfWo.has(id)) styleOfWo.set(id, await plannerStyleParams.styleOfWorkOrder(client, id));
+      return styleOfWo.get(id);
     };
-    const touchedDays = new Set();
+    const capCache = new Map();
+    const capOf = async (st, day) => {
+      const k = `${st}|${day}`;
+      if (!capCache.has(k)) {
+        const cap = await plannerStyleParams.cellCapacity(client, { lineNo: line, date: day, style: st });
+        capCache.set(k, { target: Math.floor(Number(cap.target) || 0), availableMinutes: cap.availableMinutes });
+      }
+      return capCache.get(k);
+    };
 
-    // 2a) Combinar con lo que YA está en el primer día destino. Si ese día la
-    //     línea tiene otra(s) orden(es) y le sobra capacidad (p. ej. SKM0041
-    //     con 300 de 400), el saldo llena ese hueco en el MISMO día, sin
-    //     recorrer nada. cellCapacity().available ya descuenta lo planeado ahí
-    //     (ponderado por estilo). Sólo lo que no quepa sigue al paso 2b.
-    let combined = null;
-    let chunkStart = start;
-    {
-      const others = await client.query(
-        `SELECT DISTINCT wo.work_order_no
-           FROM line_assignments la
-           JOIN work_orders wo ON wo.id = la.work_order_id
-          WHERE la.line_no = $1
-            AND la.assigned_date = $2::date
-            AND la.status NOT IN ('cancelled', 'rejected')
-            AND la.work_order_id <> $3
-          ORDER BY wo.work_order_no`,
-        [line, start, woId]
-      );
-      if (others.rows.length) {
-        const cap0 = await plannerStyleParams.cellCapacity(client, { lineNo: line, date: start, style });
-        const room0 = Math.floor(Number(cap0.available) || 0);
-        if (room0 > 0) {
-          const rows = takeFromQueue(room0);
-          for (const r of rows) {
-            await mergeOrInsertAssignment(client, {
-              workOrderId: woId,
-              lineRunId: null,
-              lineNo: line,
-              assignedDate: start,
-              quantity: r.qty,
-              availableMinutes: cap0.availableMinutes,
-              requiredRate: Math.floor(Number(cap0.target) || 0),
-              startDate: start,
-              endDate: start,
-              status: "planned",
-              color: r.color,
-            });
-          }
-          combined = {
-            date: start,
-            qty: rows.reduce((t, r) => t + r.qty, 0),
-            with: others.rows.map((r) => r.work_order_no),
-          };
-          touchedDays.add(start);
-          // Lo que no cupo entra desde el día siguiente (ese día ya quedó lleno).
-          chunkStart = nextWorkday(start);
-        }
-        // Sin hueco ese día: como antes, el saldo entra primero en `start` y lo
-        // que ya estaba ahí se recorre.
-      }
-    }
-
-    // 2b) Partir lo que queda del saldo en celdas de día completo (por color,
-    //     en orden), desde chunkStart.
-    const chunks = []; // [{ date, availableMinutes, target, rows:[{ color, qty }] }]
-    {
-      let day = chunkStart, scanned = 0;
-      while (queue.length && scanned < MAX_DAYS) {
-        scanned++;
-        const cap = await plannerStyleParams.cellCapacity(client, { lineNo: line, date: day, style });
-        const target = Math.floor(Number(cap.target) || 0);
-        if (target <= 0) {
-          await client.query("ROLLBACK"); inTx = false;
-          return res.status(409).json({ success: false, error: `La Línea ${line} no tiene estándar de capacidad para ${style} el ${day}.` });
-        }
-        const rows = takeFromQueue(target);
-        chunks.push({ date: day, availableMinutes: cap.availableMinutes, target, rows });
-        day = nextWorkday(day);
-      }
-      if (queue.length) {
-        await client.query("ROLLBACK"); inTx = false;
-        return res.status(400).json({ success: false, error: `La línea ${line} no tiene días con capacidad para el saldo de ${wo.work_order_no}.` });
-      }
-    }
-    // 3) Lo que hay en la línea de `chunkStart` en adelante que se puede recorrer.
-    const occRes = await client.query(
-      `SELECT id, status, to_char(assigned_date, 'YYYY-MM-DD') AS d
+    const lineRes = await client.query(
+      `SELECT id, work_order_id, color, status, assigned_quantity,
+              to_char(assigned_date, 'YYYY-MM-DD') AS d
          FROM line_assignments
         WHERE line_no = $1
           AND assigned_date >= $2::date
-          AND status IN ('planned', 'released')
+          AND status NOT IN ('cancelled', 'rejected')
         ORDER BY assigned_date, id
         FOR UPDATE`,
-      [line, chunkStart]
+      [line, start]
     );
-    const occ = new Map(); // día -> [filas]
-    for (const r of occRes.rows) {
-      if (!isWorkday(r.d)) continue; // filas en fin de semana / festivo: no se tocan
-      if (!occ.has(r.d)) occ.set(r.d, []);
-      occ.get(r.d).push(r);
+    const movByDay = new Map();   // día -> filas planned/released (se reacomodan)
+    const fixedByDay = new Map(); // día -> otras filas (sólo ocupan capacidad)
+    for (const r of lineRes.rows) {
+      if (!isWorkday(r.d)) continue; // fin de semana / festivo: no se toca
+      const m = r.status === "planned" || r.status === "released" ? movByDay : fixedByDay;
+      if (!m.has(r.d)) m.set(r.d, []);
+      m.get(r.d).push({ ...r, qty: Number(r.assigned_quantity) || 0 });
     }
 
-    // Cola FIFO: cada día laborable recibe lo primero de la cola y lo que tenía
-    // pasa al final de la cola. Un día vacío absorbe y la cola se acorta. Las
-    // celdas del saldo van primero, así que caen exactamente en chunks[i].date
-    // (los mismos días laborables consecutivos desde `start`).
-    const carry = chunks.map(() => ({ kind: "balance" }));
-    const moves = []; // { from, to, rows }
+    let carry = settled.leftovers
+      .filter((l) => Number(l.qty) > 0)
+      .map((l) => ({ woId, color: l.color, qty: Number(l.qty), status: "planned", fromRow: null, isBalance: true, ownDay: false }));
+    const dayPlans = []; // [{ day, keep: Map(rowId -> qty), incoming: [seg], present: Set(woId) }]
     {
-      let day = chunkStart, scanned = 0;
+      let day = start, scanned = 0;
       while (carry.length && scanned < MAX_DAYS) {
         scanned++;
-        const item = carry.shift();
-        if (item.kind === "day") moves.push({ from: item.from, to: day, rows: item.rows });
-        const here = occ.get(day);
-        if (here && here.length) carry.push({ kind: "day", from: day, rows: here });
+        const fixed = fixedByDay.get(day) || [];
+        const mov = movByDay.get(day) || [];
+        let load = 0;
+        for (const f of fixed) {
+          const t = (await capOf(await getStyle(f.work_order_id), day)).target;
+          if (t > 0) load += f.qty / t;
+        }
+        const seq = [
+          ...carry,
+          ...mov.map((r) => ({ woId: r.work_order_id, color: r.color, qty: r.qty, status: r.status, fromRow: r.id, isBalance: false, ownDay: true })),
+        ];
+        const next = [];
+        const keep = new Map(mov.map((r) => [r.id, 0]));
+        const incoming = [];
+        for (const seg of seq) {
+          if (next.length) { next.push({ ...seg, ownDay: false }); continue; } // respetar el orden
+          const st = await getStyle(seg.woId);
+          const t = (await capOf(st, day)).target;
+          if (t <= 0) {
+            await client.query("ROLLBACK"); inTx = false;
+            return res.status(409).json({ success: false, error: `La Línea ${line} no tiene estándar de capacidad para ${st} el ${day}.` });
+          }
+          const room = Math.max(0, Math.floor((1 - load) * t + 1e-6));
+          const q = Math.min(room, seg.qty);
+          if (q > 0) {
+            load += q / t;
+            if (seg.ownDay) keep.set(seg.fromRow, (keep.get(seg.fromRow) || 0) + q);
+            else incoming.push({ ...seg, qty: q });
+          }
+          if (seg.qty - q > 0) next.push({ ...seg, qty: seg.qty - q, ownDay: false });
+        }
+        const present = new Set([
+          ...fixed.map((f) => f.work_order_id),
+          ...mov.filter((r) => (keep.get(r.id) || 0) > 0).map((r) => r.work_order_id),
+          ...incoming.map((s) => s.woId),
+        ]);
+        dayPlans.push({ day, mov, keep, incoming, present });
+        carry = next;
         day = nextWorkday(day);
       }
       if (carry.length) {
@@ -3638,52 +3615,65 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
       }
     }
 
-    // 4) Aplicar los recorridos del más lejano al más cercano: cada día llega a
-    //    un lugar que ya quedó libre y nunca chocan dos filas 'planned' en
-    //    uq_line_assign_planned_cell.
-    moves.sort((a, b) => (a.from < b.from ? 1 : a.from > b.from ? -1 : 0));
-    let shifted = 0, shiftedReleased = 0;
-    for (const mv of moves) {
-      for (const r of mv.rows) {
-        await client.query(
-          `UPDATE line_assignments
-              SET assigned_date = $1, planned_start_date = $1, planned_end_date = $1,
-                  line_run_id = CASE WHEN status = 'released' THEN NULL ELSE line_run_id END,
-                  updated_at = now()
-            WHERE id = $2`,
-          [mv.to, r.id]
-        );
-        shifted++;
-        if (r.status === "released") shiftedReleased++;
+    // 3) Aplicar. Primero se recortan / borran las filas que soltaron piezas
+    //    (assigned_quantity tiene CHECK > 0), luego se insertan las piezas que
+    //    llegaron a cada día con mergeOrInsertAssignment, que las FUSIONA con
+    //    la fila de la misma orden + color + estado si ya existe ese día
+    //    (así saldo 82 + 268 de la misma orden quedan en una sola celda de 350).
+    const touchedDays = new Set([shortDay]);
+    let rowsChanged = 0, piecesShifted = 0, releasedMoved = 0;
+    for (const p of dayPlans) {
+      for (const r of p.mov) {
+        const k = p.keep.get(r.id) || 0;
+        if (k === r.qty) continue;
+        if (k <= 0) await client.query(`DELETE FROM line_assignments WHERE id = $1`, [r.id]);
+        else await client.query(`UPDATE line_assignments SET assigned_quantity = $2, updated_at = now() WHERE id = $1`, [r.id, k]);
+        rowsChanged++;
+        touchedDays.add(p.day);
       }
-      touchedDays.add(mv.from); touchedDays.add(mv.to);
     }
-
-    // 5) Poner el saldo en sus días (ya libres).
-    const placed = [];
-    for (const c of chunks) {
-      for (const r of c.rows) {
+    const placed = [];   // saldo por día
+    const combined = []; // días donde el saldo quedó junto a otra(s) orden(es)
+    for (const p of dayPlans) {
+      let balHere = 0;
+      for (const seg of p.incoming) {
+        const cap = await capOf(await getStyle(seg.woId), p.day);
         await mergeOrInsertAssignment(client, {
-          workOrderId: woId,
+          workOrderId: seg.woId,
           lineRunId: null,
           lineNo: line,
-          assignedDate: c.date,
-          quantity: r.qty,
-          availableMinutes: c.availableMinutes,
-          requiredRate: c.target,
-          startDate: c.date,
-          endDate: c.date,
-          status: "planned",
-          color: r.color,
+          assignedDate: p.day,
+          quantity: seg.qty,
+          availableMinutes: cap.availableMinutes,
+          requiredRate: cap.target,
+          startDate: p.day,
+          endDate: p.day,
+          status: seg.status,
+          color: seg.color,
         });
+        touchedDays.add(p.day);
+        if (seg.isBalance) balHere += seg.qty;
+        else {
+          piecesShifted += seg.qty;
+          if (seg.status === "released") releasedMoved++;
+        }
       }
-      placed.push({ date: c.date, qty: c.rows.reduce((t, r) => t + r.qty, 0) });
-      touchedDays.add(c.date);
+      if (balHere > 0) {
+        placed.push({ date: p.day, qty: balHere });
+        const others = [...p.present].filter((id) => String(id) !== String(woId));
+        if (others.length) combined.push({ date: p.day, qty: balHere, withIds: others });
+      }
     }
+    if (combined.length) {
+      const ids = [...new Set(combined.flatMap((c) => c.withIds))];
+      const names = new Map((await client.query(`SELECT id, work_order_no FROM work_orders WHERE id = ANY($1)`, [ids])).rows.map((r) => [String(r.id), r.work_order_no]));
+      for (const c of combined) { c.with = c.withIds.map((id) => names.get(String(id)) || `#${id}`); delete c.withIds; }
+    }
+    const shifted = rowsChanged;
+    const shiftedReleased = releasedMoved;
 
-    // 6) Corridas borrador que quedaron sin celda (día corto vacío o días que
-    //    se recorrieron).
-    touchedDays.add(shortDay);
+    // 4) Corridas borrador que quedaron sin celda (día corto vacío o días que
+    //    se reacomodaron).
     for (const d of touchedDays) await cleanupOrphanDraftRuns(client, line, d);
 
     // Semanas bloqueadas que se tocaron (para el aviso del tablero).
@@ -3692,8 +3682,10 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
 
     await client.query("COMMIT"); inTx = false;
     console.log(
-      `[carry-balance v3-combine] wo=${woId} line=${line} short=${shortDay} balance=${settled.balance} ` +
-      `start=${start} combined=${combined ? `${combined.qty}@${combined.with.join("+")}` : "-"} cells=${placed.length} shifted=${shifted} lockedWeeks=${lockedTouched.join(",") || "-"} by=${req.user?.id ?? "?"}`
+      `[carry-balance v4-reflow] wo=${woId} line=${line} short=${shortDay} balance=${settled.balance} ` +
+      `start=${start} placed=${placed.map((p) => `${p.qty}@${p.date}`).join(",") || "-"} ` +
+      `combined=${combined.map((c) => `${c.qty}@${c.date}+${c.with.join("+")}`).join(",") || "-"} ` +
+      `rowsChanged=${shifted} piecesShifted=${piecesShifted} lockedWeeks=${lockedTouched.join(",") || "-"} by=${req.user?.id ?? "?"}`
     );
     res.json({
       success: true,
@@ -3701,9 +3693,10 @@ app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, r
       produced: settled.produced,
       balance: settled.balance,
       startDate: start,
-      combined,
-      placed,
-      shifted,
+      combined,          // [{ date, qty, with:[OT] }]
+      placed,            // [{ date, qty }] saldo por día
+      shifted,           // filas que soltaron piezas
+      piecesShifted,     // piezas de otras celdas que se corrieron
       shiftedReleased,
       lockedWeeks: lockedTouched,
     });
