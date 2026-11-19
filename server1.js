@@ -1211,6 +1211,8 @@ learningCurves(app, {
   ceoRoles: ["ceo", "master", "skyrina"],
 });
 
+const registerPlanningStyleFit = require("./planning-style-fit");
+registerPlanningStyleFit(app, { authenticateToken, pool, setSchema, holidays: registerHolidays, planWeekLocks });
 
 // ~línea 867, junto a registerMerchantPlan:
 const registerPreOrders = require("./pre-orders");
