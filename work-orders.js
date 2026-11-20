@@ -429,8 +429,12 @@ const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, 
 const toTxt = (v) => (v == null ? null : String(v).trim() || null);
 const toNum = (v) => (v === "" || v == null || isNaN(parseFloat(v)) ? null : parseFloat(v));
 
+// Identity of a tela: name + code + consumo (yield). Same name and code with a
+// different consumo is a different tela (MONIQUE/MQE1200PQE/0.15 vs .../0.25).
+const fabricKey = (nm, cd, y) => `${nm || ""}|${cd || ""}|${y == null ? "" : String(y)}`.toUpperCase();
+
 // Normalise a line's telas into [{ name, code, yield }], dropping blank names
-// and duplicate name+code pairs. Each tela keeps its OWN yield. Accepts the new
+// and exact duplicates (same name + code + yield). Each tela keeps its OWN yield. Accepts the new
 // `fabrics` array or a legacy scalar {fabricName, fabricCode, yield}; `fb`
 // supplies order-level fallbacks used by the create route.
 const buildLineFabrics = (l, fb = {}) => {
@@ -440,10 +444,11 @@ const buildLineFabrics = (l, fb = {}) => {
     const nm = toTxt(name);
     if (!nm) return;
     const cd = toTxt(code);
-    const key = `${nm}|${cd || ""}`.toUpperCase();
+    const yv = toNum(y);
+    const key = fabricKey(nm, cd, yv);
     if (seen.has(key)) return;
     seen.add(key);
-    out.push({ name: nm, code: cd, yield: toNum(y) });
+    out.push({ name: nm, code: cd, yield: yv });
   };
   if (Array.isArray(l.fabrics) && l.fabrics.length) {
     for (const f of l.fabrics) push(f?.name, f?.code, f?.yield ?? f?.yieldPerPiece);
@@ -1255,10 +1260,11 @@ function registerWorkOrders(app, deps) {
           const nm = toTxt(f?.name);
           if (!nm) continue;
           const cd = toTxt(f?.code);
-          const key = `${nm}|${cd || ""}`.toUpperCase();
+          const yv = toNum(f?.yield);
+          const key = fabricKey(nm, cd, yv);
           if (seen.has(key)) continue;
           seen.add(key);
-          out.push({ name: nm, code: cd, yield: toNum(f?.yield) });
+          out.push({ name: nm, code: cd, yield: yv });
         }
         return out;
       };
