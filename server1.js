@@ -3004,12 +3004,16 @@ async function mergeOrInsertAssignment(client, a) {
 }
 
 // ---------------------------------------------------------------------------
-// PATCH /api/line-assignments/:id/move  —  add to server.js near the other
-// line-assignments routes.
+// PATCH /api/line-assignments/:id/move
 //
-// Moves an existing assignment to another line and/or day. Revalidates the
-// target's daily capacity (target_pcs of the line's run for that date, minus
-// what's already assigned there — excluding this assignment itself).
+// Moves an existing assignment to another line and/or day. Walks the target
+// line from assignedDate filling each day's remaining capacity and carrying the
+// remainder forward. Every skipped day is logged with its reason so the board
+// can say WHERE the order landed and WHY.
+//
+// Body: { lineNo, assignedDate: "YYYY-MM-DD", strictStart?: boolean }
+//   strictStart = true → if assignedDate itself can't take a single piece, the
+//   move is rejected (409 DROP_DAY_UNUSABLE) and the order stays where it was.
 // ---------------------------------------------------------------------------
 app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -3029,15 +3033,18 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
   try {
     await setSchema(client);
     const id = parseInt(req.params.id);
-    const { lineNo, assignedDate } = req.body;
- 
+    // strictStart: el tablero lo manda cuando se suelta la orden en una casilla
+    // VACÍA. Si ese día no puede recibir ni una pieza, el movimiento se rechaza
+    // con el motivo, en vez de recorrer la orden semanas o meses en silencio.
+    const { lineNo, assignedDate, strictStart = false } = req.body;
+
     if (!lineNo || !assignedDate) {
       return res.status(400).json({ success: false, error: "lineNo y assignedDate son obligatorios" });
     }
- 
+
     await client.query("BEGIN");
     await planWeekLocks.enforce(client); // 🔒 semanas bloqueadas por el CEO
- 
+
     const cur = await client.query(
       "SELECT id, work_order_id, assigned_quantity, color, status, line_no, to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date_str FROM line_assignments WHERE id = $1",
       [id]
@@ -3051,39 +3058,46 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     // the day ends up empty after the move.
     const sourceLineNo = String(original.line_no);
     const sourceDate = original.assigned_date_str;
- 
+
     const totalQty = parseFloat(original.assigned_quantity) || 0;
     const workOrderId = original.work_order_id;
     const color = original.color || null;
     const status = ["planned", "released", "completed", "cancelled"].includes(original.status)
       ? original.status
       : "planned";
- 
+
     // Planner standard for this order's style drives the target line capacity.
     const moveStyle = await plannerStyleParams.styleOfWorkOrder(client, workOrderId);
     if (!(await plannerStyleParams.getParams(client, moveStyle))) {
       await client.query("ROLLBACK");
       return plannerStyleParams.styleParamsRequired(res, moveStyle);
     }
- 
+
     // Free the original's capacity first so the re-flow can reuse its old slot.
     // Everything happens in one transaction, so a shortfall rolls this back and
     // leaves the assignment exactly where it was.
     await client.query("DELETE FROM line_assignments WHERE id = $1", [id]);
- 
+
     // Walk the target line day by day from assignedDate, filling each day's
     // remaining capacity and carrying the remainder forward — the same packing
-    // rule as a pool placement. Weekends, days with no run configured, or days
-    // already full are skipped. All-or-nothing: if the whole quantity can't fit
+    // rule as a pool placement. All-or-nothing: if the whole quantity can't fit
     // within the horizon, roll back and report the shortfall.
-        const MAX_DAYS = 180;
+    const MAX_DAYS = 180;
     let remaining = totalQty;
     let dayStr = assignedDate;
     let scanned = 0;
     const createdRows = [];
- 
-    // Registered holidays (días festivos / paros) block a day just like weekends,
-    // so the forward walk hops over them instead of stacking onto a blocked cell.
+    // Bitácora de días brincados y por qué, para que el tablero diga dónde y por
+    // qué quedó la orden (antes respondía "success" sin explicar el salto).
+    const skipped = [];
+    const why = (r) => ({
+      holiday: "día festivo / paro",
+      locked: "semana bloqueada",
+      noCapacity: "sin capacidad configurada para el estilo",
+      full: "línea llena",
+    })[r] || r;
+
+    // Registered holidays (días festivos / paros) block a day just like weekends.
     // Plant-wide rows (line_no NULL) block every line. Best-effort: if the module
     // isn't there we fall back to skipping weekends only.
     const holidaySet = new Set();
@@ -3094,20 +3108,50 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     // 🔒 Semanas bloqueadas por el CEO: el reparto las BRINCA y sigue en la
     // siguiente semana libre (si no, el trigger rechazaría todo el movimiento).
     const lockedWeeks = await planWeekLocks.lockedWeekSet(client);
- 
+
     while (remaining > 0 && scanned < MAX_DAYS) {
       scanned++;
-      if (isWeekend(dayStr) || holidaySet.has(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend / holiday work
-      if (planWeekLocks.isLockedDay(lockedWeeks, dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; } // 🔒 semana bloqueada
-      const cap = await plannerStyleParams.cellCapacity(client, { lineNo: String(lineNo), date: dayStr, style: moveStyle });
+      if (isWeekend(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // calendario normal, no es un "salto"
+
+      let skip = null;
+      let cap = null;
+      if (holidaySet.has(dayStr)) skip = { reason: "holiday" };
+      else if (planWeekLocks.isLockedDay(lockedWeeks, dayStr)) skip = { reason: "locked" };   // 🔒 semana bloqueada
+      else {
+        cap = await plannerStyleParams.cellCapacity(client, { lineNo: String(lineNo), date: dayStr, style: moveStyle });
+        const target = Math.round(Number(cap.target) || 0);
+        if (target <= 0) skip = { reason: "noCapacity", target };
+        else if (!(cap.available > 0)) skip = { reason: "full", target, available: Math.round(Number(cap.available) || 0) };
+      }
+
+      if (skip) {
+        skipped.push({ date: dayStr, ...skip });
+        // Soltada en casilla vacía y ese MISMO día no sirve: rechazar con motivo.
+        if (strictStart && createdRows.length === 0 && dayStr === assignedDate) {
+          await client.query("ROLLBACK");
+          const detail = skip.reason === "full"
+            ? ` (para el estilo ${moveStyle} el día ya suma su capacidad de ${skip.target} pzas aunque la casilla se vea vacía: revise asignaciones completadas o liberadas y reservas de pre-orden en ese día)`
+            : skip.reason === "noCapacity"
+              ? ` (el estándar del estilo ${moveStyle} da 0 pzas/día en la línea ${lineNo}: revise operarios, horas, SAM o eficiencia)`
+              : "";
+          return res.status(409).json({
+            success: false,
+            code: "DROP_DAY_UNUSABLE",
+            reason: skip.reason,
+            skipped,
+            error: `No se movió: la línea ${lineNo} no puede recibir piezas el ${assignedDate} — ${why(skip.reason)}${detail}.`,
+          });
+        }
+        dayStr = addDaysStr(dayStr, 1);
+        continue;
+      }
+
       const available = cap.available;
-      if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
- 
       const chunk = Math.min(remaining, available);
       const effectiveDailyMinutes = cap.availableMinutes;
       const piecesPerDay = cap.target;
       const lineData = { id: null }; // planning is decoupled from engineering runs
- 
+
       const ins = await client.query(
         `INSERT INTO line_assignments
            (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
@@ -3123,26 +3167,46 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       remaining -= chunk;
       dayStr = addDaysStr(dayStr, 1);
     }
- 
+
     if (remaining > 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({
         success: false,
+        skipped,
         error: `La línea ${lineNo} no tiene capacidad suficiente para mover ${Math.round(totalQty)} pzas desde el ${assignedDate} (faltan ${Math.round(remaining)}).`,
       });
     }
- 
+
     // The source day may now be empty. If it only had an unconfirmed draft run
     // (created before the planner confirmed), drop it so line leaders don't keep
     // seeing a draft for a day the order was moved away from.
     await cleanupOrphanDraftRuns(client, sourceLineNo, sourceDate);
- 
+
     await client.query("COMMIT");
+
+    // Si la orden empezó después del día pedido, explicar qué días brincó.
+    // pg entrega DATE como medianoche LOCAL: leer con getters locales, no toISOString().
+    const ymdOf = (v) => (v instanceof Date
+      ? `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, "0")}-${String(v.getDate()).padStart(2, "0")}`
+      : String(v || "").slice(0, 10));
+    const firstDay = createdRows[0] ? ymdOf(createdRows[0].assigned_date) : null;
+    let reason = null;
+    if (firstDay && firstDay !== assignedDate) {
+      const counts = skipped.filter((x) => x.date < firstDay)
+        .reduce((m, x) => { m[x.reason] = (m[x.reason] || 0) + 1; return m; }, {});
+      reason = Object.entries(counts).map(([r, n]) => `${n} día(s) con ${why(r)}`).join(", ") || null;
+      console.warn(`[move] #${id} pedida ${assignedDate} L${lineNo} → quedó ${firstDay}`, skipped.slice(0, 20));
+    }
+
     res.json({
       success: true,
       assignment: createdRows[0] || null,
       assignments: createdRows,
       cells: createdRows.length,
+      requestedDate: assignedDate,
+      firstDate: firstDay,
+      skipped,
+      reason,
     });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
@@ -3153,7 +3217,6 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     client.release();
   }
 });
- 
 
 
 // ---------------------------------------------------------------------------
