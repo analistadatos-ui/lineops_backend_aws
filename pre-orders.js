@@ -695,18 +695,20 @@ function registerPreOrders(app, deps) {
       //    holds nunca se soltaban y la PRE seguía pintada en el tablero.
       //    🔒 Las reservas en semanas bloqueadas por el CEO se quedan; se sueltan
       //    cuando se desbloquea esa semana (plan-week-locks.js).
+      //    OBLIGATORIO (no best-effort): si no se pueden soltar las reservas, la
+      //    conversión entera se deshace. Antes un error aquí se registraba y la
+      //    PRE quedaba 'converted' con sus reservas vivas: invisibles en el
+      //    tablero pero contando capacidad (líneas "llenas" que se veían vacías).
       let releasedHolds = 0;
       if (isFinal) {
-        releasedHolds = (await step("release_holds", async () => {
-          const r = await client.query(
-            `DELETE FROM pre_order_day_holds
-              WHERE pre_order_id = $1 AND ${notInLockedWeekSql("assigned_date")}`,
-            [id]
-          );
-          return r.rowCount;
-        })) || 0;
+        const r = await client.query(
+          `DELETE FROM pre_order_day_holds
+            WHERE pre_order_id = $1 AND ${notInLockedWeekSql("assigned_date")}`,
+          [id]
+        );
+        releasedHolds = r.rowCount;
       } else {
-        await step("shrink_holds", () => shrinkPreOrderHolds(client, id, convertedPieces));
+        await shrinkPreOrderHolds(client, id, convertedPieces);
       }
 
       // 2) Después, heredar la semana del tablero del merchant a las POs nuevas.
@@ -795,6 +797,10 @@ function registerPreOrders(app, deps) {
     const client = await pool.connect();
     try {
       await setSchema(client);
+      // Una sola transacción: cancelar y soltar reservas van juntos. Antes la
+      // cancelación se guardaba primero y el borrado de reservas iba aparte con
+      // .catch(): si fallaba, la PRE quedaba cancelada con reservas vivas.
+      await client.query("BEGIN");
       const { rows } = await client.query(
         `UPDATE pre_orders
             SET status = 'cancelled', updated_by = $2, updated_at = NOW()
@@ -803,22 +809,38 @@ function registerPreOrders(app, deps) {
         [id, req.user?.id ?? null]
       );
       if (rows.length === 0) {
+        await client.query("ROLLBACK");
         return res.status(400).json({ success: false, error: "No existe, ya se convirtió en PO o ya estaba cancelada" });
       }
-      // Si venía de un pronóstico, lo que no se convirtió regresa a ese pronóstico.
-      await returnPiecesToForecast(client, rows[0])
-        .catch((e) => console.warn("no se pudieron regresar piezas al pronóstico:", e.message));
-      // Cancelada = fuera del tablero de planeación (semana del merchant + holds del planner).
-      await client.query("DELETE FROM merchant_week_plan WHERE pre_order_id = $1", [id])
-        .catch((e) => console.warn("no se pudo limpiar el tablero:", e.message));
-      // 🔒 Las reservas en semanas bloqueadas se quedan hasta que el CEO desbloquea.
-      await client.query(
+      // 🔒 Las reservas en semanas bloqueadas se quedan; el barrido de
+      // pre-order-holds.js las quita en cuanto la semana deja de estar bloqueada.
+      // Fuera de eso, OBLIGATORIO: si falla, no se cancela nada.
+      const released = await client.query(
         `DELETE FROM pre_order_day_holds
           WHERE pre_order_id = $1 AND ${notInLockedWeekSql("assigned_date")}`,
         [id]
-      ).catch((e) => console.warn("no se pudieron limpiar los holds:", e.message));
-      res.json({ success: true, preOrder: rows[0] });
+      );
+
+      // Pasos secundarios: aislados en SAVEPOINT para que un error en ellos no
+      // tumbe la cancelación ni deje la transacción abortada.
+      const side = async (name, fn) => {
+        await client.query(`SAVEPOINT ${name}`);
+        try { await fn(); await client.query(`RELEASE SAVEPOINT ${name}`); }
+        catch (e) {
+          await client.query(`ROLLBACK TO SAVEPOINT ${name}`);
+          console.warn(`\u26a0\ufe0f  cancelar pre-orden ${id} [${name}] falló:`, e.message);
+        }
+      };
+      // Si venía de un pronóstico, lo que no se convirtió regresa a ese pronóstico.
+      await side("return_forecast", () => returnPiecesToForecast(client, rows[0]));
+      // Cancelada = fuera del tablero del merchant.
+      await side("clear_merchant", () => client.query("DELETE FROM merchant_week_plan WHERE pre_order_id = $1", [id]));
+
+      await client.query("COMMIT");
+      res.json({ success: true, preOrder: rows[0], releasedHolds: released.rowCount });
     } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (planWeekLocks.isLockError(err)) return planWeekLocks.sendLocked(res, err);
       console.error("\u274c POST /api/pre-orders/:id/cancel:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {

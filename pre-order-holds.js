@@ -78,6 +78,41 @@ async function initSchema({ pool, setSchema }) {
     `);
     await client.query("CREATE INDEX IF NOT EXISTS idx_pre_order_day_holds_cell ON pre_order_day_holds(line_no, assigned_date);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_pre_order_day_holds_pre ON pre_order_day_holds(pre_order_id);");
+
+    // 🛡️ Guardia en la base: una PRE convertida o cancelada NO puede recibir
+    // reservas nuevas, venga de donde venga (ruta, deshacer, script, SQL a mano).
+    // BEFORE INSERT que regresa NULL = la fila simplemente no se escribe, sin
+    // romper la transacción de quien la intentó.
+    try {
+      await client.query(`
+        CREATE OR REPLACE FUNCTION trg_pre_order_holds_closed_guard() RETURNS trigger AS $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pre_orders p
+                      WHERE p.id = NEW.pre_order_id
+                        AND p.status IN ('converted', 'cancelled')) THEN
+            RETURN NULL;
+          END IF;
+          RETURN NEW;
+        END
+        $$ LANGUAGE plpgsql;
+      `);
+      await client.query("DROP TRIGGER IF EXISTS pre_order_holds_closed_guard ON pre_order_day_holds;");
+      await client.query(`
+        CREATE TRIGGER pre_order_holds_closed_guard
+          BEFORE INSERT ON pre_order_day_holds
+          FOR EACH ROW EXECUTE PROCEDURE trg_pre_order_holds_closed_guard();
+      `);
+    } catch (e) {
+      console.warn("\u26a0\ufe0f  no se pudo crear la guardia de reservas PRE cerradas:", e.message);
+    }
+
+    // Limpieza al arrancar: reservas huérfanas que hayan quedado de antes.
+    try {
+      await purgeClosedPreOrderHolds(client);
+    } catch (e) {
+      console.warn("\u26a0\ufe0f  limpieza de reservas PRE al arrancar falló:", e.message);
+    }
+
     console.log("\u2705 pre_order_day_holds table ready in prod_db_schema");
   } finally {
     client.release();
@@ -91,6 +126,31 @@ const plannerStyleParams = require("./planner-style-params");
 // 🔒 Candado de semanas del CEO: una reserva PRE no se crea, cambia ni borra
 // en una semana bloqueada (trigger en pre_order_day_holds, opt-in con enforce).
 const planWeekLocks = require("./plan-week-locks");
+
+// ---------------------------------------------------------------------------
+// Reservas huérfanas: una PRE convertida o cancelada ya no reserva nada. Sus
+// reservas sólo pueden quedarse en una semana bloqueada por el CEO; en cuanto
+// esa semana ya no está bloqueada, sobran. El tablero NO las pinta, pero
+// cellCapacity() sí las contaba, y la línea se veía vacía aunque estaba "llena"
+// (así quedó la línea 11 del 3 dic al 2 mar con la PRE 243).
+//
+// Se llama al arrancar, en cada carga del tablero (GET) y desde pre-orders.js,
+// así ninguna fuga —conversión fallida, cancelación a medias o semana
+// desbloqueada— sobrevive más de una carga del tablero.
+// ---------------------------------------------------------------------------
+async function purgeClosedPreOrderHolds(client) {
+  const r = await client.query(
+    `DELETE FROM pre_order_day_holds h
+      USING pre_orders p
+      WHERE p.id = h.pre_order_id
+        AND p.status IN ('converted', 'cancelled')
+        AND ${planWeekLocks.notInLockedWeekSql("h.assigned_date")}`
+  );
+  if (r.rowCount) {
+    console.warn(`\u{1F9F9} ${r.rowCount} reserva(s) PRE huérfana(s) eliminada(s) (pre-orden convertida o cancelada)`);
+  }
+  return r.rowCount;
+}
 
 // --- coercion helpers ------------------------------------------------------
 const txt = (v, n) => (v == null ? null : String(v).trim().slice(0, n || 200) || null);
@@ -124,6 +184,10 @@ function registerPreOrderHolds(app, deps) {
     const client = await pool.connect();
     try {
       await setSchema(client);
+      // Cada carga del tablero barre las reservas de PRE cerradas fuera de
+      // semanas bloqueadas (incluye las que quedaron al desbloquear una semana).
+      try { await purgeClosedPreOrderHolds(client); }
+      catch (e) { console.warn("\u26a0\ufe0f  limpieza de reservas PRE falló:", e.message); }
       const params = [];
       const where = [];
       if (from) { params.push(from); where.push(`assigned_date >= $${params.length}`); }
@@ -419,4 +483,5 @@ function registerPreOrderHolds(app, deps) {
 }
 
 registerPreOrderHolds.initSchema = initSchema;
+registerPreOrderHolds.purgeClosedPreOrderHolds = purgeClosedPreOrderHolds;
 module.exports = registerPreOrderHolds;
