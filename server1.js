@@ -701,6 +701,7 @@ await registerCutOrders.initSchema({ pool, setSchema });
 await registerCutOrderRequests.initSchema({ pool, setSchema });   // solicitudes de corte (después de cut_orders)
 await registerBom.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
+await registerBanda.initSchema({ pool, setSchema });   // 📦 banda_eventos
 await registerFabricWarehouse.initSchema({ pool, setSchema });
 
 await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
@@ -1242,6 +1243,10 @@ registerMerchantPlan(app, { authenticateToken, pool, setSchema });
 
 const registerFinishedWarehouse = require("./finished-warehouse");
 registerFinishedWarehouse(app, { authenticateToken, pool, setSchema });
+
+
+const registerBanda = require("./banda-plc");
+registerBanda(app, { authenticateToken, pool, setSchema });
 
 const registerFabricWarehouse = require("./fabric-warehouse");
 registerFabricWarehouse(app, { authenticateToken, pool, setSchema });
