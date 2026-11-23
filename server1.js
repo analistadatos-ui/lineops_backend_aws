@@ -704,7 +704,7 @@ await registerBom.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
 await registerBanda.initSchema({ pool, setSchema });   // 📦 banda_eventos
 await registerFabricWarehouse.initSchema({ pool, setSchema });
-
+await registerPanelStock.initSchema({ pool, setSchema });
 await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
 await registerWorkOrders.initSchema({ pool, setSchema });   // ← add this
 await registerOrderClose.initSchema({ pool, setSchema });   // ✅ cierre manual (después de work_orders)
@@ -1227,6 +1227,9 @@ registerPanelRequests(app, { authenticateToken, pool, setSchema });
 
 const registerFinishedWarehouseAnalytics = require("./finished-warehouse-analytics");
 registerFinishedWarehouseAnalytics(app, { authenticateToken, pool, setSchema });
+
+const registerPanelStock = require("./panel-stock");                 // with the other requires
+registerPanelStock(app, { authenticateToken, pool, setSchema });
 
 const registerPreOrderHolds = require("./pre-order-holds");
 registerPreOrderHolds(app, { authenticateToken, pool, setSchema, holidays: registerHolidays });
