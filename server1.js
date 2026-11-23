@@ -696,6 +696,7 @@ await registerPreOrders.initSchema({ pool, setSchema });
 await registerMerchantAnalytics.initSchema({ pool, setSchema });
 await registerMerchantPlan.initSchema({ pool, setSchema });
 await registerPreOrderHolds.initSchema({ pool, setSchema });   // ← add
+await registerPanelRequests.initSchema({ pool, setSchema });
 await registerForecastOrders.initSchema({ pool, setSchema });  // 📈 Tablero de pronóstico (después de customers)
 await registerCutOrders.initSchema({ pool, setSchema });
 await registerCutOrderRequests.initSchema({ pool, setSchema });   // solicitudes de corte (después de cut_orders)
@@ -1219,6 +1220,11 @@ registerPlanningStyleFit(app, { authenticateToken, pool, setSchema, holidays: re
 const registerPreOrders = require("./pre-orders");
 registerPreOrders(app, { authenticateToken, pool, setSchema });
 // with the other requires / registrations, near registerFinishedWarehouse:
+
+const registerPanelRequests = require("./panel-requests");
+registerPanelRequests(app, { authenticateToken, pool, setSchema });
+
+
 const registerFinishedWarehouseAnalytics = require("./finished-warehouse-analytics");
 registerFinishedWarehouseAnalytics(app, { authenticateToken, pool, setSchema });
 
