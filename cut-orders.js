@@ -219,7 +219,7 @@ const sumMarkerPanels = (markers) =>
 
 // Quién puede firmar la verificación del corte. Ajusta a los roles reales de
 // tu tabla de usuarios si el nombre difiere.
-const VERIFIER_ROLES = ["supervisor", "master", "admin", "skyrina", "soporte_it","corte"];
+const VERIFIER_ROLES = ["master", "admin", "corte"];
 
 // Nombre que queda sellado en verified_by; el payload del token varía según el
 // login, así que tomamos el primero que exista.
