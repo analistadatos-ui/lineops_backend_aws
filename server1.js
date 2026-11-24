@@ -1133,6 +1133,28 @@ app.post("/api/refresh-token", authenticateToken, (req, res) => {
   res.json({ success: true, token });
 });
 
+
+// Backend version: changes whenever the server code is deployed (or set APP_VERSION in the deploy)
+const BACKEND_VERSION = process.env.APP_VERSION || (() => {
+  try {
+    const path = require("path");
+    const hash = crypto.createHash("sha1");
+    fs.readdirSync(__dirname)
+      .filter((f) => f.endsWith(".js"))
+      .sort()
+      .forEach((f) => hash.update(fs.readFileSync(path.join(__dirname, f))));
+    return hash.digest("hex").slice(0, 12);
+  } catch {
+    return "unknown";
+  }
+})();
+
+// Public on purpose: returns only the version, so every role (including the TVs) can check it
+app.get("/api/version", (req, res) => {
+  res.json({ version: BACKEND_VERSION });
+});
+
+
 // ======================================================================
 // 🔒 PLAN BOARD LOCK
 // The planner finishes the plan, then clicks "Bloquear tablero". While locked,
