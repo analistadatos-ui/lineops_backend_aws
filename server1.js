@@ -858,15 +858,27 @@ const securityLog = (event, req, meta = {}) => {
   });
 };
 
-// soporte_it is only used for the line TV screens: allow only these routes
-const TV_ROLE = "soporte_it";
-const TV_ALLOWED = [
-  { method: "GET",  path: /^\/api\/me$/ },
-  { method: "POST", path: /^\/api\/refresh-token$/ },
-  { method: "GET",  path: /^\/api\/line-runs\/[^/]+$/ },
-  { method: "GET",  path: /^\/api\/get-run-data\/[^/]+$/ },
-  { method: "GET",  path: /^\/api\/line-tv\// },
-];
+// Roles that may only use one screen: each is allowed only these routes
+const RESTRICTED_ROLES = {
+  // Line TV screens
+  soporte_it: [
+    { method: "GET",  path: /^\/api\/me$/ },
+    { method: "POST", path: /^\/api\/refresh-token$/ },
+    { method: "GET",  path: /^\/api\/line-runs\/[^/]+$/ },
+    { method: "GET",  path: /^\/api\/get-run-data\/[^/]+$/ },
+    { method: "GET",  path: /^\/api\/line-tv\// },
+  ],
+  // Skyrina dashboard
+  skyrina: [
+    { method: "GET",  path: /^\/api\/me$/ },
+    { method: "POST", path: /^\/api\/batch\/line-runs-data$/ },
+    { method: "GET",  path: /^\/api\/supervisor\/summary$/ },
+    { method: "GET",  path: /^\/api\/supervisor\/line-performance$/ },
+    { method: "GET",  path: /^\/api\/supervisor\/assignments$/ },
+  ],
+};
+
+
 
 const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers["authorization"];
@@ -893,11 +905,12 @@ const authenticateToken = async (req, res, next) => {
         return res.status(401).json({ success: false, error: "User not found or inactive" });
       }
       req.user = applyRoleAlias(userResult.rows[0]);
-      if (req.user.role === TV_ROLE) {
+            const allowed = RESTRICTED_ROLES[req.user.role];
+      if (allowed) {
         const path = req.originalUrl.split("?")[0];
-        const ok = TV_ALLOWED.some((r) => r.method === req.method && r.path.test(path));
+        const ok = allowed.some((r) => r.method === req.method && r.path.test(path));
         if (!ok) {
-          securityLog("tv_role_blocked", req, { username: req.user.username, method: req.method });
+          securityLog("restricted_role_blocked", req, { username: req.user.username, role: req.user.role, method: req.method });
           return res.status(403).json({ success: false, error: "Access denied. Insufficient permissions." });
         }
       }
