@@ -40,7 +40,7 @@
 // Roles allowed to APPROVE / REJECT a request. "master" is the CEO account
 // (Salvador Cassab); "skyrina" is the owner/company account. Trim this list if
 // you want the decision to be the CEO alone.
-const CEO_ROLES = ["master", "skyrina", "soporte_it"];
+const CEO_ROLES = ["master"];
 
 const norm = (s) => String(s || "").trim().toUpperCase();
 const clampEff = (v) => {

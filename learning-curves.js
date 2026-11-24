@@ -48,8 +48,8 @@
 //          await learningCurves.initSchema({ pool, setSchema });
 // --------------------------------------------------------------------------
 
-const DEFAULT_CURVE_ROLES = ["planner", "master", "ceo", "skyrina"];
-const DEFAULT_CEO_ROLES = ["ceo", "master", "skyrina"];
+const DEFAULT_CURVE_ROLES = ["planner", "master", "ceo"];
+const DEFAULT_CEO_ROLES = ["ceo", "master"];
 
 // days = cuántos días dura la etapa; null = el resto de los días.
 const PRESETS = {

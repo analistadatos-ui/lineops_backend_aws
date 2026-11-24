@@ -34,7 +34,7 @@
 // ==========================================================================
 
 // Quién recibe los avisos. El Factory Director entra como "master".
-const CEO_ROLES = ["master", "skyrina", "admin", "ceo"];
+const CEO_ROLES = ["master", "admin", "ceo"];
 
 // Mismas palabras clave que PACKING_KEYWORDS en work-orders.js: un cambio en
 // estas operaciones cambia lo PRODUCIDO de la orden.

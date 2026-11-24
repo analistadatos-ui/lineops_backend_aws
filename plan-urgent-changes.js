@@ -69,7 +69,7 @@
 // ==========================================================================
 
 const OVERRIDE_GUC = "plan.urgent_override";
-const DEFAULT_ROLES = ["planner", "master", "ceo", "skyrina"];
+const DEFAULT_ROLES = ["planner", "master", "ceo"];
 const MIN_REASON = 5;
 
 const normColor = (c) => String(c == null ? "" : c).trim().toUpperCase();

@@ -139,7 +139,7 @@ function registerSupermarketPlan(app, deps) {
   // Roles que pueden ENVIAR al supermercado. Se pueden sobreescribir desde
   // server.js. `null` = cualquiera autenticado (util en instalaciones que aun
   // no tienen roles cableados).
-  const publisherRoles = deps.publisherRoles || ["admin", "planner", "planeacion", "planning", "supermarcado", "supervisor", "master", "soporte_it", "skyrina"];
+  const publisherRoles = deps.publisherRoles || ["admin", "planner", "planeacion", "planning", "supermarcado", "master"];
 
   // Horizonte de envío: sólo se pueden publicar las semanas entre
   // `minWeeksAhead` y `maxWeeksAhead` contando desde la semana actual (0).

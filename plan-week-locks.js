@@ -44,7 +44,7 @@
 
 // Roles que pueden bloquear / desbloquear. Ajuste a como se llama el rol del
 // CEO en su tabla users (o pase `lockerRoles` al registrar el módulo).
-const DEFAULT_LOCKER_ROLES = ["ceo", "skyrina", "master"];
+const DEFAULT_LOCKER_ROLES = ["ceo","master"];
 
 // 🔔 Aviso al CEO. Cuando un usuario con uno de estos roles REALES
 // (req.user.actual_role; factory_director entra como "master" por el alias)

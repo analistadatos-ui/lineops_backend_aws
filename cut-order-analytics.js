@@ -45,7 +45,7 @@
 // Roles allowed to see the executive cut board. Matches the broad exec set used
 // elsewhere in the app; trim it if the cutting board should be narrower.
 // 'corte' is here so the cutting floor's own Dashboard tab can read it.
-const ALLOWED_ROLES = ['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'admin', 'planner', 'corte'];
+const ALLOWED_ROLES = ['master', 'admin', 'planner', 'corte'];
 
 const STATUSES = ['pending', 'in_progress', 'awaiting_verification', 'completed', 'cancelled'];
 

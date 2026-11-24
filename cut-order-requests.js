@@ -28,7 +28,7 @@
 
 const URGENCIES = ["urgent", "intermediate", "normal"];
 // Roles que NO pueden rechazar solicitudes (sólo piden).
-const REQUESTER_ONLY_ROLES = ["corte", "line_leader"];
+const REQUESTER_ONLY_ROLES = ["corte"];
 
 const normColor = (c) => String(c == null ? "" : c).trim().toUpperCase().slice(0, 50);
 const userName = (u) => u?.full_name || u?.username || u?.name || u?.email || (u?.id != null ? String(u.id) : null);
