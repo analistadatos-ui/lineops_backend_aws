@@ -858,6 +858,16 @@ const securityLog = (event, req, meta = {}) => {
   });
 };
 
+// soporte_it is only used for the line TV screens: allow only these routes
+const TV_ROLE = "soporte_it";
+const TV_ALLOWED = [
+  { method: "GET",  path: /^\/api\/me$/ },
+  { method: "POST", path: /^\/api\/refresh-token$/ },
+  { method: "GET",  path: /^\/api\/line-runs\/[^/]+$/ },
+  { method: "GET",  path: /^\/api\/get-run-data\/[^/]+$/ },
+  { method: "GET",  path: /^\/api\/line-tv\// },
+];
+
 const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
@@ -883,6 +893,14 @@ const authenticateToken = async (req, res, next) => {
         return res.status(401).json({ success: false, error: "User not found or inactive" });
       }
       req.user = applyRoleAlias(userResult.rows[0]);
+      if (req.user.role === TV_ROLE) {
+        const path = req.originalUrl.split("?")[0];
+        const ok = TV_ALLOWED.some((r) => r.method === req.method && r.path.test(path));
+        if (!ok) {
+          securityLog("tv_role_blocked", req, { username: req.user.username, method: req.method });
+          return res.status(403).json({ success: false, error: "Access denied. Insufficient permissions." });
+        }
+      }
       next();
     } finally {
       client.release();
@@ -910,7 +928,7 @@ const allowRoles = (...roles) => (req, res, next) => {
 // Only a master (the CEO, or factory_director through the role alias) may create,
 // edit or deactivate master / factory_director accounts, or give anyone those roles.
 const PRIVILEGED_ROLES = ["master", "factory_director","admin"];
-const USER_ROLES = ["engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "master", "factory_director", "admin"];
+const USER_ROLES = ["engineer", "line_leader", "supervisor",  "skyrina", "master", "factory_director", "admin"];
 const canManagePrivileged = (req) => Boolean(req.user && ["master", "admin"].includes(req.user.role));
 const denyPrivileged = (req, res, action, extra = {}) => {
   logger.warn("Blocked: non-master tried to manage a privileged account", { by: req.user?.username, action, ...extra });
@@ -1092,6 +1110,15 @@ app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
+// TV screens call this every hour to stay logged in 24/7
+app.post("/api/refresh-token", authenticateToken, (req, res) => {
+  const token = jwt.sign(
+    { id: req.user.id, username: req.user.username, role: req.user.actual_role },
+    JWT_SECRET,
+    { expiresIn: "72h" } // safety margin for reboots or network outages
+  );
+  res.json({ success: true, token });
+});
 
 // ======================================================================
 // 🔒 PLAN BOARD LOCK
@@ -1296,7 +1323,7 @@ registerSupermarketPlan(app, {
   authenticateToken,
   pool,
   setSchema,
-  publisherRoles: ["planner", "supervisor", "master", "soporte_it", "skyrina", "admin","supermarcado"],
+  publisherRoles: ["planner", "supervisor", "master",  "skyrina", "admin","supermarcado"],
 });
 
 const registerEfficiencyPermissions = require("./efficiency-permissions");
@@ -1779,7 +1806,7 @@ function ensureEffReasonColumns(client) {
 app.get(
   "/api/lineleader/efficiency-reason/:runId",
   authenticateToken,
-  allowRoles("line_leader", "engineer", "supervisor", "skyrina", "master", "soporte_it"),
+  allowRoles("line_leader", "engineer", "supervisor", "skyrina", "master"),
   validate([param("runId").isInt({ gt: 0 }).withMessage("Valid run ID required")]),
   async (req, res, next) => {
     const client = await pool.connect();
@@ -1932,7 +1959,7 @@ app.get(
 const requireVerificador = (req, res, next) => {
   const allowed = [
     "verificador", "planner", "engineer", "supervisor",
-    "soporte_it", "skyrina", "master", "inspector",
+     "skyrina", "master", "inspector",
     "quality_head", "admin",
   ];
   if (!allowed.includes(req.user?.role)) {
@@ -4879,7 +4906,7 @@ app.delete("/api/run/:runId", authenticateToken, async (req, res) => {
     const run = runCheck.rows[0];
 
     // Check if user has permission to delete (engineer, supervisor, master, soporte_it)
-    const allowedRoles = ['engineer', 'supervisor', 'master', 'soporte_it'];
+    const allowedRoles = ['engineer', 'supervisor', 'master'];
     if (!allowedRoles.includes(req.user.role)) {
       await client.query("ROLLBACK");
       return res.status(403).json({
@@ -6153,7 +6180,7 @@ app.get("/api/run-capacity-history/:runId", authenticateToken, async (req, res) 
 
 // Helper middleware for quality inspector access
 const requireQualityInspector = (req, res, next) => {
-  const allowedRoles = ['quality_inspector', 'engineer', 'supervisor', 'soporte_it', 'master','quality_head'];
+  const allowedRoles = ['quality_inspector', 'engineer', 'supervisor', 'master','quality_head'];
   if (!allowedRoles.includes(req.user?.role)) {
     return res.status(403).json({
       success: false,
@@ -6718,7 +6745,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
   try {
     await setSchema(client);
 
-    if (!['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'quality_inspector', 'quality_head'].includes(req.user?.role)) {
+    if (!['skyrina', 'master', 'engineer', 'supervisor', 'quality_inspector', 'quality_head'].includes(req.user?.role)) {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
 
@@ -6930,7 +6957,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
 // --------------------------------------------------------------
 
 const requireSupervisor = (req, res, next) => {
-  if (req.user.role !== "supervisor" && req.user.role !== "soporte_it" && req.user.role !== "skyrina" 
+  if (req.user.role !== "supervisor" && req.user.role !== "skyrina" 
     && req.user.role !== "master" && req.user.role !== "planner") {
     return res.status(403).json({
       success: false,
@@ -8459,7 +8486,7 @@ app.get("/api/skyrina/style-performance", authenticateToken, async (req, res) =>
       });
     }
     
-    if (!['skyrina', 'engineer', 'supervisor', 'soporte_it', 'master'].includes(req.user.role)) {
+    if (!['skyrina', 'engineer', 'supervisor',  'master'].includes(req.user.role)) {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
     
@@ -10678,7 +10705,7 @@ app.get("/api/supervisor/assignments", authenticateToken, requireSupervisor, asy
 // ========== PLANNER: EDIT OPERATION (SEWED QTY) ==========
 
 const requirePlanner = (req, res, next) => {
-  const allowedRoles = ["planner", "engineer", "supervisor", "soporte_it", "skyrina", "master", "inspector",'verificador'];
+  const allowedRoles = ["planner", "engineer", "supervisor", "skyrina", "master", "inspector",'verificador'];
   if (!allowedRoles.includes(req.user?.role)) {
     return res.status(403).json({
       success: false,
@@ -10882,7 +10909,7 @@ app.post("/api/planner/update-sewed/:runId", authenticateToken, requirePlanner, 
 // ========== MASTER CODE MANAGEMENT ==========
 
 const requireMerchantAccess = (req, res, next) => {
-  const allowedRoles = ['engineer', 'supervisor', 'master', 'soporte_it', 'skyrina', 'merchant', 'admin', 'planner'];
+  const allowedRoles = ['engineer', 'supervisor', 'master',  'skyrina', 'merchant', 'admin', 'planner'];
   if (!allowedRoles.includes(req.user?.role)) {
     return res.status(403).json({
       success: false,
@@ -11470,7 +11497,7 @@ app.put("/api/master-codes/:id", authenticateToken, requireMerchantAccess, async
 // ----------------------------------------------------------------------
 // 18. USER MANAGEMENT
 // ----------------------------------------------------------------------
-app.get("/api/users", authenticateToken, allowRoles("engineer", "supervisor", "soporte_it", "skyrina","master"), async (req, res, next) => {
+app.get("/api/users", authenticateToken, allowRoles("engineer", "supervisor",  "skyrina","master"), async (req, res, next) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
@@ -11478,7 +11505,7 @@ app.get("/api/users", authenticateToken, allowRoles("engineer", "supervisor", "s
       `SELECT id, username, role, line_number, full_name, is_active, created_at, updated_at
        FROM users
        ORDER BY
-         CASE role WHEN 'engineer' THEN 1 WHEN 'supervisor' THEN 2 WHEN 'line_leader' THEN 3 WHEN 'soporte_it' THEN 4 WHEN 'skyrina' THEN 5 WHEN 'master' THEN 6 ELSE 7 END,
+         CASE role WHEN 'engineer' THEN 1 WHEN 'supervisor' THEN 2 WHEN 'line_leader' THEN 3 WHEN 'skyrina' THEN 4 WHEN 'master' THEN 5 ELSE 6 END,
          line_number NULLS FIRST,
          username`
     );
@@ -11497,7 +11524,7 @@ app.post(
   validate([
     body("username").notEmpty().withMessage("Username required"),
     body("password").isLength({ min: 8 }).withMessage("Password must be at least 8 characters"),
-    body("role").isIn(["engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "master", "factory_director"]).withMessage("Invalid role"),
+    body("role").isIn(["engineer", "line_leader", "supervisor", "skyrina", "master", "factory_director"]).withMessage("Invalid role"),
     body("line_number").if(body("role").equals("line_leader")).isInt({ min: 1, max: 26 }).withMessage("Line number 1-26 required for line leader"),
   ]),
   async (req, res, next) => {
