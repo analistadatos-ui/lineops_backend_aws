@@ -23,6 +23,10 @@
 //     lo asignado). Esas casillas se liquidan igual que settle-day: se bajan a
 //     lo que SI se cosio y quedan 'completed'; el saldo vuelve a la bolsa y de
 //     ahi sale para la casilla urgente. Lo que sobre se queda en la bolsa.
+//   • Tambien se pueden ADELANTAR piezas de casillas FUTURAS de la orden
+//     destino (de mañana en adelante, aunque esten en semanas bloqueadas): se
+//     quita de esas casillas SOLO lo que falta para el cambio; si una queda en
+//     0 se borra. Las casillas futuras quedan en la bitacora (pulled_future).
 //   • MOTIVO obligatorio. Todo queda en plan_urgent_changes (quien, cuando,
 //     de que a que y por que), y el tablero marca la casilla con ⚡.
 //   • El candado de TODO el tablero (plan_board_lock) SI se respeta: la ruta
@@ -126,6 +130,8 @@ async function initSchema({ pool, setSchema }) {
     await client.query("ALTER TABLE plan_urgent_changes ADD COLUMN IF NOT EXISTS target_qty NUMERIC(12,2);");
     // Saldos de dias pasados que se liquidaron para tomar sus piezas.
     await client.query("ALTER TABLE plan_urgent_changes ADD COLUMN IF NOT EXISTS settled_balances JSONB NOT NULL DEFAULT '[]';");
+    // Casillas futuras de la orden destino de las que se adelantaron piezas.
+    await client.query("ALTER TABLE plan_urgent_changes ADD COLUMN IF NOT EXISTS pulled_future JSONB NOT NULL DEFAULT '[]';");
     await client.query("CREATE INDEX IF NOT EXISTS idx_plan_urgent_changes_unseen ON plan_urgent_changes(created_at DESC) WHERE ceo_seen_at IS NULL;");
     await client.query("CREATE INDEX IF NOT EXISTS idx_plan_urgent_changes_day ON plan_urgent_changes(assigned_date);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_plan_urgent_changes_target ON plan_urgent_changes(target_assignment_id);");
@@ -212,6 +218,46 @@ async function settlePastCell(client, { workOrderId, lineNo, date, produced }) {
   const del = parts.filter((x) => x.keep <= 0).map((x) => x.id);
   if (del.length) await client.query("DELETE FROM line_assignments WHERE id = ANY($1)", [del]);
   return { balance, assigned, colors: parts.map((r) => r.color).filter(Boolean) };
+}
+
+// Adelanta piezas de UNA casilla FUTURA (orden + linea + dia > hoy): le quita
+// hasta `need` piezas, primero de las filas del color destino y luego de las
+// demas (la mas grande primero). Filas en 0 se borran. Devuelve lo tomado.
+async function pullFutureCell(client, { workOrderId, lineNo, date, need, preferColor }) {
+  const cell = await client.query(
+    `SELECT id, color, assigned_quantity
+       FROM line_assignments
+      WHERE work_order_id = $1 AND line_no = $2 AND assigned_date = $3::date
+        AND assigned_date > CURRENT_DATE
+        AND status NOT IN ('cancelled', 'rejected', 'completed')
+      ORDER BY id
+      FOR UPDATE`,
+    [workOrderId, String(lineNo), date]
+  );
+  const parts = cell.rows.map((r) => ({ id: r.id, color: r.color, qty: Number(r.assigned_quantity) || 0 }));
+  const assigned = parts.reduce((t, r) => t + r.qty, 0);
+  if (!parts.length || assigned <= 0) return { assigned: 0, taken: 0, emptied: false, colors: [] };
+  const pc = normColor(preferColor);
+  parts.sort((x, y) =>
+    Number(!!pc && normColor(y.color) === pc) - Number(!!pc && normColor(x.color) === pc) || y.qty - x.qty);
+  let left = Math.max(Math.floor(Number(need) || 0), 0);
+  let taken = 0;
+  const colors = [];
+  for (const r of parts) {
+    if (left <= 0) break;
+    const take = Math.min(r.qty, left);
+    if (take <= 0) continue;
+    const keep = n2(r.qty - take);
+    if (keep > 0) {
+      await client.query("UPDATE line_assignments SET assigned_quantity = $2, updated_at = now() WHERE id = $1", [r.id, keep]);
+    } else {
+      await client.query("DELETE FROM line_assignments WHERE id = $1", [r.id]);
+    }
+    taken += take;
+    left -= take;
+    if (r.color) colors.push(normColor(r.color));
+  }
+  return { assigned, taken: n2(taken), emptied: n2(assigned - taken) <= 0, colors };
 }
 
 /**
@@ -304,6 +350,7 @@ function registerPlanUrgentChanges(app, deps) {
         reason: r.reason,
         warnings: r.warnings || [],
         settledBalances: r.settled_balances || [],
+        pulledFuture: r.pulled_future || [],
       },
     };
   };
@@ -319,7 +366,7 @@ function registerPlanUrgentChanges(app, deps) {
                 to_char(week_start, 'YYYY-MM-DD') AS week_start,
                 source_work_order_no, source_style, source_color, source_qty_after, moved_qty, target_qty,
                 target_work_order_no, target_style, target_color, reason, warnings,
-                settled_balances, changed_by_name, created_at, ceo_seen_at
+                settled_balances, pulled_future, changed_by_name, created_at, ceo_seen_at
            FROM plan_urgent_changes
           ORDER BY created_at DESC
           LIMIT $1`,
@@ -444,6 +491,55 @@ function registerPlanUrgentChanges(app, deps) {
     }
   });
 
+  // ---- GET /api/line-assignments/urgent-future-cells?days=180&workOrderId=N
+  // Casillas FUTURAS (de mañana en adelante) de ordenes activas, una fila por
+  // orden + linea + dia. El modal las ofrece para ADELANTAR piezas a la casilla
+  // urgente cuando la orden destino ya no tiene piezas libres.
+  app.get("/api/line-assignments/urgent-future-cells", authenticateToken, async (req, res) => {
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 180, 1), 366);
+    const woId = req.query.workOrderId == null || req.query.workOrderId === "" ? null : parseInt(req.query.workOrderId, 10);
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const { rows } = await client.query(
+        `SELECT la.work_order_id, la.line_no,
+                to_char(la.assigned_date, 'YYYY-MM-DD') AS assigned_date,
+                SUM(la.assigned_quantity)::numeric AS assigned,
+                ARRAY_AGG(la.id ORDER BY la.id) AS assignment_ids,
+                COALESCE(ARRAY_AGG(DISTINCT UPPER(TRIM(la.color))) FILTER (WHERE la.color IS NOT NULL AND TRIM(la.color) <> ''), ARRAY[]::text[]) AS colors,
+                BOOL_OR(la.status = 'released' OR la.line_run_id IS NOT NULL) AS sent
+           FROM line_assignments la
+           JOIN work_orders w ON w.id = la.work_order_id
+          WHERE la.assigned_date > CURRENT_DATE
+            AND la.assigned_date <= CURRENT_DATE + $1::int
+            AND la.status NOT IN ('cancelled', 'rejected', 'completed')
+            AND COALESCE(w.status, '') NOT IN ('completed', 'cancelled', 'canceled', 'closed')
+            AND ($2::bigint IS NULL OR la.work_order_id = $2::bigint)
+          GROUP BY la.work_order_id, la.line_no, la.assigned_date
+         HAVING SUM(la.assigned_quantity) > 0
+          ORDER BY la.assigned_date, la.line_no`,
+        [days, Number.isInteger(woId) ? woId : null]
+      );
+      res.json({
+        success: true,
+        rows: rows.map((r) => ({
+          work_order_id: Number(r.work_order_id),
+          line_no: r.line_no,
+          assigned_date: r.assigned_date,
+          assigned: Number(r.assigned) || 0,
+          assignment_ids: r.assignment_ids || [],
+          colors: r.colors || [],
+          sent: !!r.sent,
+        })),
+      });
+    } catch (err) {
+      console.error("\u274c Error en urgent-future-cells:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
   // ---- POST /api/line-assignments/urgent-change ---------------------------
   // Body:
   //   assignmentId   casilla (line_assignments.id) en una semana bloqueada
@@ -455,6 +551,8 @@ function registerPlanUrgentChanges(app, deps) {
   //   reason         motivo (obligatorio)
   //   balanceCells   [{ lineNo, date }] casillas PASADAS de la orden destino
   //                  con saldo: se liquidan y su saldo se usa para el cambio.
+  //   futureCells    [{ lineNo, date }] casillas FUTURAS (> hoy) de la orden
+  //                  destino: se les quita solo lo que falte (en ese orden).
   //   sendToLines    true/false: crear el borrador para el lider de linea.
   //                  Default: true si la casilla original ya se habia enviado.
   app.post("/api/line-assignments/urgent-change", authenticateToken, async (req, res) => {
@@ -588,12 +686,45 @@ function registerPlanUrgentChanges(app, deps) {
       // ---- la orden destino debe tener piezas en la bolsa --------------------
       const sameOrder = targetWoId === Number(src.work_order_id);
       const target = Number(tgt.total_to_produce) || Number(tgt.quantity) || 0;
-      const assignedAll = await assignedActive(client, targetWoId);
-      const orderFree = n2(target - (sameOrder ? assignedAll - qty : assignedAll));
+      const freeNow = async () => {
+        const assignedAll = await assignedActive(client, targetWoId);
+        return n2(target - (sameOrder ? assignedAll - qty : assignedAll));
+      };
+
+      // ---- adelantar piezas de casillas FUTURAS de la orden destino ----------
+      // Solo lo que falte despues de la bolsa y los saldos: el resto del plan
+      // futuro se queda como esta.
+      const pulled = [];
+      const wantedFut = Array.isArray(body.futureCells) ? body.futureCells.slice(0, 60) : [];
+      if (wantedFut.length && target > 0) {
+        let need = Math.ceil(qty - (await freeNow()));
+        const seenF = new Set();
+        for (const c of wantedFut) {
+          if (need <= 0) break;
+          const lineNo = String(c?.lineNo ?? ""), date = String(c?.date || "").slice(0, 10);
+          if (!lineNo || !/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new HttpError(400, "Casilla futura inválida.");
+          const k = `${lineNo}|${date}`;
+          if (seenF.has(k)) continue;
+          seenF.add(k);
+          if (lineNo === String(src.line_no) && date === src.day) continue; // la casilla urgente no
+          const r = await pullFutureCell(client, { workOrderId: targetWoId, lineNo, date, need, preferColor: newColor });
+          if (r.assigned === 0) {
+            throw new HttpError(409, `La casilla Línea ${lineNo} ${date} de ${tgt.work_order_no} ya no tiene piezas (o ya no es futura). Recargue el tablero.`);
+          }
+          if (r.taken <= 0) continue;
+          need -= r.taken;
+          pulled.push({ lineNo, date, assigned: r.assigned, taken: r.taken, left: n2(r.assigned - r.taken), colors: r.colors });
+          if (r.emptied && typeof cleanupOrphanDraftRuns === "function") {
+            await cleanupOrphanDraftRuns(client, lineNo, date);
+          }
+        }
+      }
+
+      const orderFree = await freeNow();
       if (target > 0 && qty > orderFree) {
         throw new HttpError(400,
           `La orden ${tgt.work_order_no} solo tiene ${Math.max(Math.floor(orderFree), 0)} pzas disponibles` +
-          (settled.length ? " (incluyendo los saldos elegidos)." : ". Elija saldos de días pasados para tomar más."),
+          (settled.length || pulled.length ? " (incluyendo los saldos y días futuros elegidos)." : ". Elija saldos de días pasados o días futuros para tomar más."),
           { maxQuantity: Math.max(Math.floor(orderFree), 0) });
       }
       const warnings = [];
@@ -640,6 +771,10 @@ function registerPlanUrgentChanges(app, deps) {
           `El estilo ${tgtStyle || "nuevo"} tarda más: en el tiempo de ${Math.round(qty)} pzas de ${srcStyle || "la orden actual"} ` +
           `caben ${placeQty} pzas.`
         );
+      }
+
+      if (pulled.length && placeQty < qty) {
+        warnings.push(`Se adelantaron piezas de días futuros pero caben ${placeQty}: ${Math.round(qty - placeQty)} pzas quedan sin asignar en la orden ${tgt.work_order_no}.`);
       }
 
       // ---- 3. poner las piezas del destino -----------------------------------
@@ -717,13 +852,13 @@ function registerPlanUrgentChanges(app, deps) {
            (change_type, line_no, assigned_date, week_start, source_assignment_id, source_work_order_id,
             source_work_order_no, source_style, source_color, source_qty_before, source_qty_after, moved_qty,
             target_assignment_id, target_work_order_id, target_work_order_no, target_style, target_color,
-            reason, warnings, changed_by, changed_by_name, settled_balances, target_qty)
-         VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22::jsonb,$23)
+            reason, warnings, changed_by, changed_by_name, settled_balances, target_qty, pulled_future)
+         VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22::jsonb,$23,$24::jsonb)
          RETURNING id, created_at`,
         [changeType, String(src.line_no), src.day, weekStart, src.id, src.work_order_id,
          src.work_order_no, srcStyle || null, srcColor || null, srcQty, srcLeft, qty,
          newRow?.id || null, targetWoId, tgt.work_order_no, tgtStyle || null, newColor || null,
-         reason, JSON.stringify(warnings), req.user?.id ?? null, who, JSON.stringify(settled), placeQty]
+         reason, JSON.stringify(warnings), req.user?.id ?? null, who, JSON.stringify(settled), placeQty, JSON.stringify(pulled)]
       )).rows[0];
 
       await client.query("COMMIT");
@@ -739,13 +874,15 @@ function registerPlanUrgentChanges(app, deps) {
         assignment: newRow,
         sentToLines: !!runId,
         settledBalances: settled,
+        pulledFuture: pulled,
         warnings,
         message:
           `⚡ ${changeType === "style" ? "Estilo" : "Color"} cambiado en Línea ${src.line_no} (${src.day}): ` +
           `${src.work_order_no}${srcColor ? ` ${srcColor}` : ""} → ${tgt.work_order_no}${newColor ? ` ${newColor}` : ""}, ` +
           (placeQty !== qty ? `${Math.round(qty)} pzas quitadas → ${Math.round(placeQty)} pzas puestas.` : `${Math.round(qty)} pzas.`) +
           (srcLeft > 0 ? ` Quedan ${Math.round(srcLeft)} pzas de la orden original.` : "") +
-          (settled.length ? ` Se liquidaron ${settled.length} día(s) pasados (${Math.round(settled.reduce((t, x) => t + x.balance, 0))} pzas de saldo).` : ""),
+          (settled.length ? ` Se liquidaron ${settled.length} día(s) pasados (${Math.round(settled.reduce((t, x) => t + x.balance, 0))} pzas de saldo).` : "") +
+          (pulled.length ? ` Se adelantaron ${Math.round(pulled.reduce((t, x) => t + x.taken, 0))} pzas de ${pulled.length} día(s) futuros (${pulled.map((x) => `L${x.lineNo} ${x.date}`).join(", ")}).` : ""),
       });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
