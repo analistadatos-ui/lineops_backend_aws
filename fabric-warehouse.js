@@ -1402,6 +1402,47 @@ function registerFabricWarehouse(app, deps) {
     });
   }));
 
+  // Move rolls between containers with the scanner (Ubicaciones › Mover rollos).
+  //   1. Scan the DESTINATION container (F12) — or its spot (A05).
+  //   2. Scan rolls: each one moves there right away (in_stock → relocated,
+  //      assigned → its reservation changes).
+  // Body: { raw, boxId? }  → { kind: "box", box } | { kind: "roll", roll, from, box, duplicate? }
+  // A container/spot scanned at any time becomes the new destination.
+  app.post(`${BASE}/rolls/move-scan`, authenticateToken, withClient(async (req, res, client) => {
+    const raw = String(req.body?.raw ?? "");
+    if (!cleanScan(raw)) return fail(res, 400, "No se pudo leer el código.");
+
+    const hit = await classifyCode(client, raw, null);
+    if (hit?.kind === "invalid_box") return fail(res, 409, hit.error);
+    if (hit?.kind === "box" || hit?.kind === "location") {
+      const B = hit.kind === "box" ? hit.box : hit.location.box_id ? await boxInfo(client, hit.location.box_id) : null;
+      if (!B) return fail(res, 409, `El lugar ${hit.location.code} no tiene contenedor. Escanee el contenedor de destino.`);
+      if (!B.location_id) {
+        return fail(res, 409, `${B.code} no tiene lugar registrado. Regístrelo en «Con escáner» (lugar → contenedor) antes de meterle rollos.`);
+      }
+      return res.json({ success: true, kind: "box", box: B });
+    }
+
+    const boxId = parseInt(req.body?.boxId, 10);
+    if (!boxId) return fail(res, 400, "Escanee primero el contenedor de destino (F01) o su lugar (A01).", { code: "no_box" });
+
+    const f = await findScannedRoll(client, raw);
+    if (f.error) return fail(res, f.status || 400, f.error);
+    if (!f.rows.length) return fail(res, 404, `No existe el rollo ${f.scan.roll_no}.`);
+    const roll = f.rows.find((r) => ["in_stock", "assigned"].includes(r.status)) || f.rows[0];
+    if (String(roll.box_id) === String(boxId) && ["in_stock", "assigned"].includes(roll.status)) {
+      return res.json({ success: true, kind: "roll", duplicate: true, roll, box: await boxInfo(client, boxId) });
+    }
+    if (roll.status === "at_inspection") return fail(res, 409, `${roll.roll_no} está en inspección. Muévalo cuando regrese.`);
+    if (["arrived", "temporary"].includes(roll.status)) return fail(res, 409, `${roll.roll_no} aún no se guarda. Guárdelo en Recepción.`);
+    if (!["in_stock", "assigned"].includes(roll.status)) return fail(res, 409, `${roll.roll_no} no está en inventario (estado «${roll.status}»).`);
+
+    const from = { box_id: roll.box_id || null, box_code: roll.box_code || null, location_code: roll.location_code || null };
+    await assignRolls(client, { ids: [roll.id], boxId, userId: req.user?.id });
+    const fresh = await client.query(`${ROLL_SELECT} WHERE r.id = $1`, [roll.id]);
+    res.json({ success: true, kind: "roll", roll: fresh.rows[0], from, box: await boxInfo(client, boxId) });
+  }));
+
   // ======================================================================
   //  SCANNING: Lugar (A01) → Contenedor (F33) → Rollos
   // ======================================================================
