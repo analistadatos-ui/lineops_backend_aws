@@ -222,6 +222,37 @@ const LIST_FORMATS = [
     fixed: { width_unit: "cm", weight_unit: "KG" },
     metersToYards: true,
   },
+  // Packing list of Sabrina Fashion (hoja «Roll no. list»). Two header rows:
+  //   Description | LOT NO. | R/NO. | ROLLS | QTY   | Net Wt. | Gross Wt.
+  //   PO NO. | ITEM NO: | COLOR |       |       | METER |
+  // Rolls come in groups: the first roll of a group carries PO, item, color and
+  // lot; the next rolls leave them empty (they repeat the group's). The lines
+  // above a group describe it: composition and «WIDTH: 152 CM».
+  //   PO NO. → PO · ITEM NO → código de tela · COLOR → color · LOT NO. → lote
+  //   R/NO. → rollo · QTY (METER) → metros (+ yardas) · Net Wt. → peso (KG)
+  //   descripción → composición · WIDTH → ancho (cm) · nombre de tela → LEGACY
+  {
+    key: "sabrina_pl",
+    label: "Packing list Sabrina (Roll no. list)",
+    headerRows: 2,
+    detect: ["R/NO.", "LOT NO.", "PO NO.", "ITEM NO:", "COLOR", "Net Wt."],
+    columns: {
+      po_number: "PO NO.",
+      fabric_item_number: "ITEM NO:",
+      color: "COLOR",
+      lot: "LOT NO.",
+      roll_no: "R/NO.",
+      meters: ["QTY", "METER"],
+      weight: "Net Wt.",
+    },
+    required: ["PO NO.", "ITEM NO:", "COLOR", "LOT NO.", "R/NO.", "QTY", "Net Wt."],
+    carry: ["po_number", "fabric_item_number", "color", "lot"],
+    groupBy: ["po_number", "fabric_item_number"],
+    descriptionColumn: "fabric_item_number",
+    // Sabrina only sells us one fabric, so its name is always LEGACY.
+    fixed: { weight_unit: "KG", fabric_name: "LEGACY" },
+    metersToYards: true,
+  },
 ];
 const FIELD_BY_KEY = new Map(FIELDS.map((f) => [f.key, f]));
 
@@ -241,6 +272,55 @@ function rollFromFormat(fmt, col, cells) {
   if (fmt.metersToYards && out.yards == null && out.meters != null) out.yards = Math.round((out.meters / 0.9144) * 100) / 100;
   return out;
 }
+
+// Rows of a grouped list (fmt.carry): a roll row has a roll number; the group's
+// values (PO, item, color, lot) are repeated down until the next group, and the
+// text lines above a group become its composition / width.
+// → [{ i, r }] in sheet order (i = index in rows)
+function readGroupedRows(fmt, rows, start, col) {
+  const out = [];
+  const descIdx = col[fmt.descriptionColumn];
+  let carried = {};
+  let pending = [];   // text lines since the last roll
+  let groupDesc = { composition: null, width: null };
+  for (let i = start; i < rows.length; i++) {
+    const cells = rows[i];
+    if (!cells.some(filled)) continue;
+    const first = String(cells.find(filled) ?? "").trim();
+    const r = rollFromFormat(fmt, col, cells);
+    // Totals, «SAY TOTAL …» and repeated headers end the group.
+    if (/^(total|say total|marks)/i.test(first) || normKey(r.roll_no) === normKey(fmt.columns.roll_no)) {
+      carried = {}; pending = []; continue;
+    }
+    // A new PO or item starts a group; a new color or lot alone only changes that value.
+    const startsGroup = (fmt.groupBy || fmt.carry).some((k) => r[k] != null);
+    if (!r.roll_no) {
+      // Description lines sit in the item column, above the group.
+      const text = descIdx != null ? str(cells[descIdx]) : null;
+      if (text && !/^#/.test(text)) pending.push(text);
+      continue;
+    }
+    if (startsGroup) {
+      carried = {};
+      const width = pending.map((t) => /width\s*:?\s*([\d.,]+)\s*(cm|mm|in|inch|\")?/i.exec(t)).find(Boolean);
+      const comp = pending.filter((t) => !/^(width|weight|hs code)\b/i.test(t.trim()));
+      groupDesc = {
+        composition: comp.length ? comp.join(" ").replace(/\s+/g, " ").trim() : null,
+        width: width ? width[1] : null,
+        width_unit: width ? (width[2] || "cm").toLowerCase().replace('"', "in") : null,
+      };
+      pending = [];
+    }
+    for (const k of fmt.carry) {
+      if (r[k] != null) carried[k] = r[k];
+      else r[k] = carried[k] ?? null;
+    }
+    if (r.composition == null) r.composition = groupDesc.composition;
+    if (r.width == null && groupDesc.width) { r.width = groupDesc.width; r.width_unit = r.width_unit || groupDesc.width_unit; }
+    out.push({ i, r });
+  }
+  return out;
+}
 // Column sizes of fabric_rolls: longer text is cut so one cell can't fail the whole file.
 const IMPORT_MAX_LEN = {
   po_number: 80, supplier: 150, supplier_code: 60, color: 80, lot: 80, width: 40, width_unit: 20,
@@ -258,11 +338,12 @@ function readImportSheet(matrix, firstRow = 1) {
   // A supplier layout (LIST_FORMATS) is recognised by its own header row.
   let fmt = null;
   let head = -1;
+  const namesAt = (i, n) => new Set(rows.slice(i, i + n).flatMap((r) => r.map((c) => normKey(c))).filter(Boolean));
   for (let i = 0; i < Math.min(rows.length, 20) && !fmt; i++) {
-    const names = new Set(rows[i].map((c) => normKey(c)).filter(Boolean));
-    const hit = LIST_FORMATS.find((f) => f.detect.every((d) => names.has(normKey(d))));
+    const hit = LIST_FORMATS.find((f) => f.detect.every((d) => namesAt(i, f.headerRows || 1).has(normKey(d))));
     if (hit) { fmt = hit; head = i; }
   }
+  const headRows = fmt?.headerRows || 1;
 
   // Header row: among the first 20 rows, the one that names the most fields.
   let best = 0;
@@ -281,13 +362,21 @@ function readImportSheet(matrix, firstRow = 1) {
     };
   }
 
-  const header = rows[head].map((c) => (c == null ? "" : String(c).trim()));
+  // With two header rows, a column's name is both cells joined («QTY METER»).
+  const width = Math.max(...rows.slice(head, head + headRows).map((r) => r.length));
+  const header = Array.from({ length: width }, (_, c) => rows.slice(head, head + headRows)
+    .map((r) => (r[c] == null ? "" : String(r[c]).trim())).filter(Boolean).join(" "));
   const col = {};
   let missing;
   if (fmt) {
     const at = new Map();
-    header.forEach((h, i) => { const k = normKey(h); if (k && !at.has(k)) at.set(k, i); });
-    for (const [key, name] of Object.entries(fmt.columns)) if (at.has(normKey(name))) col[key] = at.get(normKey(name));
+    for (let r = head; r < head + headRows; r++) {
+      (rows[r] || []).forEach((h, i) => { const k = normKey(h); if (k && !at.has(k)) at.set(k, i); });
+    }
+    for (const [key, names] of Object.entries(fmt.columns)) {
+      const hit = [].concat(names).find((n) => at.has(normKey(n)));
+      if (hit) col[key] = at.get(normKey(hit));
+    }
     missing = fmt.required.filter((name) => !at.has(normKey(name)));
   } else {
     header.forEach((h, i) => {
@@ -296,7 +385,7 @@ function readImportSheet(matrix, firstRow = 1) {
     });
     missing = IMPORT_COLUMNS.filter((f) => col[f.key] == null).map((f) => f.label);
   }
-  const headerRow = firstRow + head;
+  const headerRow = firstRow + head + headRows - 1;
   if (missing.length) {
     return {
       status: 422,
@@ -309,15 +398,19 @@ function readImportSheet(matrix, firstRow = 1) {
   const errors = [];
   const duplicates = [];
   const seen = new Map();
-  for (let i = head + 1; i < rows.length; i++) {
+  const start = head + headRows;
+  const candidates = fmt?.carry
+    ? readGroupedRows(fmt, rows, start, col)
+    : rows.map((cells, i) => ({ i, cells })).slice(start).filter((x) => x.cells.some(filled)).map(({ i, cells }) => {
+        const obj = {};
+        for (const [k, idx] of Object.entries(col)) obj[k] = cells[idx];
+        return { i, r: fmt ? rollFromFormat(fmt, col, cells) : normalizeRoll(obj) };
+      });
+  for (const { i, r } of candidates) {
     const cells = rows[i];
-    if (!cells.some(filled)) continue;
     const rowNo = firstRow + i;
-    const obj = {};
-    for (const [k, idx] of Object.entries(col)) obj[k] = cells[idx];
     const raw = {};
     header.forEach((h, idx) => { if (h && filled(cells[idx])) raw[h] = cells[idx]; });
-    const r = fmt ? rollFromFormat(fmt, col, cells) : normalizeRoll(obj);
     if (!r.roll_no) { errors.push({ row: rowNo, error: "Sin número de rollo" }); continue; }
     if (SCI_NUMBER.test(r.roll_no)) {
       errors.push({ row: rowNo, roll_no: r.roll_no, error: "El número de rollo quedó en notación científica. Dé formato de texto a la columna en Excel y guarde de nuevo." });
@@ -1489,7 +1582,8 @@ function registerFabricWarehouse(app, deps) {
     const raw = String(req.body?.raw ?? "");
     if (!cleanScan(raw)) return fail(res, 400, "No se pudo leer el código.");
 
-    const hit = await classifyCode(client, raw, null);
+    // With a destination chosen, rolls are expected: roll A01 wins over spot A01.
+    const hit = await classifyScan(client, raw, null, !!parseInt(req.body?.boxId, 10));
     if (hit?.kind === "invalid_box") return fail(res, 409, hit.error);
     if (hit?.kind === "box" || hit?.kind === "location") {
       const B = hit.kind === "box" ? hit.box : hit.location.box_id ? await boxInfo(client, hit.location.box_id) : null;
@@ -1594,6 +1688,23 @@ function registerFabricWarehouse(app, deps) {
       }
     }
     return null;
+  }
+
+  // A plain code like «A01» can be a spot label (division A, spot 01) and also a
+  // roll number: some suppliers (Sabrina) number rolls A01, A02… When the screen
+  // is waiting for rolls (preferRoll), an existing roll with that number wins
+  // over the spot. Labels that say what they are — QR with JSON/URL keys, the
+  // spot's own qr_code text, a container code (F01…) — are always labels.
+  // → the label (box / location / invalid_box), or null = read it as a roll.
+  async function classifyScan(client, raw, expect, preferRoll) {
+    const hit = await classifyCode(client, raw, expect);
+    if (!hit || !preferRoll || hit.kind !== "location") return hit;
+    if (labelCandidates(raw, expect).some((c) => c.kind)) return hit;
+    const whole = cleanScan(raw);
+    const q = await client.query(`SELECT 1 FROM fabric_locations WHERE UPPER(qr_code) = UPPER($1) LIMIT 1`, [whole]);
+    if (q.rows.length) return hit;
+    const f = await findScannedRoll(client, raw);
+    return !f.error && f.rows.length ? null : hit;
   }
 
   // Scanner test: what did the PDA send and what does the system understand?
@@ -1757,7 +1868,8 @@ function registerFabricWarehouse(app, deps) {
   const scanHandler = (mode) => withClient(async (req, res, client) => {
     const raw = str(req.body?.raw);
     if (!raw) return fail(res, 400, "Código vacío.");
-    const hit = await classifyCode(client, raw, req.body?.expect);
+    // With a container chosen, rolls are expected: roll A01 wins over spot A01.
+    const hit = await classifyScan(client, raw, req.body?.expect, !!(req.body?.boxId || req.body?.locationId));
     if (hit) return res.json({ success: true, ...hit });
     const boxId = await boxIdFrom(client, req.body);
     const args = { raw, boxId, allowUnrequested: req.body?.allowUnrequested === true, userId: req.user?.id };
@@ -1997,10 +2109,13 @@ function registerFabricWarehouse(app, deps) {
   app.post(`${BASE}/reception/arrive`, authenticateToken, withClient(async (req, res, client) => {
     const raw = str(req.body?.raw);
     if (!raw) return fail(res, 400, "Código vacío.");
-    const label = await classifyCode(client, raw);
+    // Only rolls are scanned here: roll A01 on a list wins over spot A01.
+    const label = await classifyScan(client, raw, null, true);
     if (label && (label.kind === "box" || label.kind === "location")) {
       const what = label.kind === "box" ? `del contenedor ${label.box.code}` : `del lugar ${label.location.code}`;
-      return fail(res, 409, `Esa es la etiqueta ${what}. Aquí solo se escanean rollos; el contenedor se elige en «Asignar a contenedor».`, { code: "label" });
+      const hint = label.kind === "location" && !labelCandidates(raw, null).some((c) => c.kind)
+        ? ` Si es un rollo con ese número, cargue primero su lista de empaque.` : "";
+      return fail(res, 409, `Esa es la etiqueta ${what}. Aquí solo se escanean rollos; el contenedor se elige en «Asignar a contenedor».${hint}`, { code: "label" });
     }
     const f = await findScannedRoll(client, raw);
     if (f.error) return fail(res, f.status, f.error);
@@ -2096,7 +2211,9 @@ function registerFabricWarehouse(app, deps) {
   app.post(`${BASE}/reception/identify`, authenticateToken, withClient(async (req, res, client) => {
     const raw = str(req.body?.raw);
     if (!raw) return fail(res, 400, "Código vacío.");
-    const label = await classifyCode(client, raw, req.body?.expect);
+    // expect "roll": container and spot are chosen, so roll A01 wins over spot A01.
+    const expect = req.body?.expect === "roll" ? undefined : req.body?.expect;
+    const label = await classifyScan(client, raw, expect, req.body?.expect === "roll");
     if (label) return res.json({ success: true, ...label });
     const f = await findScannedRoll(client, raw);
     if (f.error) return fail(res, f.status, f.error);
@@ -2894,7 +3011,7 @@ function registerFabricWarehouse(app, deps) {
 
     if (step === "roll") {
       const boxId = parseInt(req.body?.boxId, 10);
-      const hit = await classifyCode(client, raw, null);
+      const hit = await classifyScan(client, raw, null, true);
       if (hit?.kind === "location") return res.json({ success: true, kind: "location", location: hit.location });
       if (hit?.kind === "box") {
         if (String(hit.box.id) === String(boxId)) return res.json({ success: true, kind: "box", box: hit.box });
