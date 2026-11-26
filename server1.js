@@ -941,7 +941,12 @@ const allowRoles = (...roles) => (req, res, next) => {
 // Only a master (the CEO, or factory_director through the role alias) may create,
 // edit or deactivate master / factory_director accounts, or give anyone those roles.
 const PRIVILEGED_ROLES = ["master", "factory_director","admin"];
-const USER_ROLES = ["engineer", "line_leader", "supervisor",  "skyrina", "master", "factory_director", "admin"];
+const USER_ROLES = [
+  "engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "master",
+  "factory_director", "admin", "merchant", "quality_inspector", "quality_head",
+  "verificador", "planner", "corte", "supermarcado",
+  "fabric_warehouse", "finished_warehouse",
+];
 const canManagePrivileged = (req) => Boolean(req.user && ["master", "admin"].includes(req.user.role));
 const denyPrivileged = (req, res, action, extra = {}) => {
   logger.warn("Blocked: non-master tried to manage a privileged account", { by: req.user?.username, action, ...extra });
@@ -1149,9 +1154,13 @@ const BACKEND_VERSION = process.env.APP_VERSION || (() => {
   }
 })();
 
-// Public on purpose: returns only the version, so every role (including the TVs) can check it
+// Roles that should see the "nueva versión" bar for this backend deployment. [] = everyone.
+// Set it before a deploy that only affects some roles, and put it back to [] on the next one.
+const UPDATE_ROLES = ["skyrina"];
+
+// Public on purpose: returns only the version and roles, so every role (including the TVs) can check it
 app.get("/api/version", (req, res) => {
-  res.json({ version: BACKEND_VERSION });
+  res.json({ version: BACKEND_VERSION, roles: UPDATE_ROLES });
 });
 
 
@@ -11559,7 +11568,7 @@ app.post(
   validate([
     body("username").notEmpty().withMessage("Username required"),
     body("password").isLength({ min: 8 }).withMessage("Password must be at least 8 characters"),
-    body("role").isIn(["engineer", "line_leader", "supervisor", "skyrina", "master", "factory_director"]).withMessage("Invalid role"),
+    body("role").isIn(USER_ROLES).withMessage("Invalid role"),
     body("line_number").if(body("role").equals("line_leader")).isInt({ min: 1, max: 26 }).withMessage("Line number 1-26 required for line leader"),
   ]),
   async (req, res, next) => {
