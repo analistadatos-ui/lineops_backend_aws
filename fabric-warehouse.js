@@ -663,6 +663,14 @@ async function initSchema({ pool, setSchema }) {
     await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS temp_at TIMESTAMPTZ;");
     await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS temp_by BIGINT;");
     await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_arrived_at ON fabric_rolls(arrived_at);");
+    // Packing list a roll came on (Excel/CSV loaded in Recepción): who sent it
+    // (Skytex, Ray or any other name typed by the user), the file and when.
+    // A roll still to arrive with list_origin set is «por escanear» (its packing
+    // list is here); without it, it is still «en Skytex, esperando llegada».
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS list_origin VARCHAR(60);");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS list_file VARCHAR(150);");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS list_loaded_at TIMESTAMPTZ;");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_list_origin ON fabric_rolls(list_origin);");
     // Databases created before: widen the status check once (it is not rebuilt on every start).
     const chk = await client.query(
       `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
@@ -1889,9 +1897,20 @@ function registerFabricWarehouse(app, deps) {
         WHERE temp_place IS NOT NULL AND temp_at >= now() - interval '90 days'
         GROUP BY temp_place ORDER BY MAX(temp_at) DESC LIMIT 8`
     );
+    // Who sent the packing lists loaded lately (for the origin question and the
+    // filter of the «Lista general»).
+    const origins = await client.query(
+      `SELECT list_origin AS origin,
+              COUNT(*) FILTER (WHERE status IN ('requested','assigned'))::int AS pending,
+              MAX(list_loaded_at) AS last_loaded_at
+         FROM fabric_rolls
+        WHERE list_origin IS NOT NULL AND list_loaded_at >= now() - interval '365 days'
+        GROUP BY list_origin ORDER BY MAX(list_loaded_at) DESC LIMIT 20`
+    );
     res.json({
       success: true, date: day,
       expected: expected.rows, arrived: arrived.rows, temporary: temporary.rows, today: today.rows,
+      origins: origins.rows,
       space: {
         placed: roomy.rows.length,
         withRoom: withRoom.length,
@@ -2075,12 +2094,28 @@ function registerFabricWarehouse(app, deps) {
     });
   }
 
+  // Who sent the packing list. «skytex» / «ray» are written the same way every
+  // time; any other name is kept as typed (max 60 characters).
+  const cleanOrigin = (v) => {
+    const t = String(v ?? "").replace(/\s+/g, " ").trim().slice(0, 60);
+    if (!t) return null;
+    const k = t.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (k === "skytex") return "Skytex";
+    if (k === "ray" || k === "rayfabrics") return "Ray";
+    return t;
+  };
+
+  // Body: { fileName, firstRow, rows, dryRun, origin }. origin is required to save.
   app.post(`${BASE}/reception/import`, authenticateToken, withClient(async (req, res, client) => {
     const fileName = (str(req.body?.fileName) || "archivo").slice(0, 150);
+    const origin = cleanOrigin(req.body?.origin);
     const sheet = readImportSheet(req.body?.rows, Math.max(1, parseInt(req.body?.firstRow, 10) || 1));
     if (sheet.error) return fail(res, sheet.status, sheet.error, sheet.extra || {});
     const dryRun = req.body?.dryRun !== false;
     const userId = req.user?.id ?? null;
+    if (!dryRun && !origin) {
+      return fail(res, 400, "Indique de quién es la lista de empaque (Skytex, Ray u otro).", { code: "origin_required" });
+    }
 
     if (!dryRun) await client.query("BEGIN");
     const plan = await planImport(client, sheet.items, !dryRun);
@@ -2089,6 +2124,7 @@ function registerFabricWarehouse(app, deps) {
 
     const summary = {
       fileName,
+      origin,
       headerRow: sheet.headerRow,
       total: plan.length,
       counts,
@@ -2122,7 +2158,7 @@ function registerFabricWarehouse(app, deps) {
       });
     }
 
-    const reason = `Cargado desde el archivo «${fileName}»`;
+    const reason = `Lista de empaque de ${origin} · archivo «${fileName}»`;
     const vals = (r) => FIELD_KEYS.map((k) => r[k]);
     const sets = (start, fillOnly = false) => FIELD_KEYS
       .map((k, i) => (fillOnly ? `${k} = COALESCE(${k}, $${start + i})` : `${k} = COALESCE($${start + i}, ${k})`))
@@ -2132,28 +2168,33 @@ function registerFabricWarehouse(app, deps) {
 
     for (const p of plan) {
       const { r, key } = p;
-      const rawJson = JSON.stringify({ ...p.raw, _archivo: fileName, _renglon: p.row });
+      const rawJson = JSON.stringify({ ...p.raw, _archivo: fileName, _renglon: p.row, _origen: origin });
       if (p.action === "duplicate") { saved.skipped++; continue; }
       if (p.action === "new") {
-        const cols = ["skytex_key", ...FIELD_KEYS, "raw", "requested_by"];
+        const cols = ["skytex_key", ...FIELD_KEYS, "raw", "requested_by", "list_origin", "list_file"];
         const ins = await client.query(
-          `INSERT INTO fabric_rolls (${cols.join(",")})
-           VALUES (${cols.map((_, i) => `$${i + 1}`).join(",")})
+          `INSERT INTO fabric_rolls (${cols.join(",")}, list_loaded_at)
+           VALUES (${cols.map((_, i) => `$${i + 1}`).join(",")}, now())
            ON CONFLICT (skytex_key) DO NOTHING RETURNING id`,
-          [key, ...vals(r), rawJson, userId]
+          [key, ...vals(r), rawJson, userId, origin, fileName]
         );
         if (!ins.rows.length) { saved.skipped++; continue; }
         p.id = ins.rows[0].id;
         await logMove(client, { rollId: ins.rows[0].id, type: "requested", reference: r.po_number, reason, userId });
       } else if (p.action === "update") {
-        await client.query(`UPDATE fabric_rolls SET ${sets(2)}, updated_at = now() WHERE id = $1`, [p.id, ...vals(r)]);
+        await client.query(
+          `UPDATE fabric_rolls SET ${sets(4)}, list_origin = $2, list_file = $3, list_loaded_at = now(), updated_at = now()
+            WHERE id = $1`,
+          [p.id, origin, fileName, ...vals(r)]
+        );
       } else if (p.action === "rerequest") {
         const upd = await client.query(
           `UPDATE fabric_rolls
-              SET ${sets(4)}, raw = $2, status = 'requested', requested_by = $3, requested_at = now(),
+              SET ${sets(6)}, raw = $2, status = 'requested', requested_by = $3, requested_at = now(),
+                  list_origin = $4, list_file = $5, list_loaded_at = now(),
                   container_id = NULL, location_id = NULL, box_id = NULL, location_set_at = NULL, updated_at = now()
             WHERE id = $1 AND status = 'cancelled' RETURNING id`,
-          [p.id, rawJson, userId, ...vals(r)]
+          [p.id, rawJson, userId, origin, fileName, ...vals(r)]
         );
         if (!upd.rows.length) { saved.skipped++; continue; }
         await logMove(client, { rollId: p.id, type: "requested", reference: r.po_number, reason, userId });
@@ -2163,12 +2204,19 @@ function registerFabricWarehouse(app, deps) {
           `UPDATE fabric_rolls
               SET skytex_key = CASE WHEN EXISTS (SELECT 1 FROM fabric_rolls x WHERE x.skytex_key = $2 AND x.id <> $1)
                                     THEN skytex_key ELSE $2 END,
-                  raw = $3, source = 'skytex', ${sets(4)}, updated_at = now()
+                  raw = $3, source = 'skytex', ${sets(6)},
+                  list_origin = $4, list_file = $5, list_loaded_at = now(), updated_at = now()
             WHERE id = $1`,
-          [p.id, key, rawJson, ...vals(r)]
+          [p.id, key, rawJson, origin, fileName, ...vals(r)]
         );
       } else if (p.action === "received") {
-        await client.query(`UPDATE fabric_rolls SET ${sets(2, true)}, updated_at = now() WHERE id = $1`, [p.id, ...vals(r)]);
+        await client.query(
+          `UPDATE fabric_rolls SET ${sets(4, true)},
+                  list_origin = COALESCE(list_origin, $2), list_file = COALESCE(list_file, $3),
+                  list_loaded_at = COALESCE(list_loaded_at, now()), updated_at = now()
+            WHERE id = $1`,
+          [p.id, origin, fileName, ...vals(r)]
+        );
       }
       saved[p.action]++;
       ids.push(p.id);
@@ -2745,9 +2793,24 @@ function registerFabricWarehouse(app, deps) {
       return res.json({ success: true, kind: "box", box: B });
     }
 
+    // Only the roll: its container and spot are already known.
+    if (step === "roll" && !parseInt(req.body?.boxId, 10)) {
+      const f = await findScannedRoll(client, raw);
+      if (f.error || !f.rows.length) {
+        const hit = await classifyCode(client, raw, null);
+        if (hit?.kind === "location") return fail(res, 409, `${hit.location.code} es un lugar. Escanee la etiqueta del rollo.`);
+        if (hit?.kind === "box" || hit?.kind === "invalid_box") return fail(res, 409, "Eso es un contenedor. Escanee la etiqueta del rollo.");
+        if (f.error) return fail(res, f.status || 400, f.error);
+        return fail(res, 404, `No existe el rollo ${f.scan.roll_no}.`);
+      }
+      const roll = f.rows.find((r) => r.status === "in_stock") || f.rows.find((r) => r.status === "at_inspection") || f.rows[0];
+      if (roll.status === "at_inspection") return fail(res, 409, `${roll.roll_no} ya está en inspección.`);
+      if (roll.status !== "in_stock") return fail(res, 409, `${roll.roll_no} no está en inventario.`);
+      return res.json({ success: true, kind: "roll", roll });
+    }
+
     if (step === "roll") {
       const boxId = parseInt(req.body?.boxId, 10);
-      if (!boxId) return fail(res, 400, "Escanee primero el lugar y el contenedor.");
       const hit = await classifyCode(client, raw, null);
       if (hit?.kind === "location") return res.json({ success: true, kind: "location", location: hit.location });
       if (hit?.kind === "box") {
@@ -3048,6 +3111,18 @@ function registerFabricWarehouse(app, deps) {
                                  AND arrival_date IS NOT NULL AND arrival_date + ${TRANSIT_DAYS} < CURRENT_DATE)::int AS overdue
          FROM fabric_rolls`
     );
+    // The flow on the dashboard: en Skytex (esperando llegada) → por escanear
+    // (packing list loaded) → en inventario → en inspección.
+    const flow = await client.query(
+      `SELECT COUNT(*) FILTER (WHERE status IN ('requested','assigned') AND list_origin IS NULL)::int     AS skytex_rolls,
+              COALESCE(SUM(yards) FILTER (WHERE status IN ('requested','assigned') AND list_origin IS NULL), 0) AS skytex_yards,
+              COUNT(*) FILTER (WHERE status IN ('requested','assigned') AND list_origin IS NOT NULL)::int AS to_scan_rolls,
+              COALESCE(SUM(yards) FILTER (WHERE status IN ('requested','assigned') AND list_origin IS NOT NULL), 0) AS to_scan_yards,
+              COUNT(*) FILTER (WHERE status IN ('arrived','temporary'))::int AS waiting_box_rolls,
+              COALESCE(SUM(yards) FILTER (WHERE status IN ('arrived','temporary')), 0) AS waiting_box_yards
+         FROM fabric_rolls`
+    );
+    const f = flow.rows[0];
     const by = Object.fromEntries(status.rows.map((r) => [r.status, { rolls: r.rolls, yards: Number(r.yards), meters: Number(r.meters) }]));
     const t = Object.fromEntries(today.rows.map((r) => [r.type, r.n]));
     res.json({
@@ -3060,6 +3135,11 @@ function registerFabricWarehouse(app, deps) {
         today: { received: t.received || 0, toInspection: t.inspection_out || 0, returned: t.supplier_return || 0 },
         unrequested: recon.rows[0].unrequested,
         overdue: recon.rows[0].overdue,
+        flow: {
+          skytex: { rolls: f.skytex_rolls, yards: Number(f.skytex_yards) },
+          toScan: { rolls: f.to_scan_rolls, yards: Number(f.to_scan_yards) },
+          waitingBox: { rolls: f.waiting_box_rolls, yards: Number(f.waiting_box_yards) },
+        },
       },
     });
   }));
