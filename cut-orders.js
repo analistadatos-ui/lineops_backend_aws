@@ -786,6 +786,102 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     }
   });
 
+  // Verificación de un GRUPO. El supervisor verifica las marcadas del grupo
+  // (tallas y piezas sumadas de todas las órdenes) y aquí se guarda, en UNA
+  // transacción, el avance de cada orden con la parte que le tocó.
+  //   { members: [{ cutOrderId, markers: [{ id, done, completedAt }], sizeProgress }],
+  //     complete: true | false }
+  // Sólo se toma de `markers` el estado done/completedAt: los paneles y tallas
+  // de cada orden son los que guardó el planner (no se pueden alterar aquí).
+  //   complete: true  -> todas las órdenes del grupo quedan 'completed' (firmadas)
+  //   complete: false -> una orden que estaba 'completed' vuelve a corte
+  app.patch("/api/cut-groups/:id/progress", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      if (!VERIFIER_ROLES.includes(req.user?.role)) {
+        return res.status(403).json({ success: false, error: "Sólo el supervisor puede verificar el corte" });
+      }
+      const groupId = parseInt(req.params.id);
+      const payload = asArr(req.body.members);
+      const complete = req.body.complete === true;
+      const cutNo = (id) => `CORTE-${String(id).padStart(4, "0")}`;
+
+      await client.query("BEGIN");
+      const fail = async (status, error) => {
+        await client.query("ROLLBACK");
+        return res.status(status).json({ success: false, error });
+      };
+      const g = await client.query("SELECT id FROM cut_groups WHERE id = $1 FOR UPDATE", [groupId]);
+      if (!g.rows.length) return fail(404, "Grupo no encontrado");
+
+      const members = await client.query(
+        "SELECT id, status, markers FROM cut_orders WHERE cut_group_id = $1 ORDER BY id FOR UPDATE",
+        [groupId]
+      );
+      const active = members.rows.filter((r) => r.status !== "cancelled");
+      const byId = new Map(payload.map((p) => [Number(p?.cutOrderId), p]));
+      const bad = payload.find((p) => !active.some((r) => Number(r.id) === Number(p?.cutOrderId)));
+      if (bad) return fail(400, `La orden ${bad?.cutOrderId} no pertenece a este grupo`);
+      const missing = active.find((r) => !byId.has(Number(r.id)));
+      if (missing) return fail(400, `Falta ${cutNo(missing.id)} en la verificación del grupo`);
+
+      let groupCut = 0;
+      const updates = active.map((r) => {
+        const p = byId.get(Number(r.id));
+        const flags = new Map(asArr(p.markers).filter((m) => m?.id).map((m) => [m.id, m]));
+        const markers = asArr(r.markers).map((m) => {
+          const f = m?.id ? flags.get(m.id) : null;
+          if (!f) return m;
+          const done = !!f.done;
+          return { ...m, done, completedAt: done ? (m.done && m.completedAt) || f.completedAt || new Date().toISOString() : null };
+        });
+        const sp = asArr(p.sizeProgress);
+        const cut = sp.reduce((s, x) => s + (parseFloat(x?.amountCut) || 0), 0);
+        const rem = sp.reduce((s, x) => {
+          const q = parseFloat(x?.quantity) || 0;
+          const c = parseFloat(x?.amountCut) || 0;
+          const rr = x?.remaining != null && x.remaining !== "" ? parseFloat(x.remaining) : Math.max(q - c, 0);
+          return s + (isNaN(rr) ? 0 : Math.max(rr, 0));
+        }, 0);
+        groupCut += cut;
+        const status = complete ? "completed" : rem <= 0 ? "awaiting_verification" : "in_progress";
+        return { id: r.id, markers, sp, cut, rem, status };
+      });
+      if (complete && groupCut <= 0) {
+        return fail(400, "No hay piezas cortadas registradas: verifica las marcadas antes de cerrar el corte");
+      }
+
+      for (const u of updates) {
+        await client.query(
+          `UPDATE cut_orders
+              SET markers = $1::jsonb,
+                  panels = $2,
+                  size_progress = $3::jsonb,
+                  amount_cut = $4,
+                  remaining_to_cut = $5,
+                  status = $6::varchar,
+                  verified_at = CASE WHEN $6::varchar = 'completed' THEN COALESCE(verified_at, now()) ELSE NULL END,
+                  verified_by = CASE WHEN $6::varchar = 'completed' THEN COALESCE(verified_by, $7) ELSE NULL END,
+                  verification_notes = CASE WHEN $6::varchar = 'completed' THEN NULL ELSE verification_notes END,
+                  updated_at = now()
+            WHERE id = $8`,
+          [JSON.stringify(u.markers), sumMarkerPanels(u.markers), JSON.stringify(u.sp), u.cut, u.rem, u.status, verifierName(req.user), u.id]
+        );
+      }
+      await client.query("COMMIT");
+
+      const updated = await client.query(`${CUT_ORDER_SELECT} WHERE co.cut_group_id = $1 ORDER BY co.id`, [groupId]);
+      res.json({ success: true, cutOrders: updated.rows });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("❌ Error saving cut group progress:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
   // Desagrupar: quita de cada orden las marcadas que venían del grupo. No se
   // permite si alguna ya está verificada (el supervisor debe reabrirla).
   app.delete("/api/cut-groups/:id", authenticateToken, async (req, res) => {
