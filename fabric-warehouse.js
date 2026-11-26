@@ -193,6 +193,54 @@ const IMPORT_COLUMNS = [
   ["import_ref", "Importación"], ["remarks", "Remarks"],
 ].map(([key, label]) => ({ key, label }));
 const IMPORT_MAX_ROWS = 3000;
+
+// Packing lists that come in a supplier's own layout instead of our columns.
+// When the header row has every `detect` column the file is read with this
+// format's map (column header → roll field); the other roll fields stay empty.
+//   Reporte de calidad (Skytex: Folio / Fol Ped / Elemento …):
+//     Fol Ped → PO · SKU → código de tela · Elemento → rollo · Lote → lote
+//     CM → ancho (cm) · GSM → gramaje · Kgs → peso (KG) · Tela → nombre
+//     Variante → color · Mts → metros (yardas = metros / 0.9144)
+const LIST_FORMATS = [
+  {
+    key: "reporte_calidad",
+    label: "Reporte de calidad (Fol Ped · Elemento)",
+    detect: ["Fol Ped", "Elemento", "SKU", "Tela", "Variante"],
+    columns: {
+      po_number: "Fol Ped",
+      fabric_item_number: "SKU",
+      roll_no: "Elemento",
+      lot: "Lote",
+      width: "CM",
+      weight_gsm: "GSM",
+      weight: "Kgs",
+      fabric_name: "Tela",
+      color: "Variante",
+      meters: "Mts",
+    },
+    required: ["Fol Ped", "SKU", "Elemento", "Lote", "CM", "GSM", "Kgs", "Tela", "Variante"],
+    fixed: { width_unit: "cm", weight_unit: "KG" },
+    metersToYards: true,
+  },
+];
+const FIELD_BY_KEY = new Map(FIELDS.map((f) => [f.key, f]));
+
+// The same row as normalizeRoll would give, but from a format's own columns.
+function rollFromFormat(fmt, col, cells) {
+  const out = {};
+  for (const k of FIELD_KEYS) out[k] = null;
+  for (const [key, idx] of Object.entries(col)) {
+    const f = FIELD_BY_KEY.get(key);
+    const v = cells[idx];
+    if (v != null && typeof v === "object") continue;
+    out[key] = f?.type === "number" ? numOrNull(v) : f?.type === "date" ? dateOrNull(v) : str(v);
+  }
+  if (out.roll_no != null || Object.values(out).some((v) => v != null)) {
+    for (const [k, v] of Object.entries(fmt.fixed || {})) if (out[k] == null) out[k] = v;
+  }
+  if (fmt.metersToYards && out.yards == null && out.meters != null) out.yards = Math.round((out.meters / 0.9144) * 100) / 100;
+  return out;
+}
 // Column sizes of fabric_rolls: longer text is cut so one cell can't fail the whole file.
 const IMPORT_MAX_LEN = {
   po_number: 80, supplier: 150, supplier_code: 60, color: 80, lot: 80, width: 40, width_unit: 20,
@@ -207,14 +255,24 @@ function readImportSheet(matrix, firstRow = 1) {
   const rows = Array.isArray(matrix) ? matrix.map((r) => (Array.isArray(r) ? r : [])) : [];
   if (!rows.some((r) => r.some(filled))) return { status: 400, error: "El archivo está vacío." };
 
-  // Header row: among the first 20 rows, the one that names the most fields.
+  // A supplier layout (LIST_FORMATS) is recognised by its own header row.
+  let fmt = null;
   let head = -1;
-  let best = 0;
-  for (let i = 0; i < Math.min(rows.length, 20); i++) {
-    const n = new Set(rows[i].map((c) => ALIAS.get(normKey(c))?.key).filter(Boolean)).size;
-    if (n > best) { best = n; head = i; }
+  for (let i = 0; i < Math.min(rows.length, 20) && !fmt; i++) {
+    const names = new Set(rows[i].map((c) => normKey(c)).filter(Boolean));
+    const hit = LIST_FORMATS.find((f) => f.detect.every((d) => names.has(normKey(d))));
+    if (hit) { fmt = hit; head = i; }
   }
-  if (best < 2) {
+
+  // Header row: among the first 20 rows, the one that names the most fields.
+  let best = 0;
+  if (!fmt) {
+    for (let i = 0; i < Math.min(rows.length, 20); i++) {
+      const n = new Set(rows[i].map((c) => ALIAS.get(normKey(c))?.key).filter(Boolean)).size;
+      if (n > best) { best = n; head = i; }
+    }
+  }
+  if (!fmt && best < 2) {
     const firstFilled = rows.find((r) => r.some(filled)) || [];
     return {
       status: 422,
@@ -225,12 +283,20 @@ function readImportSheet(matrix, firstRow = 1) {
 
   const header = rows[head].map((c) => (c == null ? "" : String(c).trim()));
   const col = {};
-  header.forEach((h, i) => {
-    const f = h && ALIAS.get(normKey(h));
-    if (f && col[f.key] == null) col[f.key] = i;
-  });
+  let missing;
+  if (fmt) {
+    const at = new Map();
+    header.forEach((h, i) => { const k = normKey(h); if (k && !at.has(k)) at.set(k, i); });
+    for (const [key, name] of Object.entries(fmt.columns)) if (at.has(normKey(name))) col[key] = at.get(normKey(name));
+    missing = fmt.required.filter((name) => !at.has(normKey(name)));
+  } else {
+    header.forEach((h, i) => {
+      const f = h && ALIAS.get(normKey(h));
+      if (f && col[f.key] == null) col[f.key] = i;
+    });
+    missing = IMPORT_COLUMNS.filter((f) => col[f.key] == null).map((f) => f.label);
+  }
   const headerRow = firstRow + head;
-  const missing = IMPORT_COLUMNS.filter((f) => col[f.key] == null).map((f) => f.label);
   if (missing.length) {
     return {
       status: 422,
@@ -251,7 +317,7 @@ function readImportSheet(matrix, firstRow = 1) {
     for (const [k, idx] of Object.entries(col)) obj[k] = cells[idx];
     const raw = {};
     header.forEach((h, idx) => { if (h && filled(cells[idx])) raw[h] = cells[idx]; });
-    const r = normalizeRoll(obj);
+    const r = fmt ? rollFromFormat(fmt, col, cells) : normalizeRoll(obj);
     if (!r.roll_no) { errors.push({ row: rowNo, error: "Sin número de rollo" }); continue; }
     if (SCI_NUMBER.test(r.roll_no)) {
       errors.push({ row: rowNo, roll_no: r.roll_no, error: "El número de rollo quedó en notación científica. Dé formato de texto a la columna en Excel y guarde de nuevo." });
@@ -274,8 +340,11 @@ function readImportSheet(matrix, firstRow = 1) {
       extra: { code: "no_rolls", errors: errors.slice(0, 100), headerRow },
     };
   }
-  const extraColumns = header.filter((h) => h && !ALIAS.has(normKey(h)));
-  return { items, errors, duplicates, headerRow, extraColumns };
+  const used = new Set(Object.values(col));
+  const extraColumns = fmt
+    ? header.filter((h, i) => h && !used.has(i))
+    : header.filter((h) => h && !ALIAS.has(normKey(h)));
+  return { items, errors, duplicates, headerRow, extraColumns, format: fmt ? { key: fmt.key, label: fmt.label } : null };
 }
 
 // Find the first array of objects inside whatever Skytex returns.
@@ -2135,6 +2204,7 @@ function registerFabricWarehouse(app, deps) {
         ...plan.filter((p) => p.action === "duplicate").map((p) => ({ row: p.row, roll_no: p.r.roll_no, first: null })),
       ].slice(0, 200),
       extraColumns: sheet.extraColumns,
+      format: sheet.format,
     };
 
     if (dryRun) {
@@ -2152,7 +2222,8 @@ function registerFabricWarehouse(app, deps) {
         byPo: [...byPo.values()].sort((a, b) => b.rolls - a.rolls),
         preview: plan.slice(0, 300).map((p) => ({
           row: p.row, action: p.action, status: p.status,
-          roll_no: p.r.roll_no, po_number: p.r.po_number, supplier: p.r.supplier,
+          roll_no: p.r.roll_no, po_number: p.r.po_number, supplier: p.r.supplier || origin,
+          supplier_code: p.r.supplier_code || origin,
           fabric_name: p.r.fabric_name, color: p.r.color, lot: p.r.lot, yards: p.r.yards,
         })),
       });
@@ -2220,6 +2291,18 @@ function registerFabricWarehouse(app, deps) {
       }
       saved[p.action]++;
       ids.push(p.id);
+    }
+    // Whoever the packing list belongs to is the supplier and supplier code of its
+    // rolls when the file does not bring them (fill-only: a code already on the
+    // roll, e.g. from a Skytex transfer, is kept so matching keeps working).
+    if (ids.length) {
+      await client.query(
+        `UPDATE fabric_rolls
+            SET supplier      = COALESCE(NULLIF(TRIM(supplier), ''), $2),
+                supplier_code = COALESCE(NULLIF(TRIM(supplier_code), ''), $3)
+          WHERE id = ANY($1::bigint[])`,
+        [ids, origin.slice(0, 150), origin.slice(0, 60)]
+      );
     }
     await client.query("COMMIT");
     // The saved rolls with all their data, so the screen can print their labels.
@@ -3153,4 +3236,5 @@ registerFabricWarehouse.cleanScan = cleanScan;
 registerFabricWarehouse.labelCandidates = labelCandidates;
 registerFabricWarehouse.BOX_CODES = BOX_CODES;
 registerFabricWarehouse.FIELDS = FIELDS;
+registerFabricWarehouse.LIST_FORMATS = LIST_FORMATS;
 module.exports = registerFabricWarehouse;
