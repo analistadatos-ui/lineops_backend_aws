@@ -21,6 +21,12 @@
 // Every change writes one row in fabric_roll_movements; the inbound and outbound
 // reports are read from there.
 //
+// Return from inspection (Inspección › Recibir, PDA):
+//   scan the roll → type its balance (yardas / metros) and the result →
+//   scan the container and the spot → save. The roll goes back to in_stock with
+//   the measured balance; the values before are kept in fabric_rolls.orig_yards /
+//   orig_meters and every return is logged in fabric_inspection_returns.
+//
 // Skytex connection (.env):
 //   SKYTEX_API_URL      full URL of the endpoint that returns the rolls JSON
 //   SKYTEX_API_TOKEN    optional, sent as "Authorization: Bearer <token>"
@@ -845,6 +851,38 @@ async function initSchema({ pool, setSchema }) {
           ('requested','assigned','arrived','temporary','in_stock','at_inspection','returned','cancelled'))`
       );
     }
+
+    // Return from inspection with the measured balance (Inspección › Recibir).
+    //   fabric_rolls.yards / meters  → become the balance measured by inspection
+    //   orig_yards / orig_meters     → what the roll had before its first inspection
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS orig_yards NUMERIC(12,2);");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS orig_meters NUMERIC(12,2);");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS inspected_at TIMESTAMPTZ;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS inspected_by BIGINT;");
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS fabric_inspection_returns(
+        id BIGSERIAL PRIMARY KEY,
+        roll_id BIGINT NOT NULL REFERENCES fabric_rolls(id) ON DELETE CASCADE,
+        result VARCHAR(20) NOT NULL,
+        yards_before NUMERIC(12,2),
+        meters_before NUMERIC(12,2),
+        yards_balance NUMERIC(12,2) NOT NULL,
+        meters_balance NUMERIC(12,2) NOT NULL,
+        box_id BIGINT REFERENCES fabric_boxes(id) ON DELETE SET NULL,
+        box_code VARCHAR(40),
+        location_id BIGINT REFERENCES fabric_locations(id) ON DELETE SET NULL,
+        location_code VARCHAR(40),
+        note TEXT,
+        user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    // A first draft of this feature also asked for kg; it is not used.
+    await client.query("ALTER TABLE fabric_inspection_returns DROP COLUMN IF EXISTS kg_before;");
+    await client.query("ALTER TABLE fabric_inspection_returns DROP COLUMN IF EXISTS kg_balance;");
+    await client.query("ALTER TABLE fabric_rolls DROP COLUMN IF EXISTS balance_kg;");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_insp_returns_date ON fabric_inspection_returns(created_at);");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_insp_returns_roll ON fabric_inspection_returns(roll_id);");
 
     console.log("✅ fabric-warehouse tables ready in prod_db_schema");
   } finally {
@@ -3067,6 +3105,143 @@ function registerFabricWarehouse(app, deps) {
     }
     await client.query("COMMIT");
     res.json({ success: true, updated: rows.length, skipped: ids.length - rows.length });
+  }));
+
+  // ======================================================================
+  //  RECEIVE FROM INSPECTION — with the balance (yardas / metros)
+  // ======================================================================
+  // PDA flow (Inspección › Recibir):
+  //   1 scan the roll          POST /inspection/return-scan   (kind: roll)
+  //   2 type the balance       yardas or metros (the other is calculated)
+  //   3 scan the container     POST /inspection/return-scan   (kind: box)
+  //   4 scan the spot          POST /inspection/return-scan   (kind: location)
+  //   5 save                   POST /inspection/receive
+  // The scan endpoint recognises any of the three labels at any step, so the
+  // user can scan them in any order. Nothing is saved until step 5.
+
+  const YD_TO_M = 0.9144;
+  const round = (v, d = 2) => Math.round(Number(v) * 10 ** d) / 10 ** d;
+  const STATUS_TEXT = {
+    requested: "en Skytex", assigned: "esperando llegada", arrived: "en recepción, sin guardar",
+    temporary: "en lugar temporal", in_stock: "en inventario", at_inspection: "en inspección",
+    returned: "devuelto al proveedor", cancelled: "cancelado",
+  };
+
+  // Body: { raw, expect: 'roll'|'box'|'location' }  → { kind, roll|box|location }
+  app.post(`${BASE}/inspection/return-scan`, authenticateToken, withClient(async (req, res, client) => {
+    const raw = String(req.body?.raw ?? "");
+    if (!cleanScan(raw)) return fail(res, 400, "No se pudo leer el código.");
+    const expect = ["roll", "box", "location"].includes(req.body?.expect) ? req.body.expect : "roll";
+    const hit = await classifyScan(client, raw, expect === "location" ? "spot" : expect === "box" ? "box" : null, expect === "roll");
+    if (hit?.kind === "location") return res.json({ success: true, kind: "location", location: hit.location });
+    if (hit?.kind === "box") return res.json({ success: true, kind: "box", box: hit.box });
+    if (hit?.kind === "invalid_box") return fail(res, 409, hit.error);
+
+    const f = await findScannedRoll(client, raw);
+    if (f.error) return fail(res, f.status || 400, f.error);
+    if (!f.rows.length) return fail(res, 404, `No existe el rollo ${f.scan.roll_no}.`);
+    const roll = f.rows.find((r) => r.status === "at_inspection") || f.rows[0];
+    if (roll.status !== "at_inspection") {
+      return fail(res, 409, `${roll.roll_no} no está en inspección (está ${STATUS_TEXT[roll.status] || roll.status}).`);
+    }
+    res.json({ success: true, kind: "roll", roll });
+  }));
+
+  // Body: { rollId, result: 'approved'|'rejected', yards?, meters?, boxId, locationId, note? }
+  // yards or meters is required (the other one is calculated).
+  app.post(`${BASE}/inspection/receive`, authenticateToken, withClient(async (req, res, client) => {
+    const rollId = parseInt(req.body?.rollId, 10);
+    const result = ["approved", "rejected"].includes(req.body?.result) ? req.body.result : null;
+    let yards = numOrNull(req.body?.yards);
+    let meters = numOrNull(req.body?.meters);
+    const boxId = parseInt(req.body?.boxId, 10);
+    const locationId = parseInt(req.body?.locationId, 10);
+    const note = str(req.body?.note);
+
+    if (!rollId) return fail(res, 400, "Escanee el rollo.");
+    if (!result) return fail(res, 400, "Indique si el rollo fue aprobado o rechazado.");
+    if (yards == null && meters == null) return fail(res, 400, "Escriba el saldo en yardas o en metros.");
+    if (yards == null) yards = meters / YD_TO_M;
+    if (meters == null) meters = yards * YD_TO_M;
+    yards = round(yards); meters = round(meters);
+    if (!(yards > 0) || !(meters > 0)) return fail(res, 400, "El saldo debe ser mayor que cero.");
+    if (yards > 100000) return fail(res, 400, "El saldo no parece correcto. Revise los números.");
+    if (!boxId) return fail(res, 400, "Escanee el contenedor donde se guarda el rollo.");
+    if (!locationId) return fail(res, 400, "Escanee el lugar del contenedor.");
+
+    const room = await roomInBox(client, boxId, [rollId], 1);
+    if (room.error) return fail(res, room.status, room.error, { code: room.code });
+    const B = room.B;
+    if (String(B.location_id) !== String(locationId)) {
+      const L = await locationInfo(client, locationId);
+      return fail(res, 409, `${B.code} no está en ${L?.code || "ese lugar"} (está en ${B.location_code}). Escanee el lugar correcto.`, { code: "box_location_mismatch" });
+    }
+
+    await client.query("BEGIN");
+    const cur = await client.query(`SELECT * FROM fabric_rolls WHERE id = $1 FOR UPDATE`, [rollId]);
+    const r = cur.rows[0];
+    if (!r) { await client.query("ROLLBACK"); return fail(res, 404, "Rollo no encontrado."); }
+    if (r.status !== "at_inspection") {
+      await client.query("ROLLBACK");
+      return fail(res, 409, `${r.roll_no} ya no está en inspección (está ${STATUS_TEXT[r.status] || r.status}).`);
+    }
+
+    await client.query(
+      `UPDATE fabric_rolls
+          SET status = 'in_stock', inspection_result = $2, out_at = NULL,
+              box_id = $3, location_id = $4, container_id = $5, location_set_at = now(),
+              orig_yards = COALESCE(orig_yards, yards), orig_meters = COALESCE(orig_meters, meters),
+              yards = $6, meters = $7,
+              inspected_at = now(), inspected_by = $8, updated_at = now()
+        WHERE id = $1`,
+      [rollId, result, B.id, B.location_id, B.container_id, yards, meters, req.user?.id || null]
+    );
+    const ins = await client.query(
+      `INSERT INTO fabric_inspection_returns
+         (roll_id, result, yards_before, meters_before, yards_balance, meters_balance,
+          box_id, box_code, location_id, location_code, note, user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       RETURNING *`,
+      [rollId, result, r.yards, r.meters, yards, meters,
+       B.id, B.code, B.location_id, B.location_code, note, req.user?.id || null]
+    );
+    await logMove(client, {
+      rollId, type: "inspection_back", from: r.location_id, to: B.location_id, toBox: B.code,
+      reason: result, reference: `Saldo ${yards} yd · ${meters} m`.slice(0, 120), userId: req.user?.id,
+    });
+    await client.query("COMMIT");
+
+    const out = await client.query(`${ROLL_SELECT} WHERE r.id = $1`, [rollId]);
+    res.json({ success: true, roll: out.rows[0], return: ins.rows[0] });
+  }));
+
+  // History of returns. GET /inspection/returns?from=YYYY-MM-DD&to=YYYY-MM-DD (default today)
+  app.get(`${BASE}/inspection/returns`, authenticateToken, withClient(async (req, res, client) => {
+    const ok = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || "");
+    const today = new Date().toISOString().slice(0, 10);
+    const from = ok(req.query.from) ? req.query.from : today;
+    const to = ok(req.query.to) ? req.query.to : from;
+    const { rows } = await client.query(
+      `SELECT ir.*, r.roll_no, r.po_number, r.supplier, r.fabric_name, r.color, r.lot, u.full_name AS user_name
+         FROM fabric_inspection_returns ir
+         JOIN fabric_rolls r ON r.id = ir.roll_id
+         LEFT JOIN users u ON u.id = ir.user_id
+        WHERE ir.created_at::date BETWEEN $1 AND $2
+        ORDER BY ir.created_at DESC
+        LIMIT 2000`,
+      [from, to]
+    );
+    const sum = (k) => rows.reduce((a, x) => a + (Number(x[k]) || 0), 0);
+    res.json({
+      success: true, from, to, returns: rows,
+      totals: {
+        rolls: rows.length,
+        approved: rows.filter((x) => x.result === "approved").length,
+        rejected: rows.filter((x) => x.result === "rejected").length,
+        yardsBefore: sum("yards_before"), yardsBalance: sum("yards_balance"),
+        metersBefore: sum("meters_before"), metersBalance: sum("meters_balance"),
+      },
+    });
   }));
 
   // ======================================================================
