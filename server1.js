@@ -1156,7 +1156,7 @@ const BACKEND_VERSION = process.env.APP_VERSION || (() => {
 
 // Roles that should see the "nueva versión" bar for this backend deployment. [] = everyone.
 // Set it before a deploy that only affects some roles, and put it back to [] on the next one.
-const UPDATE_ROLES = ["corte"];
+const UPDATE_ROLES = ["fabric_warehouse"];
 
 // Public on purpose: returns only the version and roles, so every role (including the TVs) can check it
 app.get("/api/version", (req, res) => {
