@@ -21,12 +21,6 @@
 // Every change writes one row in fabric_roll_movements; the inbound and outbound
 // reports are read from there.
 //
-// Return from inspection (Inspección › Recibir, PDA):
-//   scan the roll → type its balance (yardas / metros) and the result →
-//   scan the container and the spot → save. The roll goes back to in_stock with
-//   the measured balance; the values before are kept in fabric_rolls.orig_yards /
-//   orig_meters and every return is logged in fabric_inspection_returns.
-//
 // Skytex connection (.env):
 //   SKYTEX_API_URL      full URL of the endpoint that returns the rolls JSON
 //   SKYTEX_API_TOKEN    optional, sent as "Authorization: Bearer <token>"
@@ -259,21 +253,88 @@ const LIST_FORMATS = [
     fixed: { weight_unit: "KG", fabric_name: "LEGACY" },
     metersToYards: true,
   },
+  // Inventory report of the previous system («Fabric Warehouse Inventory Report»).
+  // Loaded in Recepción like any packing list: its rolls go to the Lista general
+  // «por escanear», then they are scanned and given a container and spot there.
+  // Its Container / locationName / receive time are only kept in raw (the old
+  // place); the container is the one chosen when the roll is put away.
+  //   PO · Supplier Code · Supplier Name · Fabric Item Code · Fabric Name
+  //   Component → composición · Color Code (o Color Name) → color · Lot · Roll
+  //   (o QR-Code) → rollo · Width(M) → ancho en cm (los valores son 152, 156…)
+  //   Weight(KG) · Yard Length → yardas · Quantity(M) → metros · Customer name
+  //   Buy Month · Container loading number → importación
+  {
+    key: "inventario_wms",
+    label: "Reporte de inventario (Fabric Warehouse Inventory Report)",
+    // Several suppliers in one file: each roll's list origin comes from its own
+    // Supplier Name / Supplier Code; the origin chosen on screen only for rows without them.
+    originFromRow: true,
+    detect: ["Roll", "Container", "locationName", "Yard Length", "Quantity(M)", "QR-Code"],
+    columns: {
+      po_number: "PO",
+      supplier_code: "Supplier Code",
+      supplier: "Supplier Name",
+      import_ref: "Container loading number",
+      fabric_item_number: "Fabric Item Code",
+      fabric_name: "Fabric Name",
+      composition: "Component",
+      color: "Color Code",
+      lot: "Lot",
+      roll_no: "Roll",
+      width: "Width(M)",
+      weight: "Weight(KG)",
+      yards: "Yard Length",
+      meters: "Quantity(M)",
+      customer: "Customer name",
+      month_buy: "Buy Month",
+    },
+    fallback: { roll_no: "QR-Code", color: "Color Name" },
+    required: ["Roll", "Container", "Yard Length", "Quantity(M)"],
+    fixed: { width_unit: "cm", weight_unit: "KG" },
+    clean: (r) => {
+      for (const k of Object.keys(r)) if (typeof r[k] === "string" && /^(n\/?a|null|-)$/i.test(r[k].trim())) r[k] = null;
+      r.month_buy = fixJavaMonth(r.month_buy);
+      // «156.00» → «156» (prints «156 cm» on the label).
+      if (r.width && /^\d+\.0+$/.test(r.width)) r.width = r.width.replace(/\.0+$/, "");
+      return r;
+    },
+  },
 ];
+
+// The old system wrote «Buy Month» 2610 as a Java date: «Thu Feb 01 00:00:00 CST
+// 2610» (year 2610). Give the original text back; real dates stay as they are.
+function fixJavaMonth(v) {
+  if (v == null) return v;
+  const m = /^\w{3} \w{3} \d{1,2} 00:00:00 \w+ (\d{4})$/.exec(String(v).trim());
+  return m && Number(m[1]) > 2100 ? m[1] : v;
+}
+
 const FIELD_BY_KEY = new Map(FIELDS.map((f) => [f.key, f]));
 
 // The same row as normalizeRoll would give, but from a format's own columns.
 function rollFromFormat(fmt, col, cells) {
   const out = {};
   for (const k of FIELD_KEYS) out[k] = null;
-  for (const [key, idx] of Object.entries(col)) {
+  const read = (key, idx) => {
     const f = FIELD_BY_KEY.get(key);
     const v = cells[idx];
-    if (v != null && typeof v === "object") continue;
-    out[key] = f?.type === "number" ? numOrNull(v) : f?.type === "date" ? dateOrNull(v) : str(v);
+    if (v != null && typeof v === "object" && !(v instanceof Date)) return null;
+    return f?.type === "number" ? numOrNull(v) : f?.type === "date" ? dateOrNull(v) : str(v);
+  };
+  for (const [key, idx] of Object.entries(col)) if (FIELD_BY_KEY.has(key)) out[key] = read(key, idx);
+  // Second column when the first is empty (e.g. Roll empty → QR-Code).
+  for (const key of Object.keys(fmt.fallback || {})) {
+    const idx = col[`fallback:${key}`];
+    if (out[key] == null && idx != null) out[key] = read(key, idx);
   }
+  if (fmt.clean) fmt.clean(out);
   if (out.roll_no != null || Object.values(out).some((v) => v != null)) {
-    for (const [k, v] of Object.entries(fmt.fixed || {})) if (out[k] == null) out[k] = v;
+    for (const [k, v] of Object.entries(fmt.fixed || {})) {
+      // A unit only goes with its value.
+      if (k === "width_unit" && out.width == null) continue;
+      if (k === "weight_unit" && out.weight == null) continue;
+      if (out[k] == null) out[k] = v;
+    }
   }
   if (fmt.metersToYards && out.yards == null && out.meters != null) out.yards = Math.round((out.meters / 0.9144) * 100) / 100;
   return out;
@@ -383,6 +444,8 @@ function readImportSheet(matrix, firstRow = 1) {
       const hit = [].concat(names).find((n) => at.has(normKey(n)));
       if (hit) col[key] = at.get(normKey(hit));
     }
+    for (const [key, name] of Object.entries(fmt.fallback || {})) if (at.has(normKey(name))) col[`fallback:${key}`] = at.get(normKey(name));
+    for (const [key, name] of Object.entries(fmt.extra || {})) if (at.has(normKey(name))) col[`extra:${key}`] = at.get(normKey(name));
     missing = fmt.required.filter((name) => !at.has(normKey(name)));
   } else {
     header.forEach((h, i) => {
@@ -417,6 +480,7 @@ function readImportSheet(matrix, firstRow = 1) {
     const rowNo = firstRow + i;
     const raw = {};
     header.forEach((h, idx) => { if (h && filled(cells[idx])) raw[h] = cells[idx]; });
+    if (!r.roll_no && /^(total|totales|grand total)\b/i.test(String(cells.find(filled) ?? "").trim())) continue;
     if (!r.roll_no) { errors.push({ row: rowNo, error: "Sin número de rollo" }); continue; }
     if (SCI_NUMBER.test(r.roll_no)) {
       errors.push({ row: rowNo, roll_no: r.roll_no, error: "El número de rollo quedó en notación científica. Dé formato de texto a la columna en Excel y guarde de nuevo." });
@@ -427,7 +491,9 @@ function readImportSheet(matrix, firstRow = 1) {
     const key = rollKeyOf(r);
     if (seen.has(key)) { duplicates.push({ row: rowNo, roll_no: r.roll_no, first: seen.get(key) }); continue; }
     seen.set(key, rowNo);
-    items.push({ row: rowNo, r, raw, key });
+    const x = {};
+    for (const k of Object.keys(fmt?.extra || {})) { const idx = col[`extra:${k}`]; x[k] = idx == null ? null : cells[idx]; }
+    items.push({ row: rowNo, r, raw, key, x });
   }
   if (items.length > IMPORT_MAX_ROWS) {
     return { status: 400, error: `Máximo ${IMPORT_MAX_ROWS} rollos por archivo; este tiene ${items.length}. Divídalo en varios archivos.` };
@@ -443,7 +509,7 @@ function readImportSheet(matrix, firstRow = 1) {
   const extraColumns = fmt
     ? header.filter((h, i) => h && !used.has(i))
     : header.filter((h) => h && !ALIAS.has(normKey(h)));
-  return { items, errors, duplicates, headerRow, extraColumns, format: fmt ? { key: fmt.key, label: fmt.label } : null };
+  return { items, errors, duplicates, headerRow, extraColumns, format: fmt ? { key: fmt.key, label: fmt.label, kind: fmt.kind || "list", originFromRow: !!fmt.originFromRow } : null };
 }
 
 // Find the first array of objects inside whatever Skytex returns.
@@ -851,38 +917,6 @@ async function initSchema({ pool, setSchema }) {
           ('requested','assigned','arrived','temporary','in_stock','at_inspection','returned','cancelled'))`
       );
     }
-
-    // Return from inspection with the measured balance (Inspección › Recibir).
-    //   fabric_rolls.yards / meters  → become the balance measured by inspection
-    //   orig_yards / orig_meters     → what the roll had before its first inspection
-    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS orig_yards NUMERIC(12,2);");
-    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS orig_meters NUMERIC(12,2);");
-    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS inspected_at TIMESTAMPTZ;");
-    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS inspected_by BIGINT;");
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS fabric_inspection_returns(
-        id BIGSERIAL PRIMARY KEY,
-        roll_id BIGINT NOT NULL REFERENCES fabric_rolls(id) ON DELETE CASCADE,
-        result VARCHAR(20) NOT NULL,
-        yards_before NUMERIC(12,2),
-        meters_before NUMERIC(12,2),
-        yards_balance NUMERIC(12,2) NOT NULL,
-        meters_balance NUMERIC(12,2) NOT NULL,
-        box_id BIGINT REFERENCES fabric_boxes(id) ON DELETE SET NULL,
-        box_code VARCHAR(40),
-        location_id BIGINT REFERENCES fabric_locations(id) ON DELETE SET NULL,
-        location_code VARCHAR(40),
-        note TEXT,
-        user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-    `);
-    // A first draft of this feature also asked for kg; it is not used.
-    await client.query("ALTER TABLE fabric_inspection_returns DROP COLUMN IF EXISTS kg_before;");
-    await client.query("ALTER TABLE fabric_inspection_returns DROP COLUMN IF EXISTS kg_balance;");
-    await client.query("ALTER TABLE fabric_rolls DROP COLUMN IF EXISTS balance_kg;");
-    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_insp_returns_date ON fabric_inspection_returns(created_at);");
-    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_insp_returns_roll ON fabric_inspection_returns(roll_id);");
 
     console.log("✅ fabric-warehouse tables ready in prod_db_schema");
   } finally {
@@ -2326,7 +2360,21 @@ function registerFabricWarehouse(app, deps) {
     const k = t.toLowerCase().replace(/[^a-z0-9]/g, "");
     if (k === "skytex") return "Skytex";
     if (k === "ray" || k === "rayfabrics") return "Ray";
+    if (k === "sabrina" || k.startsWith("sabrinafashion")) return "Sabrina";
     return t;
+  };
+  // Origin of one roll from its own supplier (files with several suppliers).
+  // The name wins over the code: «SABRINA» with code «RAY» is Sabrina.
+  //   …skytex… → Skytex · …sabrina… → Sabrina · ray / ray-fabrics → Ray · other → its name
+  const originFromSupplier = (r) => {
+    for (const v of [r.supplier, r.supplier_code]) {
+      const k = String(v ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!k || k === "na") continue;
+      if (k.includes("skytex")) return "Skytex";
+      if (k.includes("sabrina")) return "Sabrina";
+      if (k === "ray" || k.startsWith("rayfabric")) return "Ray";
+    }
+    return cleanOrigin(r.supplier) || cleanOrigin(r.supplier_code);
   };
 
   // Body: { fileName, firstRow, rows, dryRun, origin }. origin is required to save.
@@ -2345,10 +2393,23 @@ function registerFabricWarehouse(app, deps) {
     const plan = await planImport(client, sheet.items, !dryRun);
     const counts = { new: 0, update: 0, rerequest: 0, link: 0, received: 0, duplicate: 0 };
     for (const p of plan) counts[p.action]++;
+    // Each roll's list origin: its own supplier when the format says so, else the one chosen.
+    const perRow = !!sheet.format?.originFromRow;
+    let noSupplier = 0;
+    for (const p of plan) {
+      const own = perRow ? originFromSupplier(p.r) : null;
+      if (perRow && !own) noSupplier++;
+      p.origin = own || origin;
+    }
+    const byOrigin = new Map();
+    for (const p of plan) if (p.action !== "duplicate") byOrigin.set(p.origin || "—", (byOrigin.get(p.origin || "—") || 0) + 1);
+    const origins = [...byOrigin.entries()].map(([o, rolls]) => ({ origin: o, rolls })).sort((a, b) => b.rolls - a.rolls);
 
     const summary = {
       fileName,
       origin,
+      origins,          // [{ origin, rolls }] — more than one when the file mixes suppliers
+      noSupplier,       // rows without supplier (they take the chosen origin)
       headerRow: sheet.headerRow,
       total: plan.length,
       counts,
@@ -2377,14 +2438,14 @@ function registerFabricWarehouse(app, deps) {
         byPo: [...byPo.values()].sort((a, b) => b.rolls - a.rolls),
         preview: plan.slice(0, 300).map((p) => ({
           row: p.row, action: p.action, status: p.status,
-          roll_no: p.r.roll_no, po_number: p.r.po_number, supplier: p.r.supplier || origin,
-          supplier_code: p.r.supplier_code || origin,
+          roll_no: p.r.roll_no, po_number: p.r.po_number, supplier: p.r.supplier || p.origin,
+          supplier_code: p.r.supplier_code || p.origin, origin: p.origin,
           fabric_name: p.r.fabric_name, color: p.r.color, lot: p.r.lot, yards: p.r.yards,
         })),
       });
     }
 
-    const reason = `Lista de empaque de ${origin} · archivo «${fileName}»`;
+    const reasonOf = (o) => `Lista de empaque de ${o} · archivo «${fileName}»`;
     const vals = (r) => FIELD_KEYS.map((k) => r[k]);
     const sets = (start, fillOnly = false) => FIELD_KEYS
       .map((k, i) => (fillOnly ? `${k} = COALESCE(${k}, $${start + i})` : `${k} = COALESCE($${start + i}, ${k})`))
@@ -2394,7 +2455,8 @@ function registerFabricWarehouse(app, deps) {
 
     for (const p of plan) {
       const { r, key } = p;
-      const rawJson = JSON.stringify({ ...p.raw, _archivo: fileName, _renglon: p.row, _origen: origin });
+      const rawJson = JSON.stringify({ ...p.raw, _archivo: fileName, _renglon: p.row, _origen: p.origin });
+      const reason = reasonOf(p.origin);
       if (p.action === "duplicate") { saved.skipped++; continue; }
       if (p.action === "new") {
         const cols = ["skytex_key", ...FIELD_KEYS, "raw", "requested_by", "list_origin", "list_file"];
@@ -2402,7 +2464,7 @@ function registerFabricWarehouse(app, deps) {
           `INSERT INTO fabric_rolls (${cols.join(",")}, list_loaded_at)
            VALUES (${cols.map((_, i) => `$${i + 1}`).join(",")}, now())
            ON CONFLICT (skytex_key) DO NOTHING RETURNING id`,
-          [key, ...vals(r), rawJson, userId, origin, fileName]
+          [key, ...vals(r), rawJson, userId, p.origin, fileName]
         );
         if (!ins.rows.length) { saved.skipped++; continue; }
         p.id = ins.rows[0].id;
@@ -2411,7 +2473,7 @@ function registerFabricWarehouse(app, deps) {
         await client.query(
           `UPDATE fabric_rolls SET ${sets(4)}, list_origin = $2, list_file = $3, list_loaded_at = now(), updated_at = now()
             WHERE id = $1`,
-          [p.id, origin, fileName, ...vals(r)]
+          [p.id, p.origin, fileName, ...vals(r)]
         );
       } else if (p.action === "rerequest") {
         const upd = await client.query(
@@ -2420,7 +2482,7 @@ function registerFabricWarehouse(app, deps) {
                   list_origin = $4, list_file = $5, list_loaded_at = now(),
                   container_id = NULL, location_id = NULL, box_id = NULL, location_set_at = NULL, updated_at = now()
             WHERE id = $1 AND status = 'cancelled' RETURNING id`,
-          [p.id, rawJson, userId, origin, fileName, ...vals(r)]
+          [p.id, rawJson, userId, p.origin, fileName, ...vals(r)]
         );
         if (!upd.rows.length) { saved.skipped++; continue; }
         await logMove(client, { rollId: p.id, type: "requested", reference: r.po_number, reason, userId });
@@ -2433,7 +2495,7 @@ function registerFabricWarehouse(app, deps) {
                   raw = $3, source = 'skytex', ${sets(6)},
                   list_origin = $4, list_file = $5, list_loaded_at = now(), updated_at = now()
             WHERE id = $1`,
-          [p.id, key, rawJson, origin, fileName, ...vals(r)]
+          [p.id, key, rawJson, p.origin, fileName, ...vals(r)]
         );
       } else if (p.action === "received") {
         await client.query(
@@ -2441,7 +2503,7 @@ function registerFabricWarehouse(app, deps) {
                   list_origin = COALESCE(list_origin, $2), list_file = COALESCE(list_file, $3),
                   list_loaded_at = COALESCE(list_loaded_at, now()), updated_at = now()
             WHERE id = $1`,
-          [p.id, origin, fileName, ...vals(r)]
+          [p.id, p.origin, fileName, ...vals(r)]
         );
       }
       saved[p.action]++;
@@ -3105,143 +3167,6 @@ function registerFabricWarehouse(app, deps) {
     }
     await client.query("COMMIT");
     res.json({ success: true, updated: rows.length, skipped: ids.length - rows.length });
-  }));
-
-  // ======================================================================
-  //  RECEIVE FROM INSPECTION — with the balance (yardas / metros)
-  // ======================================================================
-  // PDA flow (Inspección › Recibir):
-  //   1 scan the roll          POST /inspection/return-scan   (kind: roll)
-  //   2 type the balance       yardas or metros (the other is calculated)
-  //   3 scan the container     POST /inspection/return-scan   (kind: box)
-  //   4 scan the spot          POST /inspection/return-scan   (kind: location)
-  //   5 save                   POST /inspection/receive
-  // The scan endpoint recognises any of the three labels at any step, so the
-  // user can scan them in any order. Nothing is saved until step 5.
-
-  const YD_TO_M = 0.9144;
-  const round = (v, d = 2) => Math.round(Number(v) * 10 ** d) / 10 ** d;
-  const STATUS_TEXT = {
-    requested: "en Skytex", assigned: "esperando llegada", arrived: "en recepción, sin guardar",
-    temporary: "en lugar temporal", in_stock: "en inventario", at_inspection: "en inspección",
-    returned: "devuelto al proveedor", cancelled: "cancelado",
-  };
-
-  // Body: { raw, expect: 'roll'|'box'|'location' }  → { kind, roll|box|location }
-  app.post(`${BASE}/inspection/return-scan`, authenticateToken, withClient(async (req, res, client) => {
-    const raw = String(req.body?.raw ?? "");
-    if (!cleanScan(raw)) return fail(res, 400, "No se pudo leer el código.");
-    const expect = ["roll", "box", "location"].includes(req.body?.expect) ? req.body.expect : "roll";
-    const hit = await classifyScan(client, raw, expect === "location" ? "spot" : expect === "box" ? "box" : null, expect === "roll");
-    if (hit?.kind === "location") return res.json({ success: true, kind: "location", location: hit.location });
-    if (hit?.kind === "box") return res.json({ success: true, kind: "box", box: hit.box });
-    if (hit?.kind === "invalid_box") return fail(res, 409, hit.error);
-
-    const f = await findScannedRoll(client, raw);
-    if (f.error) return fail(res, f.status || 400, f.error);
-    if (!f.rows.length) return fail(res, 404, `No existe el rollo ${f.scan.roll_no}.`);
-    const roll = f.rows.find((r) => r.status === "at_inspection") || f.rows[0];
-    if (roll.status !== "at_inspection") {
-      return fail(res, 409, `${roll.roll_no} no está en inspección (está ${STATUS_TEXT[roll.status] || roll.status}).`);
-    }
-    res.json({ success: true, kind: "roll", roll });
-  }));
-
-  // Body: { rollId, result: 'approved'|'rejected', yards?, meters?, boxId, locationId, note? }
-  // yards or meters is required (the other one is calculated).
-  app.post(`${BASE}/inspection/receive`, authenticateToken, withClient(async (req, res, client) => {
-    const rollId = parseInt(req.body?.rollId, 10);
-    const result = ["approved", "rejected"].includes(req.body?.result) ? req.body.result : null;
-    let yards = numOrNull(req.body?.yards);
-    let meters = numOrNull(req.body?.meters);
-    const boxId = parseInt(req.body?.boxId, 10);
-    const locationId = parseInt(req.body?.locationId, 10);
-    const note = str(req.body?.note);
-
-    if (!rollId) return fail(res, 400, "Escanee el rollo.");
-    if (!result) return fail(res, 400, "Indique si el rollo fue aprobado o rechazado.");
-    if (yards == null && meters == null) return fail(res, 400, "Escriba el saldo en yardas o en metros.");
-    if (yards == null) yards = meters / YD_TO_M;
-    if (meters == null) meters = yards * YD_TO_M;
-    yards = round(yards); meters = round(meters);
-    if (!(yards > 0) || !(meters > 0)) return fail(res, 400, "El saldo debe ser mayor que cero.");
-    if (yards > 100000) return fail(res, 400, "El saldo no parece correcto. Revise los números.");
-    if (!boxId) return fail(res, 400, "Escanee el contenedor donde se guarda el rollo.");
-    if (!locationId) return fail(res, 400, "Escanee el lugar del contenedor.");
-
-    const room = await roomInBox(client, boxId, [rollId], 1);
-    if (room.error) return fail(res, room.status, room.error, { code: room.code });
-    const B = room.B;
-    if (String(B.location_id) !== String(locationId)) {
-      const L = await locationInfo(client, locationId);
-      return fail(res, 409, `${B.code} no está en ${L?.code || "ese lugar"} (está en ${B.location_code}). Escanee el lugar correcto.`, { code: "box_location_mismatch" });
-    }
-
-    await client.query("BEGIN");
-    const cur = await client.query(`SELECT * FROM fabric_rolls WHERE id = $1 FOR UPDATE`, [rollId]);
-    const r = cur.rows[0];
-    if (!r) { await client.query("ROLLBACK"); return fail(res, 404, "Rollo no encontrado."); }
-    if (r.status !== "at_inspection") {
-      await client.query("ROLLBACK");
-      return fail(res, 409, `${r.roll_no} ya no está en inspección (está ${STATUS_TEXT[r.status] || r.status}).`);
-    }
-
-    await client.query(
-      `UPDATE fabric_rolls
-          SET status = 'in_stock', inspection_result = $2, out_at = NULL,
-              box_id = $3, location_id = $4, container_id = $5, location_set_at = now(),
-              orig_yards = COALESCE(orig_yards, yards), orig_meters = COALESCE(orig_meters, meters),
-              yards = $6, meters = $7,
-              inspected_at = now(), inspected_by = $8, updated_at = now()
-        WHERE id = $1`,
-      [rollId, result, B.id, B.location_id, B.container_id, yards, meters, req.user?.id || null]
-    );
-    const ins = await client.query(
-      `INSERT INTO fabric_inspection_returns
-         (roll_id, result, yards_before, meters_before, yards_balance, meters_balance,
-          box_id, box_code, location_id, location_code, note, user_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-       RETURNING *`,
-      [rollId, result, r.yards, r.meters, yards, meters,
-       B.id, B.code, B.location_id, B.location_code, note, req.user?.id || null]
-    );
-    await logMove(client, {
-      rollId, type: "inspection_back", from: r.location_id, to: B.location_id, toBox: B.code,
-      reason: result, reference: `Saldo ${yards} yd · ${meters} m`.slice(0, 120), userId: req.user?.id,
-    });
-    await client.query("COMMIT");
-
-    const out = await client.query(`${ROLL_SELECT} WHERE r.id = $1`, [rollId]);
-    res.json({ success: true, roll: out.rows[0], return: ins.rows[0] });
-  }));
-
-  // History of returns. GET /inspection/returns?from=YYYY-MM-DD&to=YYYY-MM-DD (default today)
-  app.get(`${BASE}/inspection/returns`, authenticateToken, withClient(async (req, res, client) => {
-    const ok = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || "");
-    const today = new Date().toISOString().slice(0, 10);
-    const from = ok(req.query.from) ? req.query.from : today;
-    const to = ok(req.query.to) ? req.query.to : from;
-    const { rows } = await client.query(
-      `SELECT ir.*, r.roll_no, r.po_number, r.supplier, r.fabric_name, r.color, r.lot, u.full_name AS user_name
-         FROM fabric_inspection_returns ir
-         JOIN fabric_rolls r ON r.id = ir.roll_id
-         LEFT JOIN users u ON u.id = ir.user_id
-        WHERE ir.created_at::date BETWEEN $1 AND $2
-        ORDER BY ir.created_at DESC
-        LIMIT 2000`,
-      [from, to]
-    );
-    const sum = (k) => rows.reduce((a, x) => a + (Number(x[k]) || 0), 0);
-    res.json({
-      success: true, from, to, returns: rows,
-      totals: {
-        rolls: rows.length,
-        approved: rows.filter((x) => x.result === "approved").length,
-        rejected: rows.filter((x) => x.result === "rejected").length,
-        yardsBefore: sum("yards_before"), yardsBalance: sum("yards_balance"),
-        metersBefore: sum("meters_before"), metersBalance: sum("meters_balance"),
-      },
-    });
   }));
 
   // ======================================================================
