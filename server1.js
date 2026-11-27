@@ -1156,7 +1156,7 @@ const BACKEND_VERSION = process.env.APP_VERSION || (() => {
 
 // Roles that should see the "nueva versión" bar for this backend deployment. [] = everyone.
 // Set it before a deploy that only affects some roles, and put it back to [] on the next one.
-const UPDATE_ROLES = ["fabric_warehouse"];
+const UPDATE_ROLES = ["supervisor"];
 
 // Public on purpose: returns only the version and roles, so every role (including the TVs) can check it
 app.get("/api/version", (req, res) => {
@@ -10745,6 +10745,126 @@ app.get("/api/supervisor/assignments", authenticateToken, requireSupervisor, asy
     client.release();
   }
 });
+
+// ==========================================================================
+// GET /api/supervisor/dashboard?date=YYYY-MM-DD
+//
+// Everything the supervisor dashboard needs, in ONE request and 3 queries.
+//
+// Before: every minute, each open dashboard tab made 24 × GET /api/line-runs/:lineNo
+// (full history of every line) + 1 × GET /api/get-run-data/:runId per run
+// (each of those runs 5 queries + 1 query per operator). That is ~50 HTTP
+// requests and several hundred DB queries per tab per minute.
+//
+// After: 1 request per tab per minute, 3 DB queries.
+//
+// WHERE TO PASTE: in server1.js, right after the
+//   app.get("/api/supervisor/assignments", ...)  route  (~line 10765)
+// It uses authenticateToken, requireSupervisor, pool and setSchema, which are
+// all defined before that point.
+//
+// The old endpoints are left untouched, so other pages keep working.
+// ==========================================================================
+
+// Operation names that count as finished garments. Same list the dashboard
+// used client-side (pack, emp, empaque, packing, finished, terminado).
+const FINISHED_OPERATION_PATTERNS = ["%pack%", "%emp%", "%finished%", "%terminado%"];
+
+app.get("/api/supervisor/dashboard", authenticateToken, requireSupervisor, async (req, res) => {
+  const { date } = req.query;
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+    return res.status(400).json({ success: false, error: "date parameter required (YYYY-MM-DD)" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    // 1) Runs of the day, with every slot end time (the client takes the latest
+    //    one as the end of production, exactly like before).
+    //    To hide planner drafts, add:  AND COALESCE(lr.is_draft, false) = false
+    const runsResult = await client.query(
+      `SELECT lr.id,
+              lr.line_no,
+              lr.style,
+              COALESCE(lr.color, '') AS color,
+              lr.target_pcs,
+              lr.sam_minutes,
+              lr.operators_count,
+              lr.working_hours,
+              wo.work_order_no,
+              (SELECT array_agg(ss.slot_end::text ORDER BY ss.slot_order)
+                 FROM shift_slots ss
+                WHERE ss.run_id = lr.id AND ss.slot_end IS NOT NULL) AS slot_ends
+         FROM line_runs lr
+         LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
+        WHERE lr.run_date = $1::date
+        ORDER BY lr.line_no, lr.style, lr.id`,
+      [date]
+    );
+
+    // 2) Finished garments per run (packing / finishing operations).
+    const finishedResult = await client.query(
+      `SELECT lr.id AS run_id,
+              COALESCE(SUM(se.sewed_qty), 0) AS finished
+         FROM line_runs lr
+         JOIN run_operators ro          ON ro.run_id = lr.id
+         JOIN operator_operations oo    ON oo.run_operator_id = ro.id AND oo.run_id = lr.id
+         JOIN operation_sewed_entries se ON se.operation_id = oo.id
+        WHERE lr.run_date = $1::date
+          AND oo.operation_name ILIKE ANY ($2::text[])
+        GROUP BY lr.id`,
+      [date, FINISHED_OPERATION_PATTERNS]
+    );
+    const finishedByRun = new Map(
+      finishedResult.rows.map((r) => [String(r.run_id), Number(r.finished) || 0])
+    );
+
+    // 3) Helper assignments (same query as /api/supervisor/assignments).
+    const assignmentsResult = await client.query(
+      `SELECT lr.line_no,
+              (lba.assigned_quantity_per_hour * lr.working_hours) AS total_helped_pieces,
+              source.operator_no   AS source_operator_no,
+              source.operator_name AS source_operator_name,
+              target.operator_no   AS target_operator_no,
+              target.operator_name AS target_operator_name
+         FROM line_balancing_assignments lba
+         JOIN line_runs lr          ON lba.run_id = lr.id
+         JOIN run_operators source  ON lba.source_operator_id = source.id
+         JOIN run_operators target  ON lba.target_operator_id = target.id
+        WHERE lr.run_date = $1::date
+        ORDER BY lr.line_no, source.operator_no, target.operator_no`,
+      [date]
+    );
+
+    const runs = runsResult.rows.map((r) => ({
+      id: r.id,
+      lineNo: r.line_no,
+      style: r.style ?? "",
+      color: r.color ?? "",
+      targetPcs: Number(r.target_pcs) || 0,
+      samMinutes: Number(r.sam_minutes) || 0,
+      operatorsCount: Number(r.operators_count) || 0,
+      workingHours: Number(r.working_hours) || 0,
+      workOrderNo: r.work_order_no || "",
+      slotEnds: r.slot_ends || [],
+      finished: finishedByRun.get(String(r.id)) || 0,
+    }));
+
+    res.json({
+      success: true,
+      date,
+      runs,
+      assignments: assignmentsResult.rows,
+    });
+  } catch (err) {
+    console.error("❌ /api/supervisor/dashboard error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 // ========== PLANNER: EDIT OPERATION (SEWED QTY) ==========
 
